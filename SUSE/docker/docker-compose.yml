@@ -1,0 +1,19 @@
+---
+version: '3'
+
+services:
+  velociraptor:
+    image: suse-linux-sensor:latest
+    hostname: sensor-frontend
+    container_name: sensor-frontend
+    ports:
+      - 8001 # API
+      - "8889:8889" # GUI
+      - "8000:8000" # Frontend
+      - "8003:8003" # Monitoring
+    volumes:
+      - ${BASEDIR}/config:/config
+      - ${BASEDIR}/data:/data
+      - ${BASEDIR}/logs:/logs
+    restart:
+      unless-stopped

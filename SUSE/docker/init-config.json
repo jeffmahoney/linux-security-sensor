@@ -1,0 +1,38 @@
+{ "Client" :
+  { "writeback_linux" : "/config/velociraptor.writeback.yaml",
+    "writeback_darwin" : null,
+    "writeback_windows" : null,
+    "windows_installer" : null,
+    "darwin_installer" : null
+  },
+  "Datastore" :
+   {
+     "location": "/data",
+     "filestore_directory" : "/data"
+   },
+  "Logging" :
+  {
+    "output_directory" : "/logs"
+  },
+  "API":
+  {
+    "bind_address": "0.0.0.0"
+  },
+  "Frontend":
+  {
+    "bind_address": "0.0.0.0"
+  },
+  "GUI":
+  {
+    "bind_address": "0.0.0.0",
+    "initial_users" : {
+	    "name" : "admin",
+	    "password_hash" : "5c39c98764173fba7cc290553f06d631c1205b2727317e413b2e62e4a1133b60",
+	    "password_salt" : "af1904fcca4dd3f8fa97ecf2431ecb718513b2ef361515e1830d400d23b03f3e"
+    }
+  },
+  "Monitoring":
+  {
+    "bind_address": "0.0.0.0"
+  }
+}
