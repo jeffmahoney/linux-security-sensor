@@ -120,6 +120,7 @@ require (
 	github.com/glaslos/tlsh v0.2.0
 	github.com/go-errors/errors v1.4.2
 	github.com/golang-jwt/jwt/v4 v4.4.2
+	github.com/google/gopacket v1.1.19
 	github.com/hillu/go-archive-zip-crypto v0.0.0-20200712202847-bd5cf365dd44
 	github.com/rogpeppe/go-internal v1.9.0
 	github.com/shirou/gopsutil/v3 v3.21.11
@@ -245,4 +246,5 @@ replace github.com/crewjam/saml v0.4.8 => github.com/Velocidex/saml v0.0.0-20221
 replace github.com/go-errors/errors => github.com/Velocidex/errors v0.0.0-20221019164655-9ace6bf61e26
 
 replace github.com/aquasecurity/libbpfgo => ./third_party/libbpfgo
+
 replace github.com/aquasecurity/libbpfgo/helpers => ./third_party/libbpfgo/helpers
