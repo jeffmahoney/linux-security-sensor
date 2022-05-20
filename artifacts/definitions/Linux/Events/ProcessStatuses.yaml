@@ -27,7 +27,7 @@ sources:
            hash(path=Process.Exe) AS Hash
        FROM audit(rules=proc_stat_rules)
        WHERE "vrr_procmon" in Tags 
-           AND atoi(string=Summary.Actor.Primary) != -1 
+           AND atoi(string=Summary.Actor.Primary) != -1
            AND atoi(string=Summary.Actor.Secondary) != 0
 
      // Cache Uid -> Username mapping.

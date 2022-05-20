@@ -35,6 +35,6 @@ sources:
 
      // Enrich the original artifact with more data.
      SELECT Time, UserId, User,
-            State, FileName, FilePath, 
+            State, FileName, FilePath,
             Hash.SHA256 AS Hash_SHA256, Hash.SHA1 AS Hash_SHA1
      FROM hash_log
