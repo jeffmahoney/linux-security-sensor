@@ -11,7 +11,6 @@ required_permissions:
 
 sources:
   - query: |
-
      LET proc_exec_rules = ("-a always,exit -F arch=b64 -S execve -k vrr_procmon", "-a always,exit -F arch=b32 -S execve -k vrr_procmon")
 
      LET exec_log = SELECT timestamp(string=Timestamp) AS Time, Sequence,
