@@ -130,6 +130,7 @@ require (
 	github.com/lpar/gzipped v1.1.0
 	github.com/pkg/errors v0.9.1
 	github.com/rogpeppe/go-internal v1.10.0
+	github.com/scryner/lfreequeue v0.0.0-20121212074822-473f33702129
 	github.com/shirou/gopsutil/v3 v3.21.11
 	github.com/syndtr/goleveldb v1.0.0
 	github.com/valyala/fastjson v1.6.3
