@@ -126,6 +126,7 @@ require (
 	github.com/lpar/gzipped v1.1.0
 	github.com/pkg/errors v0.9.1
 	github.com/rogpeppe/go-internal v1.9.0
+	github.com/scryner/lfreequeue v0.0.0-20121212074822-473f33702129
 	github.com/shirou/gopsutil/v3 v3.21.11
 	github.com/valyala/fastjson v1.6.3
 	golang.org/x/oauth2 v0.0.0-20221014153046-6fdb5e3db783
