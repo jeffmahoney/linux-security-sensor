@@ -133,11 +133,11 @@ require (
 	github.com/lpar/gzipped v1.1.0
 	github.com/pkg/errors v0.9.1
 	github.com/rogpeppe/go-internal v1.10.0
-	github.com/scryner/lfreequeue v0.0.0-20121212074822-473f33702129
 	github.com/shirou/gopsutil/v3 v3.21.11
 	github.com/syndtr/goleveldb v1.0.0
 	github.com/valyala/fastjson v1.6.3
 	golang.org/x/oauth2 v0.8.0
+	golang.org/x/sync v0.3.0
 	google.golang.org/genproto/googleapis/api v0.0.0-20230530153820-e85fd2cbaebc
 	google.golang.org/grpc/cmd/protoc-gen-go-grpc v1.2.0
 	software.sslmate.com/src/go-pkcs12 v0.2.0
@@ -214,7 +214,6 @@ require (
 	go.uber.org/atomic v1.7.0 // indirect
 	go.uber.org/goleak v1.2.0 // indirect
 	go.uber.org/multierr v1.7.0 // indirect
-	golang.org/x/sync v0.3.0 // indirect
 	golang.org/x/term v0.10.0 // indirect
 	golang.org/x/tools v0.6.0 // indirect
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
@@ -275,4 +274,4 @@ replace github.com/aquasecurity/libbpfgo => ./third_party/libbpfgo
 
 replace github.com/aquasecurity/libbpfgo/helpers => ./third_party/libbpfgo/helpers
 
-replace github.com/elastic/go-libaudit/v2 => github.com/jeffmahoney/go-libaudit/v2 v2.3.1-0.20221119160842-2e08d29618ce
+replace github.com/elastic/go-libaudit/v2 => github.com/jeffmahoney/go-libaudit/v2 v2.3.3-0.20230410233611-6be5fed137e9
