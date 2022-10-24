@@ -1,6 +1,8 @@
 package api
 
 import (
+	"sort"
+
 	errors "github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	context "golang.org/x/net/context"
@@ -54,6 +56,18 @@ func (self *ApiServer) SetPassword(
 	return &emptypb.Empty{}, users_manager.SetUser(user_record)
 }
 
+type userByName []*api_proto.VelociraptorUser
+
+func (s userByName) Len() int {
+    return len(s)
+}
+func (s userByName) Swap(i, j int) {
+    s[i], s[j] = s[j], s[i]
+}
+func (s userByName) Less(i, j int) bool {
+    return s[i].Name < s[j].Name
+}
+
 func (self *ApiServer) GetUsers(
 	ctx context.Context,
 	in *emptypb.Empty) (*api_proto.Users, error) {
@@ -77,6 +91,7 @@ func (self *ApiServer) GetUsers(
 		return nil, err
 	}
 
+	sort.Sort(userByName(users))
 	result.Users = users
 
 	return result, nil
