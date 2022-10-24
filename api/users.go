@@ -64,8 +64,7 @@ func (self *ApiServer) GetUsers(
 		return nil, err
 	}
 
-	permissions := acls.READ_RESULTS
-	perm, err := acls.CheckAccess(org_config_obj, user_record.Name, permissions)
+	perm, err := acls.CheckAccess(org_config_obj, user_record.Name, acls.SERVER_ADMIN)
 	if !perm || err != nil {
 		return nil, status.Error(codes.PermissionDenied,
 			"User is not allowed to enumerate users.")
