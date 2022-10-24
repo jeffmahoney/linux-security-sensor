@@ -140,6 +140,31 @@ func (self *ApiServer) GetUsers(
 	return result, nil
 }
 
+func (self *ApiServer) DeleteUser(
+	ctx context.Context,
+	in *api_proto.UserRequest) (*emptypb.Empty, error) {
+
+	users_manager := services.GetUserManager()
+	user_record, org_config_obj, err := users_manager.GetUserFromContext(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	permissions := acls.SERVER_ADMIN
+	perm, err := acls.CheckAccess(org_config_obj, user_record.Name, permissions)
+	if !perm || err != nil {
+		return nil, status.Error(codes.PermissionDenied,
+			"User is not allowed to delete users.")
+	}
+
+	err = users_manager.DeleteUser(org_config_obj, in.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
 func setPassword(config_obj *config_proto.Config, user_record *api_proto.VelociraptorUser,
 		    password string, replace bool) error {
 	// Check the password if needed
