@@ -14,6 +14,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/services/users"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 // This is only used to set the user's own password which is always
@@ -84,11 +85,40 @@ func (self *ApiServer) GetUsers(
 			"User is not allowed to enumerate users.")
 	}
 
+	ok, err := acls.CheckAccess(org_config_obj, user_record.Name, acls.ORG_ADMIN)
+	if err != nil {
+		return nil, err
+	}
+
+	allOrgs := true
+	if !ok {
+		allOrgs = false
+	}
+
+
 	result := &api_proto.Users{}
 
 	users, err := users_manager.ListUsers()
 	if err != nil {
 		return nil, err
+	}
+
+	if !allOrgs {
+		newUsers := []*api_proto.VelociraptorUser{}
+		for _, org := range user_record.Orgs {
+			for _, user := range users {
+				for _, userOrg := range user.Orgs {
+					if utils.CompareOrgIds(org.Id, userOrg.Id) {
+						newUsers = append(newUsers, user)
+						break
+					}
+				}
+			}
+			if utils.IsRootOrg(org.Id) {
+				break
+			}
+		}
+		users = newUsers
 	}
 
 	sort.Sort(userByName(users))
