@@ -48,6 +48,7 @@ type APIClient interface {
 	// List all the Organizations known on this server.
 	GetOrganizations(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*Organizations, error)
 	GetUser(ctx context.Context, in *UserRequest, opts ...grpc.CallOption) (*VelociraptorUser, error)
+	CreateUser(ctx context.Context, in *CreateUserRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	GetUserFavorites(ctx context.Context, in *Favorite, opts ...grpc.CallOption) (*Favorites, error)
 	SetPassword(ctx context.Context, in *SetPasswordRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	// VFS
@@ -289,6 +290,15 @@ func (c *aPIClient) GetOrganizations(ctx context.Context, in *emptypb.Empty, opt
 func (c *aPIClient) GetUser(ctx context.Context, in *UserRequest, opts ...grpc.CallOption) (*VelociraptorUser, error) {
 	out := new(VelociraptorUser)
 	err := c.cc.Invoke(ctx, "/proto.API/GetUser", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aPIClient) CreateUser(ctx context.Context, in *CreateUserRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/proto.API/CreateUser", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -767,6 +777,7 @@ type APIServer interface {
 	// List all the Organizations known on this server.
 	GetOrganizations(context.Context, *emptypb.Empty) (*Organizations, error)
 	GetUser(context.Context, *UserRequest) (*VelociraptorUser, error)
+	CreateUser(context.Context, *CreateUserRequest) (*emptypb.Empty, error)
 	GetUserFavorites(context.Context, *Favorite) (*Favorites, error)
 	SetPassword(context.Context, *SetPasswordRequest) (*emptypb.Empty, error)
 	// VFS
@@ -896,6 +907,9 @@ func (UnimplementedAPIServer) GetOrganizations(context.Context, *emptypb.Empty) 
 }
 func (UnimplementedAPIServer) GetUser(context.Context, *UserRequest) (*VelociraptorUser, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetUser not implemented")
+}
+func (UnimplementedAPIServer) CreateUser(context.Context, *CreateUserRequest) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method CreateUser not implemented")
 }
 func (UnimplementedAPIServer) GetUserFavorites(context.Context, *Favorite) (*Favorites, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetUserFavorites not implemented")
@@ -1380,6 +1394,24 @@ func _API_GetUser_Handler(srv interface{}, ctx context.Context, dec func(interfa
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(APIServer).GetUser(ctx, req.(*UserRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _API_CreateUser_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CreateUserRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).CreateUser(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/CreateUser",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).CreateUser(ctx, req.(*CreateUserRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2264,6 +2296,10 @@ var API_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetUser",
 			Handler:    _API_GetUser_Handler,
+		},
+		{
+			MethodName: "CreateUser",
+			Handler:    _API_CreateUser_Handler,
 		},
 		{
 			MethodName: "GetUserFavorites",
