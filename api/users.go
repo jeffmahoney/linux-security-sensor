@@ -71,7 +71,7 @@ func (s userByName) Less(i, j int) bool {
 
 func (self *ApiServer) GetUsers(
 	ctx context.Context,
-	in *emptypb.Empty) (*api_proto.Users, error) {
+	in *api_proto.GetUsersRequest) (*api_proto.Users, error) {
 
 	users_manager := services.GetUserManager()
 	user_record, org_config_obj, err := users_manager.GetUserFromContext(ctx)
@@ -119,6 +119,15 @@ func (self *ApiServer) GetUsers(
 			}
 		}
 		users = newUsers
+	}
+
+	if in.WithRoles {
+		for _, user := range users {
+			user.Permissions, err = acls.GetPolicy(org_config_obj, user.Name)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	sort.Sort(userByName(users))
