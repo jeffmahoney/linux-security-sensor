@@ -199,7 +199,12 @@ export default class Users extends Component {
                     return;
                 }
 
-                this.setState({orgs_initialized: true, orgs: response.data.orgs});
+		let orgs = [];
+		response.data.orgs.map((elem, idx) => {
+			orgs.push({ id: elem.org_id, name: elem.name});
+		});
+
+                this.setState({orgs_initialized: true, orgs: orgs});
               });
           } else {
               this.setState({orgs_initialized: true});

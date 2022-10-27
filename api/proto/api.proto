@@ -243,9 +243,16 @@ service API {
         };
     }
 
-    rpc CreateUser(CreateUserRequest) returns(google.protobuf.Empty) {
+    rpc CreateUser(ChangeUserRequest) returns(google.protobuf.Empty) {
         option (google.api.http) = {
             post: "/api/v1/CreateUser",
+            body: "*"
+        };
+    }
+
+    rpc UpdateUser(ChangeUserRequest) returns(google.protobuf.Empty) {
+        option (google.api.http) = {
+            post: "/api/v1/UpdateUser",
             body: "*"
         };
     }

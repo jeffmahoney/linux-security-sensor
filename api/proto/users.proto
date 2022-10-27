@@ -46,16 +46,12 @@ message VelociraptorUser {
     string current_org = 12;
 }
 
-message CreateUserRequest {
+message ChangeUserRequest {
 	VelociraptorUser User = 1 [(sem_type) = {
-		description: "The user to be created.  Password fields will be ignored."
+		description: "The user to be created or changed.  Password fields will be ignored."
 	}];
 	string password = 2 [(sem_type) = {
 		description: "The cleartext password."
-	}];
-
-	bool replace = 3 [(sem_type) = {
-		description: "Whether to update an existing user if one exists."
 	}];
 }
 

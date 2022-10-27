@@ -11,6 +11,7 @@ import Tooltip from 'react-bootstrap/Tooltip';
 import T from '../i8n/i8n.js';
 import Card  from 'react-bootstrap/Card';
 import UserConfig from '../core/user.js';
+import { withSnackbar } from 'react-simple-snackbar';
 import "./user.css";
 
 
@@ -76,7 +77,6 @@ class UserState {
             'currentOrg': '',
             'failed' : false,
         }
-        this.org_ids = [];
 
         this.password = '';
     }
@@ -95,18 +95,6 @@ class UserState {
         return this.roles.indexOf(role) !== -1;
     }
 
-    isMemberOf(org) {
-        if (this.fields.orgs.length === 0) {
-            return org === "root";
-        }
-        if (this.org_ids.length === 0 && this.fields.orgs.length !== 0) {
-            this.fields.orgs.forEach((org, idx) => {
-                this.org_ids.push(org.id);
-            });
-          }
-        return this.org_ids.indexOf(org) !== -1;
-    }
-
     updateImpliedPermissions() {
         this.permissions = {};
         this.roles.forEach((role) => {
@@ -117,11 +105,11 @@ class UserState {
     }
 
     modifyRoles(role, present) {
-        let idx = this.roles.indexOf(role);
-        if (present && idx === -1)
+        if (present) {
             this.roles.push(role);
-        else if (!present)
-            this.roles.splice(idx, 1);
+        } else if (!present) {
+            this.roles = this.roles.filter((elem) => { return elem !== role });
+        }
 
         this.updateImpliedPermissions();
     }
@@ -130,38 +118,39 @@ class UserState {
         this.permissions[perm] = value;
     }
 
-    removeOrg(org_id) {
-        let idx_remove = -1;
-        this.fields.orgs.forEach((current_org, idx) => {
-            if (org_id === current_org.id) {
-              idx_remove = idx;
+    isMemberOf(org_id) {
+        for (let i = 0; i < this.fields.orgs.length; i++) {
+            if (org_id == this.fields.orgs[i].id) {
+                return true;
             }
-        });
-        if (idx_remove !== -1) {
-            this.fields.orgs.splice(idx_remove, 1);
         }
+
+        return false;
+    }
+
+    setRootOrg() {
+        this.fields.orgs = [ { "id" : "root", "name" : "<root>" } ];
     }
 
     modifyOrgs(org, present, allOrgs) {
+        console.log("org " + org.id + " present " + present);
         if (!present) {
-            if (this.fields.orgs.length === 0) {
-                this.fields.orgs = [];
-                _.map(allOrgs, (current_org, idx) => {
-                    this.fields.orgs.push({id: current_org.org_id,
-                                           name: current_org.name});
+            if (org.id === "root") {
+                this.fields.orgs = allOrgs.filter((elem) => {
+                    return elem.id !== "root";
+                });
+            } else {
+                this.fields.orgs = this.fields.orgs.filter((elem) => {
+                    return elem.id !== org.id;
                 });
             }
-            this.removeOrg(org.org_id);
-            this.removeOrg("root");
         } else if (present) {
             if (org.id === "root") {
-                this.fields.orgs = [];
+                this.setRootOrg();
             } else {
-                this.fields.orgs.push({id: org.org_id, name: org.name});
-                this.removeOrg("root");
+                this.fields.orgs.push({id: org.id, name: org.name});
             }
         }
-        this.org_ids = [];
     }
 
     clone() {
@@ -218,7 +207,9 @@ export class User extends Component {
         if (this.props.mode === "edit" || this.props.mode === "view") {
             this.loadUser(this.props.user);
         } else {
-            this.setState({'user' : new UserState() });
+            let user = new UserState();
+            user.setRootOrg();
+            this.setState({'user' : user });
         }
     }
 
@@ -264,9 +255,15 @@ export class User extends Component {
                     new_user_state.fields[data_key] = data_value;
                 }
             }
+
+            if (new_user_state.fields.orgs.length === 0) {
+                new_user_state.setRootOrg();
+            }
+
             this.setState({'user' : new_user_state});
         }, (reason) => {
             let new_user_state = new UserState();
+            new_user_state.setRootOrg();
             new_user_state.name = user;
             new_user_state.failed = true;
             this.setState({'user' : new_user_state});
@@ -293,6 +290,7 @@ export class User extends Component {
 
     changeOrg(org, e) {
         let value = e.currentTarget.checked;
+        console.log("changeOrg org " + org.id + " present " + value);
         this.setState((state) => {
             let user_state = state.user.clone();
             user_state.modifyOrgs(org, value, this.props.orgs);
@@ -460,30 +458,34 @@ export class User extends Component {
     }
 
     renderOrganizationsCard() {
-        let disabled = !this.context.traits.Permissions.org_admin || this.props.orgs.length === 2;
+        let disabled = !this.context.traits.Permissions.org_admin;
         let root_org = this.state.user.isMemberOf("root");
         return (
           <Card>
-          <Card.Header>
-            <OverlayTrigger delay={{show: 250, hide: 400}}
-                            overlay={(props)=>renderToolTip(props, "ToolOrganizations")}>
-              <div>
-                    {T("Organizations")}
-              </div>
-             </OverlayTrigger>
-          </Card.Header>
+            <Card.Header>
+              <OverlayTrigger delay={{show: 250, hide: 400}}
+                              overlay={(props)=>renderToolTip(props, "ToolOrganizations")}>
+                <div>
+                  {T("Organizations")}
+                </div>
+              </OverlayTrigger>
+            </Card.Header>
             <Card.Body>
               { _.map(this.props.orgs, (org, idx) => {
-                  let name = org.name;
-                  let checked = root_org || this.state.user.isMemberOf(org.org_id)
-                  if (org.org_id === "root") {
-                    name = T("Organizational Root");
-                  }
-                  return (
-                     <Form.Switch disabled={disabled} label={name} key={org.org_id}
-                                  id={org.org_id} checked={checked}
-                                  onChange={(e) => {this.changeOrg(org, e)}} />
-                  );
+                    let name = org.name;
+                    let checked = root_org || this.state.user.isMemberOf(org.id);
+                    if (org.id === "root") {
+                        name = T("Organizational Root");
+                    } else if (root_org) {
+                        disabled = true;
+                    }
+                    // We can't have an id of 'root'
+                    let key = "Org_" + org.id;
+                    return (
+                       <Form.Switch label={name} id={key} disabled={disabled} key={key}
+                                    checked={checked}
+                                    onChange={(e) => {this.changeOrg(org, e)}} />
+                    );
               })}
             </Card.Body>
           </Card>
@@ -600,4 +602,4 @@ export class User extends Component {
     }
 };
 
-export default withRouter(User);
+export default withSnackbar(withRouter(User));

@@ -48,7 +48,8 @@ type APIClient interface {
 	// List all the Organizations known on this server.
 	GetOrganizations(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*Organizations, error)
 	GetUser(ctx context.Context, in *UserRequest, opts ...grpc.CallOption) (*VelociraptorUser, error)
-	CreateUser(ctx context.Context, in *CreateUserRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	CreateUser(ctx context.Context, in *ChangeUserRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
+	UpdateUser(ctx context.Context, in *ChangeUserRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	DeleteUser(ctx context.Context, in *UserRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
 	GetUserFavorites(ctx context.Context, in *Favorite, opts ...grpc.CallOption) (*Favorites, error)
 	SetPassword(ctx context.Context, in *SetPasswordRequest, opts ...grpc.CallOption) (*emptypb.Empty, error)
@@ -297,9 +298,18 @@ func (c *aPIClient) GetUser(ctx context.Context, in *UserRequest, opts ...grpc.C
 	return out, nil
 }
 
-func (c *aPIClient) CreateUser(ctx context.Context, in *CreateUserRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+func (c *aPIClient) CreateUser(ctx context.Context, in *ChangeUserRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
 	out := new(emptypb.Empty)
 	err := c.cc.Invoke(ctx, "/proto.API/CreateUser", in, out, opts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *aPIClient) UpdateUser(ctx context.Context, in *ChangeUserRequest, opts ...grpc.CallOption) (*emptypb.Empty, error) {
+	out := new(emptypb.Empty)
+	err := c.cc.Invoke(ctx, "/proto.API/UpdateUser", in, out, opts...)
 	if err != nil {
 		return nil, err
 	}
@@ -787,7 +797,8 @@ type APIServer interface {
 	// List all the Organizations known on this server.
 	GetOrganizations(context.Context, *emptypb.Empty) (*Organizations, error)
 	GetUser(context.Context, *UserRequest) (*VelociraptorUser, error)
-	CreateUser(context.Context, *CreateUserRequest) (*emptypb.Empty, error)
+	CreateUser(context.Context, *ChangeUserRequest) (*emptypb.Empty, error)
+	UpdateUser(context.Context, *ChangeUserRequest) (*emptypb.Empty, error)
 	DeleteUser(context.Context, *UserRequest) (*emptypb.Empty, error)
 	GetUserFavorites(context.Context, *Favorite) (*Favorites, error)
 	SetPassword(context.Context, *SetPasswordRequest) (*emptypb.Empty, error)
@@ -919,8 +930,11 @@ func (UnimplementedAPIServer) GetOrganizations(context.Context, *emptypb.Empty) 
 func (UnimplementedAPIServer) GetUser(context.Context, *UserRequest) (*VelociraptorUser, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method GetUser not implemented")
 }
-func (UnimplementedAPIServer) CreateUser(context.Context, *CreateUserRequest) (*emptypb.Empty, error) {
+func (UnimplementedAPIServer) CreateUser(context.Context, *ChangeUserRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method CreateUser not implemented")
+}
+func (UnimplementedAPIServer) UpdateUser(context.Context, *ChangeUserRequest) (*emptypb.Empty, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method UpdateUser not implemented")
 }
 func (UnimplementedAPIServer) DeleteUser(context.Context, *UserRequest) (*emptypb.Empty, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method DeleteUser not implemented")
@@ -1413,7 +1427,7 @@ func _API_GetUser_Handler(srv interface{}, ctx context.Context, dec func(interfa
 }
 
 func _API_CreateUser_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(CreateUserRequest)
+	in := new(ChangeUserRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
@@ -1425,7 +1439,25 @@ func _API_CreateUser_Handler(srv interface{}, ctx context.Context, dec func(inte
 		FullMethod: "/proto.API/CreateUser",
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(APIServer).CreateUser(ctx, req.(*CreateUserRequest))
+		return srv.(APIServer).CreateUser(ctx, req.(*ChangeUserRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _API_UpdateUser_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ChangeUserRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(APIServer).UpdateUser(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: "/proto.API/UpdateUser",
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(APIServer).UpdateUser(ctx, req.(*ChangeUserRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -2332,6 +2364,10 @@ var API_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CreateUser",
 			Handler:    _API_CreateUser_Handler,
+		},
+		{
+			MethodName: "UpdateUser",
+			Handler:    _API_UpdateUser_Handler,
 		},
 		{
 			MethodName: "DeleteUser",
