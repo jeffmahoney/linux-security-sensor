@@ -1,3 +1,30 @@
+CLANG ?= clang
+LLVM_STRIP ?= llvm-strip
+CFLAGS := -g -O2 -Wall
+ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/' | sed 's/ppc64le/powerpc/' | sed 's/mips.*/mips/')
+EXTRA_TAGS =
+
+GOOS := $(shell go env | grep GOOS|sed -e 's/^.*=//'|tr -d '"')
+ifeq ($(GOOS),linux)
+BUILD_LIBBPFGO ?= 1
+endif
+
+ifeq ($(BUILD_LIBBPFGO),1)
+ifneq ($(shell command -pv $(CLANG);),)
+LIBBPFGO_DIR := $(abspath third_party/libbpfgo)
+LIBBPF_DIR := $(LIBBPFGO_DIR)/libbpf
+LIBBPF_OUTPUT := $(LIBBPFGO_DIR)/output
+LIBBPF_LIB := $(LIBBPF_OUTPUT)/libbpf.a
+GIT := git
+BPFTOOL := bpftool
+EXTRA_TAGS += linuxbpf libbpfgo_static
+else
+$(error Cannot build BPF objects without clang installed.  Install clang or build with BUILD_LIBBPFGO=0.)
+endif
+endif
+
+export EXTRA_TAGS
+
 all:
 	go run make.go -v autoDev
 
@@ -45,10 +72,35 @@ linux_arm64:
 linux_musl:
 	go run make.go -v LinuxMusl
 
-linux:
-	go run make.go -v linux
+always-check:
 
-linux_bare:
+ifeq ($(BUILD_LIBBPFGO), 1)
+BPF_MODULES :=
+
+$(LIBBPFGO_DIR): always-check
+	echo "INFO: updating submodule 'libbpfgo'"
+	$(GIT) submodule update --init --recursive $@
+
+$(LIBBPF_OUTPUT)/vmlinux.h: $(LIBBFGO_DIR)
+	mkdir -p $(LIBBPF_OUTPUT)
+	$(BPFTOOL) btf dump file /sys/kernel/btf/vmlinux format c > $@
+
+$(LIBBPF_LIB): $(LIBBPFGO_DIR) $(LIBBPF_OUTPUT)/vmlinux.h
+	make -C $(LIBBPFGO_DIR) libbpfgo-static
+
+%.bpf.o: %.bpf.c $(LIBBPF_LIB)
+	$(CLANG) $(CFLAGS) -target bpf -D__TARGET_ARCH_$(ARCH)	      \
+		     -I$(LIBBPF_OUTPUT) -I$(LIBBPF_DIR)/include/uapi \
+		     -c $(filter %.c,$^) -o $@ && \
+	$(LLVM_STRIP) -g $@
+libbpfgo-clean:
+	make -C $(LIBBPFGO_DIR) clean
+LIBBPFGO_CLEAN := libbpfgo-clean
+endif
+
+linux: $(BPF_MODULES)
+	go run make.go -v linux
+linux_bare: $(BPF_MODULES)
 	go run make.go -v linuxBare
 
 freebsd:
@@ -63,8 +115,10 @@ windows_bare:
 windowsx86:
 	go run make.go -v windowsx86
 
-clean:
+go-clean:
 	go run make.go -v clean
+
+clean: go-clean $(LIBBPFGO_CLEAN)
 
 generate:
 	go generate ./vql/windows/
