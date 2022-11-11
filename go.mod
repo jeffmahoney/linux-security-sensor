@@ -112,6 +112,8 @@ require (
 	github.com/Shopify/sarama v1.37.2
 	github.com/Velocidex/file-rotatelogs v0.0.0-20211221020724-d12e4dae4e11
 	github.com/Velocidex/ordereddict v0.0.0-20221110130714-6a7cb85851cd
+	github.com/aquasecurity/libbpfgo v0.4.4-libbpf-1.0.1
+	github.com/aquasecurity/libbpfgo/helpers v0.4.4-libbpf-1.0.1
 	github.com/clayscode/Go-Splunk-HTTP/splunk/v2 v2.0.1-0.20221027171526-76a36be4fa02
 	github.com/coreos/go-oidc/v3 v3.4.0
 	github.com/evanphx/json-patch/v5 v5.6.0
@@ -241,3 +243,6 @@ replace github.com/alecthomas/chroma => github.com/Velocidex/chroma v0.6.8-0.202
 replace github.com/crewjam/saml v0.4.8 => github.com/Velocidex/saml v0.0.0-20221019055034-272f55e26c8d
 
 replace github.com/go-errors/errors => github.com/Velocidex/errors v0.0.0-20221019164655-9ace6bf61e26
+
+replace github.com/aquasecurity/libbpfgo => ./third_party/libbpfgo
+replace github.com/aquasecurity/libbpfgo/helpers => ./third_party/libbpfgo/helpers
