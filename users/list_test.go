@@ -45,7 +45,7 @@ func (self *UserManagerTestSuite) TestListUsers() {
 		Roles: []string{"administrator"},
 	}
 	err = users.AddUserToOrg(self.Ctx, users.UseExistingUser,
-		"OrgAdmin", "AdminO1", []string{"O1", "O2"}, admin_policy)
+		"OrgAdmin", "AdminO1", map[string]*acl_proto.ApiClientACL{"O1": admin_policy, "O2": admin_policy})
 	assert.NoError(self.T(), err)
 
 	// List users as AdminO2. AdminO2 can see AdminO1 in their org,

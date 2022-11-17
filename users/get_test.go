@@ -52,11 +52,11 @@ func (self *UserManagerTestSuite) TestGetUsers() {
 		Roles: []string{"administrator"},
 	}
 	err = users.AddUserToOrg(self.Ctx, users.UseExistingUser,
-		"OrgAdmin", "AdminO1", []string{"O1", "O2"}, admin_policy)
+	"OrgAdmin", "AdminO1", map[string]*acl_proto.ApiClientACL{"O1": admin_policy, "O2": admin_policy})
 	assert.NoError(self.T(), err)
 
 	err = users.AddUserToOrg(self.Ctx, users.UseExistingUser,
-		"OrgAdmin", "UserO1", []string{"O1", "O2"}, admin_policy)
+		"OrgAdmin", "UserO1", map[string]*acl_proto.ApiClientACL{"O1": admin_policy, "O2": admin_policy})
 	assert.NoError(self.T(), err)
 
 	// When AdminO2 looks at UserO1 they can only see the O2

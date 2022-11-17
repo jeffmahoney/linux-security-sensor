@@ -39,7 +39,7 @@ func (self *UserManagerTestSuite) TestDeleteUser() {
 	}
 
 	err = users.AddUserToOrg(self.Ctx, users.UseExistingUser,
-		"OrgAdmin", "UserO2", []string{"O1", "O2"}, reader_policy)
+		"OrgAdmin", "UserO2", map[string]*acl_proto.ApiClientACL{"O1": reader_policy, "O2": reader_policy})
 	assert.NoError(self.T(), err)
 
 	// Lookup using ORG_ADMIN
