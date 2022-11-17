@@ -701,6 +701,26 @@ func (mr *MockAPIClientMockRecorder) GetUserFavorites(arg0, arg1 interface{}, ar
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetUserFavorites", reflect.TypeOf((*MockAPIClient)(nil).GetUserFavorites), varargs...)
 }
 
+// GetUserRoles mocks base method.
+func (m *MockAPIClient) GetUserRoles(arg0 context.Context, arg1 *proto0.UserRequest, arg2 ...grpc.CallOption) (*proto0.UserRoles, error) {
+	m.ctrl.T.Helper()
+	varargs := []interface{}{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "GetUserRoles", varargs...)
+	ret0, _ := ret[0].(*proto0.UserRoles)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetUserRoles indicates an expected call of GetUserRoles.
+func (mr *MockAPIClientMockRecorder) GetUserRoles(arg0, arg1 interface{}, arg2 ...interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]interface{}{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetUserRoles", reflect.TypeOf((*MockAPIClient)(nil).GetUserRoles), varargs...)
+}
+
 // GetUserUITraits mocks base method.
 func (m *MockAPIClient) GetUserUITraits(arg0 context.Context, arg1 *emptypb.Empty, arg2 ...grpc.CallOption) (*proto0.ApiUser, error) {
 	m.ctrl.T.Helper()
@@ -1139,6 +1159,26 @@ func (mr *MockAPIClientMockRecorder) SetToolInfo(arg0, arg1 interface{}, arg2 ..
 	mr.mock.ctrl.T.Helper()
 	varargs := append([]interface{}{arg0, arg1}, arg2...)
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetToolInfo", reflect.TypeOf((*MockAPIClient)(nil).SetToolInfo), varargs...)
+}
+
+// SetUserRoles mocks base method.
+func (m *MockAPIClient) SetUserRoles(arg0 context.Context, arg1 *proto0.UserRoles, arg2 ...grpc.CallOption) (*emptypb.Empty, error) {
+	m.ctrl.T.Helper()
+	varargs := []interface{}{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "SetUserRoles", varargs...)
+	ret0, _ := ret[0].(*emptypb.Empty)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// SetUserRoles indicates an expected call of SetUserRoles.
+func (mr *MockAPIClientMockRecorder) SetUserRoles(arg0, arg1 interface{}, arg2 ...interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]interface{}{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "SetUserRoles", reflect.TypeOf((*MockAPIClient)(nil).SetUserRoles), varargs...)
 }
 
 // UpdateNotebook mocks base method.
