@@ -421,6 +421,26 @@ func (mr *MockAPIClientMockRecorder) GetFlowRequests(arg0, arg1 interface{}, arg
 	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetFlowRequests", reflect.TypeOf((*MockAPIClient)(nil).GetFlowRequests), varargs...)
 }
 
+// GetGlobalUsers mocks base method.
+func (m *MockAPIClient) GetGlobalUsers(arg0 context.Context, arg1 *emptypb.Empty, arg2 ...grpc.CallOption) (*proto0.Users, error) {
+	m.ctrl.T.Helper()
+	varargs := []interface{}{arg0, arg1}
+	for _, a := range arg2 {
+		varargs = append(varargs, a)
+	}
+	ret := m.ctrl.Call(m, "GetGlobalUsers", varargs...)
+	ret0, _ := ret[0].(*proto0.Users)
+	ret1, _ := ret[1].(error)
+	return ret0, ret1
+}
+
+// GetGlobalUsers indicates an expected call of GetGlobalUsers.
+func (mr *MockAPIClientMockRecorder) GetGlobalUsers(arg0, arg1 interface{}, arg2 ...interface{}) *gomock.Call {
+	mr.mock.ctrl.T.Helper()
+	varargs := append([]interface{}{arg0, arg1}, arg2...)
+	return mr.mock.ctrl.RecordCallWithMethodType(mr.mock, "GetGlobalUsers", reflect.TypeOf((*MockAPIClient)(nil).GetGlobalUsers), varargs...)
+}
+
 // GetHunt mocks base method.
 func (m *MockAPIClient) GetHunt(arg0 context.Context, arg1 *proto0.GetHuntRequest, arg2 ...grpc.CallOption) (*proto0.Hunt, error) {
 	m.ctrl.T.Helper()
