@@ -80,6 +80,11 @@ jobs:
         go run make.go -v Windowsx86
         go run make.go -v DarwinBase
 
+    - name: Test
+      run:
+        go test -race -v --tags server_vql ./...                                 
+
+
     - name: StoreBinaries
       uses: actions/upload-artifact@v1
       with:
