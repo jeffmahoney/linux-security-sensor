@@ -267,7 +267,7 @@ func (self *HTTPConnector) Post(
 	req, err := http.NewRequestWithContext(ctx,
 		"POST", self.GetCurrentUrl(handler), reader)
 	if err != nil {
-		self.logger.Info("Post to %v returned %v - advancing to next server\n",
+		self.logger.Warn("Post to %v returned %v - advancing to next server\n",
 			self.GetCurrentUrl(handler), err)
 		self.advanceToNextServer(ctx)
 		return nil, errors.Wrap(err, 0)
@@ -293,7 +293,7 @@ func (self *HTTPConnector) Post(
 
 	resp, err := self.client.Do(req)
 	if err != nil && err != io.EOF {
-		self.logger.Info("Post to %v returned %v - advancing to next server\n",
+		self.logger.Warn("Post to %v returned %v - advancing to next server\n",
 			self.GetCurrentUrl(handler), err)
 
 		// POST error - rotate to next URL
@@ -389,7 +389,7 @@ func (self *HTTPConnector) Post(
 		return encrypted, nil
 
 	default:
-		self.logger.Info("Post to %v returned %v - advancing\n",
+		self.logger.Warn("Post to %v returned %v - advancing\n",
 			self.GetCurrentUrl(handler), resp.StatusCode)
 
 		// POST error - rotate to next URL
@@ -422,7 +422,7 @@ func (self *HTTPConnector) advanceToNextServer(ctx context.Context) {
 		wait := self.maxPoll + time.Duration(
 			GetRand()(int(self.maxPollDev)))*time.Second
 
-		self.logger.Info(
+		self.logger.Warn(
 			"Waiting for a reachable server: %v", wait)
 
 		// While we wait to reconnect we need to update the nanny or
@@ -680,7 +680,7 @@ func (self *NotificationReader) sendToURL(
 		self.connector.ReKeyNextServer(ctx)
 	}
 
-	self.logger.Info("%s: Connected to %s", self.name,
+	self.logger.Warn("%s: Connected to %s", self.name,
 		self.connector.GetCurrentUrl(self.handler))
 
 	// Clients always compress messages to the server.
