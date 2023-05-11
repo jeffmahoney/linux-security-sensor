@@ -12,6 +12,7 @@ import "C"
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -123,13 +124,13 @@ func (snooper *CronSnooper) emit_event(cmd, user, file string, action Action) {
 func (snooper *CronSnooper) add_cron_watches() error {
 	for _, v := range snooper.cron_system_paths {
 		err := snooper.watcher.Add(v)
-		if err != nil && err != syscall.ENOENT {
+		if err != nil && !errors.Is(err, syscall.ENOENT) {
 			return fmt.Errorf("Еrror adding a watch for: %v err: %v", v, err)
 		}
 	}
 
 	err := snooper.watcher.Add(snooper.cron_spool_path)
-	if err != nil && err != syscall.ENOENT {
+	if err != nil && !errors.Is(err, syscall.ENOENT) {
 		return fmt.Errorf("Еrror adding a watch for: %v err: %v",
 				  snooper.cron_spool_path, err)
 	}
