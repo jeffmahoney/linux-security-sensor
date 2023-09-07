@@ -1,7 +1,8 @@
 CLANG ?= clang
 LLVM_STRIP ?= llvm-strip
 CFLAGS := -g -O2 -Wall
-ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/' | sed 's/ppc64le/powerpc/' | sed 's/mips.*/mips/' | sed 's/s390x/s390/')
+CLANGARCH := $(shell uname -m | sed 's/ppc64le/ppc64/')
+BPFARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/' | sed 's/ppc64le/powerpc/' | sed 's/mips.*/mips/' | sed 's/s390x/s390/')
 EXTRA_TAGS =
 
 GOOS := $(shell go env | grep GOOS|sed -e 's/^.*=//'|tr -d '"')
@@ -18,6 +19,9 @@ LIBBPF_LIB := $(LIBBPF_OUTPUT)/libbpf.a
 GIT := git
 BPFTOOL := bpftool
 EXTRA_TAGS += linuxbpf libbpfgo_static
+CGO_CFLAGS = -I$(LIBBPF_OUTPUT)
+CGO_LDFLAGS = $(LIBBPF_OUTPUT)/libbpf.a -l:libelf.a -lz -lzstd
+export CGO_CFLAGS CGO_LDFLAGS
 else
 $(error Cannot build BPF objects without clang installed.  Install clang or build with BUILD_LIBBPFGO=0.)
 endif
@@ -91,7 +95,7 @@ $(LIBBPF_LIB): $(LIBBPFGO_DIR) $(LIBBPF_OUTPUT)/vmlinux.h
 	make -C $(LIBBPFGO_DIR) libbpfgo-static
 
 %.bpf.o: %.bpf.c $(LIBBPF_LIB)
-	$(CLANG) $(CFLAGS) -target bpf -D__TARGET_ARCH_$(ARCH)	      \
+	$(CLANG) $(CFLAGS) -target bpf -D__TARGET_ARCH_$(BPFARCH) -D__$(CLANGARCH)__	      \
 		     -I$(LIBBPF_OUTPUT) -I$(LIBBPF_DIR)/include/uapi \
 		     -c $(filter %.c,$^) -o $@ && \
 	$(LLVM_STRIP) -g $@
