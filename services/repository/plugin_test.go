@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -18,14 +18,15 @@
 package repository_test
 
 import (
-	"sync"
 	"testing"
+	"time"
 
 	"github.com/Velocidex/ordereddict"
 	"github.com/sebdah/goldie/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"www.velocidex.com/golang/velociraptor/actions"
+	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/json"
@@ -33,10 +34,10 @@ import (
 	"www.velocidex.com/golang/velociraptor/responder"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/services/repository"
-	repository_impl "www.velocidex.com/golang/velociraptor/services/repository"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vtesting"
 	"www.velocidex.com/golang/vfilter"
 
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	_ "www.velocidex.com/golang/velociraptor/vql/common"
 )
 
@@ -49,12 +50,11 @@ type PluginTestSuite struct {
 // Load all built in artifacts and make sure they validate
 // syntax. This should catch syntax errors in built in artifacts.
 func (self *PluginTestSuite) TestArtifactsSyntax() {
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	err = repository.LoadBuiltInArtifacts(
-		self.Ctx, self.ConfigObj, manager.(*repository.RepositoryManager),
-		true /* validate */)
+		self.Ctx, self.ConfigObj, manager.(*repository.RepositoryManager))
 	assert.NoError(self.T(), err)
 
 	ConfigObj := self.ConfigObj
@@ -63,27 +63,19 @@ func (self *PluginTestSuite) TestArtifactsSyntax() {
 
 	new_repository := manager.NewRepository()
 
-	for _, artifact_name := range repository.List() {
-		artifact, pres := repository.Get(ConfigObj, artifact_name)
+	names, err := repository.List(self.Ctx, ConfigObj)
+	assert.NoError(self.T(), err)
+
+	for _, artifact_name := range names {
+		artifact, pres := repository.Get(self.Ctx, ConfigObj, artifact_name)
 		assert.True(self.T(), pres)
 
-		if artifact != nil {
-			_, err = new_repository.LoadProto(artifact, true /* validate */)
+		if artifact != nil && !artifact.IsAlias {
+			_, err = new_repository.LoadProto(artifact,
+				services.ArtifactOptions{ValidateArtifact: true})
 			assert.NoError(self.T(), err, "Error compiling "+artifact_name)
 		}
 	}
-}
-
-func (self *PluginTestSuite) LoadArtifacts(artifact_definitions []string) services.Repository {
-	manager, _ := services.GetRepositoryManager()
-	repository := manager.NewRepository()
-
-	for _, definition := range artifact_definitions {
-		_, err := repository.LoadYaml(definition, false, true)
-		assert.NoError(self.T(), err)
-	}
-
-	return repository
 }
 
 var (
@@ -106,17 +98,6 @@ sources:
 `}
 )
 
-func (self *PluginTestSuite) TestArtifactPlugin() {
-	repository := self.LoadArtifacts(artifact_definitions)
-
-	wg := &sync.WaitGroup{}
-	p := repository_impl.NewArtifactRepositoryPlugin(
-		wg, repository.(*repository_impl.Repository)).(*repository_impl.ArtifactRepositoryPlugin)
-
-	g := goldie.New(self.T())
-	g.Assert(self.T(), "TestArtifactPlugin", []byte(p.Print()))
-}
-
 var (
 	artifact_definitions_precondition = []string{`
 name: CallArtifactWithFalsePrecondition
@@ -135,17 +116,17 @@ sources:
 )
 
 func (self *PluginTestSuite) TestArtifactPluginWithPrecondition() {
-	repository := self.LoadArtifacts(artifact_definitions_precondition)
+	repository := self.LoadArtifacts(artifact_definitions_precondition...)
 
 	builder := services.ScopeBuilder{
 		Config:     self.ConfigObj,
-		ACLManager: vql_subsystem.NullACLManager{},
+		ACLManager: acl_managers.NullACLManager{},
 		Repository: repository,
 		Logger:     logging.NewPlainLogger(self.ConfigObj, &logging.FrontendComponent),
 		Env:        ordereddict.NewDict(),
 	}
 
-	manager, _ := services.GetRepositoryManager()
+	manager, _ := services.GetRepositoryManager(self.ConfigObj)
 	scope := manager.BuildScope(builder)
 	defer scope.Close()
 
@@ -195,14 +176,14 @@ sources:
 // Test that calling a client artifact with multiple sources results
 // in all rows.
 func (self *PluginTestSuite) TestClientPluginMultipleSources() {
-	repository := self.LoadArtifacts(source_definitions)
+	repository := self.LoadArtifacts(source_definitions...)
 	request := &flows_proto.ArtifactCollectorArgs{
 		ClientId:  "C.1234",
 		Artifacts: []string{"Call"},
 	}
 
-	acl_manager := vql_subsystem.NullACLManager{}
-	launcher, err := services.GetLauncher()
+	acl_manager := acl_managers.NullACLManager{}
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	compiled, err := launcher.CompileCollectorArgs(
@@ -210,18 +191,27 @@ func (self *PluginTestSuite) TestClientPluginMultipleSources() {
 		services.CompilerOptions{}, request)
 	assert.NoError(self.T(), err)
 
-	test_responder := responder.TestResponder()
+	test_responder := responder.TestResponderWithFlowId(
+		self.ConfigObj, "F.TestClientPluginMultipleSources")
 	for _, vql_request := range compiled {
 		actions.VQLClientAction{}.StartQuery(
 			self.ConfigObj, self.Ctx, test_responder, vql_request)
 	}
+	defer test_responder.Close()
+
+	messages := []*crypto_proto.VeloMessage{}
+	vtesting.WaitUntil(time.Second, self.T(), func() bool {
+		messages = test_responder.Drain.Messages()
+		return len(messages) >= 2
+	})
 
 	results := ""
-	for _, msg := range responder.GetTestResponses(test_responder) {
+	for _, msg := range messages {
 		if msg.VQLResponse != nil {
 			results += msg.VQLResponse.JSONLResponse
 		}
 	}
+
 	g := goldie.New(self.T())
 	g.Assert(self.T(), "TestClientPluginMultipleSources", []byte(results))
 }
@@ -243,17 +233,17 @@ sources:
 // Test that calling a client artifact with multiple sources results
 // in all rows.
 func (self *PluginTestSuite) TestClientPluginMultipleSourcesAndPrecondtions() {
-	repository := self.LoadArtifacts(precondition_source_definitions)
+	repository := self.LoadArtifacts(precondition_source_definitions...)
 	builder := services.ScopeBuilder{
 		Config:     self.ConfigObj,
-		ACLManager: vql_subsystem.NullACLManager{},
+		ACLManager: acl_managers.NullACLManager{},
 		Repository: repository,
 		Logger: logging.NewPlainLogger(
 			self.ConfigObj, &logging.FrontendComponent),
 		Env: ordereddict.NewDict(),
 	}
 
-	manager, _ := services.GetRepositoryManager()
+	manager, _ := services.GetRepositoryManager(self.ConfigObj)
 	scope := manager.BuildScope(builder)
 	defer scope.Close()
 
@@ -303,17 +293,17 @@ sources:
 // Test that calling a client artifact with multiple sources results
 // in all rows.
 func (self *PluginTestSuite) TestClientPluginMultipleSourcesAndPrecondtionsEvents() {
-	repository := self.LoadArtifacts(precondition_source_events_definitions)
+	repository := self.LoadArtifacts(precondition_source_events_definitions...)
 	builder := services.ScopeBuilder{
 		Config:     self.ConfigObj,
-		ACLManager: vql_subsystem.NullACLManager{},
+		ACLManager: acl_managers.NullACLManager{},
 		Repository: repository,
 		Logger: logging.NewPlainLogger(
 			self.ConfigObj, &logging.FrontendComponent),
 		Env: ordereddict.NewDict(),
 	}
 
-	manager, _ := services.GetRepositoryManager()
+	manager, _ := services.GetRepositoryManager(self.ConfigObj)
 	scope := manager.BuildScope(builder)
 	defer scope.Close()
 

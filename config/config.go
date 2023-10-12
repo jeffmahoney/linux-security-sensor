@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -19,13 +19,13 @@ package config
 
 import (
 	"io/ioutil"
-	"os"
 	"runtime"
 
 	"github.com/Velocidex/yaml/v2"
-	errors "github.com/pkg/errors"
+	"github.com/go-errors/errors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	constants "www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 // Embed build time constants into here for reporting client version.
@@ -36,24 +36,6 @@ var (
 	ci_run_url  string
 )
 
-// Return the location of the writeback file.
-func WritebackLocation(self *config_proto.Config) (string, error) {
-	if self.Client == nil {
-		return "", errors.New("Client not configured")
-	}
-
-	switch runtime.GOOS {
-	case "darwin":
-		return os.ExpandEnv(self.Client.WritebackDarwin), nil
-	case "linux":
-		return os.ExpandEnv(self.Client.WritebackLinux), nil
-	case "windows":
-		return os.ExpandEnv(self.Client.WritebackWindows), nil
-	default:
-		return os.ExpandEnv(self.Client.WritebackLinux), nil
-	}
-}
-
 func GetVersion() *config_proto.Version {
 	return &config_proto.Version{
 		Name:       "velociraptor",
@@ -61,6 +43,7 @@ func GetVersion() *config_proto.Version {
 		BuildTime:  build_time,
 		Commit:     commit_hash,
 		CiBuildUrl: ci_run_url,
+		Compiler:   runtime.Version(),
 	}
 }
 
@@ -72,8 +55,16 @@ func GetDefaultConfig() *config_proto.Config {
 			WritebackLinux:  "/etc/velociraptor.writeback.yaml",
 			WritebackWindows: "$ProgramFiles\\Velociraptor\\" +
 				"velociraptor.writeback.yaml",
-			TempdirWindows: "$ProgramFiles\\Velociraptor\\Tools",
-			MaxPoll:        60,
+			Level2WritebackSuffix: ".bak",
+			TempdirWindows:        "$ProgramFiles\\Velociraptor\\Tools",
+			MaxPoll:               60,
+
+			// By default restart the client if we are unable to
+			// contant the server within this long. (NOTE - even a
+			// failed connection will reset the counter, the nanny
+			// will only fire if the client has failed in some way -
+			// e.g. the communicator is stopped for some reason).
+			NannyMaxConnectionDelay: 600,
 
 			// Local ring buffer to queue messages to the
 			// server. If the server is not available we
@@ -125,6 +116,15 @@ func GetDefaultConfig() *config_proto.Config {
 			Authenticator: &config_proto.Authenticator{
 				Type: "Basic",
 			},
+			Links: []*config_proto.GUILink{
+				{
+					Text:    "Documentation",
+					Url:     "https://docs.velociraptor.app/",
+					NewTab:  true,
+					Type:    "sidebar",
+					IconUrl: VeloIconDataURL,
+				},
+			},
 		},
 		CA: &config_proto.CAConfig{},
 		Frontend: &config_proto.FrontendConfig{
@@ -158,7 +158,6 @@ func GetDefaultConfig() *config_proto.Config {
 			Location:           "/var/tmp/velociraptor/",
 			FilestoreDirectory: "/var/tmp/velociraptor/",
 		},
-		Writeback: &config_proto.Writeback{},
 		Logging: &config_proto.LoggingConfig{
 			// Disable debug logging by default.
 			Debug: &config_proto.LoggingRetentionConfig{
@@ -189,6 +188,7 @@ func GetDefaultConfig() *config_proto.Config {
 	// server's version.
 	result.Client.Version = GetVersion()
 	result.Version = result.Client.Version
+	result.Client.Version.InstallTime = uint64(utils.GetTime().Now().Unix())
 
 	// On windows we need slightly different defaults.
 	if runtime.GOOS == "windows" {
@@ -207,28 +207,7 @@ func WriteConfigToFile(filename string, config *config_proto.Config) error {
 	// Make sure the new file is only readable by root.
 	err = ioutil.WriteFile(filename, bytes, 0600)
 	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	return nil
-}
-
-// Update the client's writeback file.
-func UpdateWriteback(config_obj *config_proto.Config) error {
-	location, err := WritebackLocation(config_obj)
-	if err != nil {
-		return err
-	}
-
-	bytes, err := yaml.Marshal(config_obj.Writeback)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
-	// Make sure the new file is only readable by root.
-	err = ioutil.WriteFile(location, bytes, 0600)
-	if err != nil {
-		return errors.WithStack(err)
+		return errors.Wrap(err, 0)
 	}
 
 	return nil

@@ -32,7 +32,8 @@ func migrate_0_4_2(config_obj *config_proto.Config) {
 		}
 	}
 
-	if config_obj.Frontend != nil {
+	if config_obj.Frontend != nil &&
+		config_obj.Frontend.Certificate != "" {
 		if config_obj.Frontend.PublicPath != "" {
 			deprecated(config_obj, "Frontend.public_path")
 			config_obj.Frontend.PublicPath = ""
@@ -49,11 +50,13 @@ func migrate_0_4_2(config_obj *config_proto.Config) {
 		if config_obj.Frontend.Hostname == "" {
 			logging.Prelog("Invalid config: New field Frontend.hostname is missing!")
 
-			for _, url := range config_obj.Client.ServerUrls {
-				re := regexp.MustCompile(`https://([^:/]+)`)
-				matches := re.FindStringSubmatch(url)
-				if len(matches) > 1 {
-					config_obj.Frontend.Hostname = matches[1]
+			if config_obj.Client != nil {
+				for _, url := range config_obj.Client.ServerUrls {
+					re := regexp.MustCompile(`https://([^:/]+)`)
+					matches := re.FindStringSubmatch(url)
+					if len(matches) > 1 {
+						config_obj.Frontend.Hostname = matches[1]
+					}
 				}
 			}
 

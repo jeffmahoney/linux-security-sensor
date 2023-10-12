@@ -1,8 +1,6 @@
-// +build server_vql
-
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -28,11 +26,11 @@ import (
 	"www.velocidex.com/golang/velociraptor/acls"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store"
-	"www.velocidex.com/golang/velociraptor/flows"
 	"www.velocidex.com/golang/velociraptor/paths"
 	artifact_paths "www.velocidex.com/golang/velociraptor/paths/artifacts"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/server/hunts"
 	"www.velocidex.com/golang/vfilter"
@@ -41,7 +39,16 @@ import (
 
 // A one stop shop plugin for retrieving result sets collected from
 // various places. Depending on the options used, the results come
-// from different places in the filestore.
+// from different places in the filestore. Because multiple sources
+// can be specified at the same time there is a preference order:
+
+// 1. If NotebookId is specified, then it is a notebook cell we read
+//    from.
+// 2. If a HuntId is specified we read from the hunt
+// 3. If an event Artifact is specified we read from the monitoring
+//    log for that artifact.
+// 4. If a FlowId is specified then we read from the collection.
+
 type SourcePluginArgs struct {
 	// Collected artifacts from clients should specify the client
 	// id and flow id as well as the artifact and source.
@@ -115,7 +122,8 @@ func (self SourcePlugin) Call(
 
 	// Hunt mode is just a proxy for the hunt_results()
 	// plugin.
-	if arg.HuntId != "" {
+	if arg.NotebookCellId == "" &&
+		arg.HuntId != "" {
 		new_args := ordereddict.NewDict().
 			Set("hunt_id", arg.HuntId).
 			Set("artifact", arg.Artifact).
@@ -126,8 +134,8 @@ func (self SourcePlugin) Call(
 	}
 
 	// Event artifacts just proxy for the monitoring plugin.
-	if arg.Artifact != "" {
-		ok, _ := isArtifactEvent(config_obj, arg)
+	if arg.NotebookCellId == "" && arg.Artifact != "" {
+		ok, _ := isArtifactEvent(ctx, config_obj, arg)
 		if ok {
 			// Just delegate directly to the monitoring plugin.
 			return MonitoringPlugin{}.Call(ctx, scope, args)
@@ -173,19 +181,20 @@ func (self SourcePlugin) Call(
 func (self SourcePlugin) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "source",
-		Doc:     "Retrieve rows from stored result sets. This is a one stop show for retrieving stored result set for post processing.",
-		ArgType: type_map.AddType(scope, &SourcePluginArgs{}),
+		Name:     "source",
+		Doc:      "Retrieve rows from stored result sets. This is a one stop show for retrieving stored result set for post processing.",
+		ArgType:  type_map.AddType(scope, &SourcePluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 
 // Figure out if the artifact is an event artifact based on its
 // definition.
 func isArtifactEvent(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	arg *SourcePluginArgs) (bool, error) {
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return false, err
 	}
@@ -195,7 +204,7 @@ func isArtifactEvent(
 		return false, err
 	}
 
-	artifact_definition, pres := repository.Get(config_obj, arg.Artifact)
+	artifact_definition, pres := repository.Get(ctx, config_obj, arg.Artifact)
 	if !pres {
 		return false, fmt.Errorf("Artifact %v not known", arg.Artifact)
 	}
@@ -244,7 +253,7 @@ func getResultSetReader(
 			arg.Source = ""
 		}
 
-		is_event, err := isArtifactEvent(config_obj, arg)
+		is_event, err := isArtifactEvent(ctx, config_obj, arg)
 		if err != nil {
 			return nil, err
 		}
@@ -261,7 +270,7 @@ func getResultSetReader(
 				"be specified for non event artifacts.")
 		}
 
-		path_manager, err := artifact_paths.NewArtifactPathManager(
+		path_manager, err := artifact_paths.NewArtifactPathManager(ctx,
 			config_obj, arg.ClientId, arg.FlowId, arg.Artifact)
 		if err != nil {
 			return nil, err
@@ -298,12 +307,12 @@ func ParseSourceArgsFromScope(arg *SourcePluginArgs, scope vfilter.Scope) {
 
 	start_time, pres := scope.Resolve("StartTime")
 	if pres {
-		arg.StartTime, _ = start_time.(int64)
+		arg.StartTime = start_time
 	}
 
 	end_time, pres := scope.Resolve("EndTime")
 	if pres {
-		arg.EndTime, _ = end_time.(int64)
+		arg.EndTime = end_time
 	}
 
 	notebook_id, pres := scope.Resolve("NotebookId")
@@ -362,7 +371,7 @@ func (self FlowResultsPlugin) Call(
 		arg := &FlowResultsPluginArgs{}
 		err = arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 		if err != nil {
-			scope.Log("hunt_results: %v", err)
+			scope.Log("flow_results: %v", err)
 			return
 		}
 
@@ -375,7 +384,13 @@ func (self FlowResultsPlugin) Call(
 		// If no artifact is specified, get the first one from
 		// the flow.
 		if arg.Artifact == "" {
-			flow, err := flows.GetFlowDetails(config_obj, arg.ClientId, arg.FlowId)
+			launcher, err := services.GetLauncher(config_obj)
+			if err != nil {
+				scope.Log("flow_results: %v", err)
+				return
+			}
+			flow, err := launcher.GetFlowDetails(
+				ctx, config_obj, arg.ClientId, arg.FlowId)
 			if err != nil {
 				scope.Log("flow_results: %v", err)
 				return
@@ -396,7 +411,7 @@ func (self FlowResultsPlugin) Call(
 			arg.Source = ""
 		}
 
-		path_manager, err := artifact_paths.NewArtifactPathManager(
+		path_manager, err := artifact_paths.NewArtifactPathManager(ctx,
 			config_obj, arg.ClientId, arg.FlowId, arg.Artifact)
 		if err != nil {
 			scope.Log("source: %v", err)
@@ -425,9 +440,10 @@ func (self FlowResultsPlugin) Call(
 
 func (self FlowResultsPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "flow_results",
-		Doc:     "Retrieve the results of a flow.",
-		ArgType: type_map.AddType(scope, &FlowResultsPluginArgs{}),
+		Name:     "flow_results",
+		Doc:      "Retrieve the results of a flow.",
+		ArgType:  type_map.AddType(scope, &FlowResultsPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 

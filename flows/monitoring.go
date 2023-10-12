@@ -1,9 +1,16 @@
+// NOTE: This file implements the old Client communication protocol. It is
+// here to provide backwards communication with older clients and will
+// eventually be removed.
+
 package flows
 
 import (
-	"time"
+	"bytes"
+	"context"
 
 	"github.com/Velocidex/ordereddict"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	artifacts "www.velocidex.com/golang/velociraptor/artifacts"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
@@ -16,20 +23,33 @@ import (
 	utils "www.velocidex.com/golang/velociraptor/utils"
 )
 
+var (
+	monitoringRowCounter = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "received_monitoring_rows",
+		Help: "Total number of event rows received from clients.",
+	})
+)
+
+type jsonBatch struct {
+	bytes.Buffer
+	row_count int
+}
+
 // Receive monitoring messages from the client.
 func MonitoringProcessMessage(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	collection_context *CollectionContext,
 	message *crypto_proto.VeloMessage) error {
 
-	err := FailIfError(config_obj, collection_context, message)
-	if err != nil {
-		return err
+	// Currently we do not do anything with monitoring status
+	// messages so just ignore them.
+	if message.Status != nil {
+		return nil
 	}
 
 	switch message.RequestId {
 	case constants.TransferWellKnownFlowId:
-		return appendUploadDataToFile(
+		return appendUploadDataToFile(ctx,
 			config_obj, collection_context, message)
 
 	}
@@ -47,25 +67,13 @@ func MonitoringProcessMessage(
 		if json_response == "" {
 			json_response = response.JSONLResponse
 		}
+		monitoringRowCounter.Add(float64(response.TotalRows))
 
-		// We need to parse each event since it needs to be
-		// pushed to the journal, in case a reader is
-		// listening to it. FIXME: This is expensive CPU wise,
-		// we need to think of a better way to do this.
-		rows, err := utils.ParseJsonToDicts([]byte(json_response))
-		if err != nil {
-			return err
-		}
-
-		// Mark the client this came from. Since message.Source
-		// is cryptographically trusted, this column may also
-		// be trusted.
-		for _, row := range rows {
-			row.Set("ClientId", message.Source)
-		}
+		new_json_response := json.AppendJsonlItem(
+			[]byte(json_response), "ClientId", message.Source)
 
 		// Batch the rows to send together.
-		collection_context.batchRows(response.Query.Name, rows)
+		collection_context.batchRows(response.Query.Name, new_json_response)
 	}
 
 	return nil
@@ -74,7 +82,7 @@ func MonitoringProcessMessage(
 // Logs from monitoring flow need to be handled especially since they
 // are written with a time index.
 func flushContextLogsMonitoring(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	collection_context *CollectionContext) error {
 
 	// A single packet may have multiple log messages from
@@ -93,7 +101,7 @@ func flushContextLogsMonitoring(
 		// Try to get the writer from the cache.
 		rs_writer, pres := writers[artifact_name]
 		if !pres {
-			log_path_manager, err := artifact_paths.NewArtifactLogPathManager(
+			log_path_manager, err := artifact_paths.NewArtifactLogPathManager(ctx,
 				config_obj, collection_context.ClientId,
 				collection_context.SessionId, artifact_name)
 			if err != nil {
@@ -102,7 +110,7 @@ func flushContextLogsMonitoring(
 
 			// Write the logs asynchronously
 			rs_writer, err = result_sets.NewTimedResultSetWriter(
-				file_store_factory, log_path_manager, json.NoEncOpts,
+				file_store_factory, log_path_manager, json.DefaultEncOpts(),
 				utils.BackgroundWriter)
 			if err != nil {
 				return err
@@ -113,7 +121,6 @@ func flushContextLogsMonitoring(
 		}
 
 		rs_writer.Write(ordereddict.NewDict().
-			Set("_ts", int(time.Now().Unix())).
 			Set("client_time", int64(row.Timestamp)/1000000).
 			Set("level", row.Level).
 			Set("message", row.Message))
@@ -125,33 +132,35 @@ func flushContextLogsMonitoring(
 }
 
 func (self *CollectionContext) batchRows(
-	artifact_name string, rows []*ordereddict.Dict) {
-	batch, _ := self.monitoring_batch[artifact_name]
-	batch = append(batch, rows...)
-	self.monitoring_batch[artifact_name] = batch
-	if len(rows) > 0 {
-		self.Dirty = true
+	artifact_name string, jsonl []byte) {
+	batch, pres := self.monitoring_batch[artifact_name]
+	if !pres {
+		batch = &jsonBatch{}
 	}
+	batch.Write(jsonl)
+	self.monitoring_batch[artifact_name] = batch
+	self.Dirty = true
 }
 
 func flushMonitoringLogs(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	collection_context *CollectionContext) error {
 
-	journal, err := services.GetJournal()
+	journal, err := services.GetJournal(config_obj)
 	if err != nil {
 		return err
 	}
 
-	for query_name, rows := range collection_context.monitoring_batch {
-		if len(rows) > 0 {
-			err := journal.PushRowsToArtifact(
-				config_obj, rows, query_name,
-				collection_context.ClientId,
-				collection_context.SessionId)
-			if err != nil {
-				return err
-			}
+	for query_name, jsonl_buff := range collection_context.monitoring_batch {
+		err := journal.PushJsonlToArtifact(
+			ctx,
+			config_obj,
+			jsonl_buff.Bytes(), jsonl_buff.row_count,
+			query_name,
+			collection_context.ClientId,
+			collection_context.SessionId)
+		if err != nil {
+			return err
 		}
 	}
 	return nil

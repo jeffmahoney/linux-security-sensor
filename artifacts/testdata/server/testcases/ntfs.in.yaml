@@ -1,0 +1,21 @@
+Queries:
+  # parse_ntfs can use an image file.
+  - LET NTFSInfoFromImage <= parse_ntfs(
+      filename=srcDir+'/artifacts/testdata/files/test.ntfs.dd',
+      inode="46-128-0")
+
+  # Prove we can read that data from the OSPath we received
+  - SELECT NTFSInfoFromImage.OSPath.Path AS OSPath_Path,
+      read_file(accessor="raw_ntfs",
+                filename= NTFSInfoFromImage.OSPath) AS Data
+    FROM scope()
+
+  # Parsing the MFT from a raw image requires extracting it using the
+  # raw_ntfs accessor because parse_mft() expect an $MFT file to read.
+  - SELECT * FROM parse_mft(
+      filename=pathspec(
+         Path="$MFT",
+         DelegateAccessor="file",
+         DelegatePath=srcDir+'/artifacts/testdata/files/test.ntfs.dd'),
+      accessor="raw_ntfs")
+    WHERE OSPath =~ "document.txt:goodbye.txt"

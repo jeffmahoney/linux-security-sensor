@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -18,28 +18,27 @@
 package api
 
 import (
-	"archive/zip"
 	"bytes"
-	"errors"
-	"fmt"
 	"io/ioutil"
 	"regexp"
 	"strings"
 
-	"github.com/sirupsen/logrus"
+	"github.com/Velocidex/ordereddict"
+	errors "github.com/go-errors/errors"
 	context "golang.org/x/net/context"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 	"www.velocidex.com/golang/velociraptor/acls"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/file_store"
+	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
-	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
-	users "www.velocidex.com/golang/velociraptor/users"
+	"www.velocidex.com/golang/velociraptor/third_party/zip"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
@@ -70,10 +69,10 @@ sources:
 )
 
 func getArtifactFile(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	name string) (string, error) {
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return "", err
 	}
@@ -83,7 +82,7 @@ func getArtifactFile(
 		return "", err
 	}
 
-	artifact, pres := repository.Get(config_obj, name)
+	artifact, pres := repository.Get(ctx, config_obj, name)
 	if !pres {
 		return default_artifact, nil
 	}
@@ -110,14 +109,14 @@ func ensureArtifactPrefix(definition, prefix string) string {
 		})
 }
 
-func setArtifactFile(config_obj *config_proto.Config, principal string,
-	in *api_proto.SetArtifactRequest,
-	required_prefix string) (
+func setArtifactFile(
+	ctx context.Context, config_obj *config_proto.Config, principal string,
+	in *api_proto.SetArtifactRequest, required_prefix string) (
 	*artifacts_proto.Artifact, error) {
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
-		return nil, err
+		return nil, Status(config_obj.Verbose, err)
 	}
 
 	switch in.Op {
@@ -126,29 +125,39 @@ func setArtifactFile(config_obj *config_proto.Config, principal string,
 		// First ensure that the artifact is correct.
 		tmp_repository := manager.NewRepository()
 		artifact_definition, err := tmp_repository.LoadYaml(
-			in.Artifact, true /* validate */, false /* built_in */)
+			in.Artifact, services.ArtifactOptions{
+				ValidateArtifact: true,
+			})
 		if err != nil {
-			return nil, err
+			return nil, Status(config_obj.Verbose, err)
 		}
 
 		if !strings.HasPrefix(artifact_definition.Name, required_prefix) {
-			return nil, errors.New(
+			return nil, InvalidStatus(
 				"Modified or custom artifact names must start with '" +
 					required_prefix + "'")
 		}
 
-		return artifact_definition, manager.DeleteArtifactFile(config_obj,
+		return artifact_definition, manager.DeleteArtifactFile(ctx, config_obj,
 			principal, artifact_definition.Name)
 
+	case api_proto.SetArtifactRequest_CHECK:
+		tmp_repository := manager.NewRepository()
+		return tmp_repository.LoadYaml(
+			in.Artifact, services.ArtifactOptions{
+				ValidateArtifact: true,
+			})
+
 	case api_proto.SetArtifactRequest_SET:
-		return manager.SetArtifactFile(
+		return manager.SetArtifactFile(ctx,
 			config_obj, principal, in.Artifact, required_prefix)
 	}
 
-	return nil, errors.New("Unknown op")
+	return nil, InvalidStatus("Unknown op")
 }
 
 func getReportArtifacts(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	report_type string,
 	number_of_results uint64) (
@@ -158,18 +167,22 @@ func getReportArtifacts(
 		number_of_results = 100
 	}
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
-		return nil, err
+		return nil, Status(config_obj.Verbose, err)
 	}
 	repository, err := manager.GetGlobalRepository(config_obj)
 	if err != nil {
-		return nil, err
+		return nil, Status(config_obj.Verbose, err)
 	}
 
 	result := &artifacts_proto.ArtifactDescriptors{}
-	for _, name := range repository.List() {
-		artifact, pres := repository.Get(config_obj, name)
+	names, err := repository.List(ctx, config_obj)
+	if err != nil {
+		return nil, Status(config_obj.Verbose, err)
+	}
+	for _, name := range names {
+		artifact, pres := repository.Get(ctx, config_obj, name)
 		if pres {
 			for _, report := range artifact.Reports {
 				if report.Type == report_type {
@@ -187,92 +200,242 @@ func getReportArtifacts(
 	return result, nil
 }
 
+type matchPlan struct {
+	// These must match against the artifact name
+	name_regex []*regexp.Regexp
+
+	// These must match against the artifact preconditions
+	precondition_regex []*regexp.Regexp
+
+	tool_regex []*regexp.Regexp
+
+	// Acceptable types
+	types []string
+
+	builtin *bool
+}
+
+func (self *matchPlan) matchDescOrName(artifact *artifacts_proto.Artifact) bool {
+	// If no name regexp are specified we do not reject based on name.
+	if len(self.name_regex) == 0 {
+		return true
+	}
+
+	// All regex must match the same artifact - either in the name or
+	// description.
+	matches := 0
+	for _, re := range self.name_regex {
+		if re.MatchString(artifact.Name) {
+			matches++
+		} else if re.MatchString(artifact.Description) {
+			matches++
+		}
+	}
+	return matches == len(self.name_regex)
+}
+
+func (self *matchPlan) matchTool(artifact *artifacts_proto.Artifact) bool {
+	if len(self.tool_regex) == 0 {
+		return true
+	}
+
+	if len(artifact.Tools) == 0 {
+		return false
+	}
+
+	for _, re := range self.tool_regex {
+		for _, t := range artifact.Tools {
+			if re.MatchString(t.Name) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Preconditions can exist at the artifact level or at each source.
+func (self *matchPlan) matchPreconditions(artifact *artifacts_proto.Artifact) bool {
+	if len(self.precondition_regex) == 0 {
+		return true
+	}
+
+	for _, re := range self.precondition_regex {
+		if artifact.Precondition != "" &&
+			re.MatchString(artifact.Precondition) {
+			return true
+		}
+		for _, s := range artifact.Sources {
+			if s.Precondition != "" &&
+				re.MatchString(s.Precondition) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (self *matchPlan) matchBuiltin(artifact *artifacts_proto.Artifact) bool {
+	if self.builtin == nil {
+		return true
+	}
+
+	if *self.builtin {
+		return artifact.BuiltIn
+	}
+	return !artifact.BuiltIn
+}
+
+func (self *matchPlan) matchType(artifact *artifacts_proto.Artifact) bool {
+	if len(self.types) > 0 {
+		for _, t := range self.types {
+			if strings.ToLower(artifact.Type) == t {
+				return true
+			}
+		}
+		return false
+	}
+	return true
+}
+
+// All conditions must match
+func (self *matchPlan) matchArtifact(artifact *artifacts_proto.Artifact) bool {
+	if !self.matchType(artifact) {
+		return false
+	}
+
+	if !self.matchDescOrName(artifact) {
+		return false
+	}
+
+	if !self.matchPreconditions(artifact) {
+		return false
+	}
+
+	if !self.matchBuiltin(artifact) {
+		return false
+	}
+
+	if !self.matchTool(artifact) {
+		return false
+	}
+
+	return true
+}
+
+func prepareMatchPlan(search string) *matchPlan {
+	result := &matchPlan{}
+	// Tokenise the search expression into search terms:
+	for _, token := range strings.Split(search, " ") {
+		if token == "" {
+			continue
+		}
+
+		parts := strings.SplitN(token, ":", 2)
+		if len(parts) == 2 {
+			verb := parts[0]
+			term := parts[1]
+			switch verb {
+			case "type":
+				result.types = append(result.types,
+					strings.ToLower(term))
+				continue
+
+			case "precondition":
+				re, err := regexp.Compile("(?i)" + term)
+				if err == nil {
+					result.precondition_regex = append(
+						result.precondition_regex, re)
+				}
+				continue
+
+			case "tool":
+				re, err := regexp.Compile("(?i)" + term)
+				if err == nil {
+					result.tool_regex = append(
+						result.tool_regex, re)
+				}
+				continue
+
+			case "builtin":
+				value := false
+				if term == "yes" {
+					value = true
+				}
+				result.builtin = &value
+				continue
+			}
+		}
+		re, err := regexp.Compile("(?i)" + token)
+		if err == nil {
+			result.name_regex = append(
+				result.name_regex, re)
+		}
+	}
+	return result
+}
+
 func searchArtifact(
+	ctx context.Context,
 	config_obj *config_proto.Config,
-	terms []string,
+	search_term string,
 	artifact_type string,
 	number_of_results uint64, fields *api_proto.FieldSelector) (
 	*artifacts_proto.ArtifactDescriptors, error) {
 
 	if config_obj.GUI == nil {
-		return nil, errors.New("GUI not configured")
+		return nil, InvalidStatus("GUI not configured")
 	}
 
-	name_filter_regexp := config_obj.GUI.ArtifactSearchFilter
-	if name_filter_regexp == "" {
-		name_filter_regexp = "."
+	matcher := prepareMatchPlan(search_term)
+	if artifact_type != "" {
+		matcher.types = append(matcher.types, strings.ToLower(artifact_type))
 	}
-	name_filter := regexp.MustCompile(name_filter_regexp)
-
-	artifact_type = strings.ToLower(artifact_type)
 
 	if number_of_results == 0 {
 		number_of_results = 1000
 	}
 
 	result := &artifacts_proto.ArtifactDescriptors{}
-	regexes := []*regexp.Regexp{}
-	for _, term := range terms {
-		if len(term) <= 2 {
-			continue
-		}
-
-		re, err := regexp.Compile("(?i)" + term)
-		if err == nil {
-			regexes = append(regexes, re)
-		}
-	}
-
-	if len(regexes) == 0 {
-		return result, nil
-	}
-
-	matcher := func(text string, regexes []*regexp.Regexp) bool {
-		for _, re := range regexes {
-			if re.FindString(text) == "" {
-				return false
-			}
-		}
-		return true
-	}
-
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
-		return nil, err
+		return nil, Status(config_obj.Verbose, err)
 	}
 	repository, err := manager.GetGlobalRepository(config_obj)
 	if err != nil {
-		return nil, err
+		return nil, Status(config_obj.Verbose, err)
 	}
 
-	for _, name := range repository.List() {
-		if name_filter.FindString(name) == "" {
+	names, err := repository.List(ctx, config_obj)
+	if err != nil {
+		return nil, Status(config_obj.Verbose, err)
+	}
+
+	for _, name := range names {
+		artifact, pres := repository.Get(ctx, config_obj, name)
+		if !pres {
 			continue
 		}
 
-		artifact, pres := repository.Get(config_obj, name)
-		if pres {
-			// Skip non matching types
-			if artifact_type != "" &&
-				artifact.Type != artifact_type {
-				continue
-			}
-
-			if matcher(artifact.Description, regexes) ||
-				matcher(artifact.Name, regexes) {
-				if fields == nil {
-					result.Items = append(result.Items, artifact)
-				} else {
-					// Send back minimal information about the
-					// artifacts
-					new_item := &artifacts_proto.Artifact{}
-					if fields.Name {
-						new_item.Name = artifact.Name
-						new_item.BuiltIn = artifact.BuiltIn
-					}
-
-					result.Items = append(result.Items, new_item)
+		if matcher.matchArtifact(artifact) {
+			if fields == nil {
+				result.Items = append(result.Items, artifact)
+			} else {
+				// Send back minimal information about the
+				// artifacts
+				new_item := &artifacts_proto.Artifact{}
+				if fields.Name {
+					new_item.Name = artifact.Name
+					new_item.BuiltIn = artifact.BuiltIn
 				}
+
+				if fields.Description {
+					new_item.Description = artifact.Description
+				}
+				if fields.Type {
+					new_item.Type = artifact.Type
+				}
+
+				result.Items = append(result.Items, new_item)
 			}
 		}
 
@@ -286,31 +449,41 @@ func searchArtifact(
 
 func (self *ApiServer) LoadArtifactPack(
 	ctx context.Context,
-	in *api_proto.VFSFileBuffer) (
+	in *api_proto.LoadArtifactPackRequest) (
 	*api_proto.LoadArtifactPackResponse, error) {
 
-	user_name := GetGRPCUserInfo(self.config, ctx, self.ca_pool).Name
-	user_record, err := users.GetUser(self.config, user_name)
+	users_manager := services.GetUserManager()
+	user_record, org_config_obj, err := users_manager.GetUserFromContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, Status(self.verbose, err)
 	}
+	principal := user_record.Name
 
 	permissions := acls.SERVER_ARTIFACT_WRITER
-	perm, err := acls.CheckAccess(self.config, user_record.Name, permissions)
+	perm, err := services.CheckAccess(org_config_obj, principal, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to upload artifact packs.")
 	}
 
-	prefix := constants.ARTIFACT_PACK_NAME_PREFIX
-
-	result := &api_proto.LoadArtifactPackResponse{}
-	buffer := bytes.NewReader(in.Data)
-	zip_reader, err := zip.NewReader(buffer, int64(len(in.Data)))
-	if err != nil {
-		return nil, err
+	prefix := in.Prefix
+	var filter_re *regexp.Regexp
+	if in.Filter != "" {
+		filter_re, err = regexp.Compile("(?i)" + in.Filter)
+		if err != nil {
+			return nil, Status(self.verbose, err)
+		}
 	}
 
+	zip_reader, closer, err := getZipReader(ctx, org_config_obj, in)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+	defer closer()
+
+	result := &api_proto.LoadArtifactPackResponse{
+		VfsPath: in.VfsPath,
+	}
 	for _, file := range zip_reader.File {
 		if strings.HasSuffix(file.Name, ".yaml") {
 			fd, err := file.Open()
@@ -325,27 +498,43 @@ func (self *ApiServer) LoadArtifactPack(
 				continue
 			}
 
-			// Make sure the artifact is written into the
-			// Packs part to prevent clashes with built in
-			// names.
+			// Update the definition to include the prefix on the
+			// artifact name.
 			artifact_definition := ensureArtifactPrefix(
-				string(data), prefix)
+				string(data), in.Prefix)
 
 			request := &api_proto.SetArtifactRequest{
-				Op:       api_proto.SetArtifactRequest_SET,
+				Op:       api_proto.SetArtifactRequest_CHECK,
 				Artifact: artifact_definition,
 			}
 
-			definition, err := setArtifactFile(
-				self.config, user_name, request, prefix)
+			definition, err := setArtifactFile(ctx,
+				org_config_obj, principal, request, prefix)
+			if err != nil {
+				continue
+			}
+
+			if filter_re != nil && !filter_re.MatchString(definition.Name) {
+				continue
+			}
+
+			if !in.ReallyDoIt {
+				result.SuccessfulArtifacts = append(result.SuccessfulArtifacts,
+					definition.Name)
+				continue
+			}
+
+			request.Op = api_proto.SetArtifactRequest_SET
+
+			// Set the artifact for real.
+			definition, err = setArtifactFile(ctx,
+				org_config_obj, principal, request, prefix)
 			if err == nil {
-				logging.GetLogger(self.config, &logging.Audit).
-					WithFields(logrus.Fields{
-						"user":     user_name,
-						"artifact": definition.Name,
-						"details": fmt.Sprintf(
-							"%v", request.Artifact),
-					}).Info("LoadArtifactPack")
+				services.LogAudit(ctx,
+					org_config_obj, principal, "LoadArtifactPack",
+					ordereddict.NewDict().
+						Set("artifact", definition.Name).
+						Set("details", request.Artifact))
 
 				result.SuccessfulArtifacts = append(result.SuccessfulArtifacts,
 					definition.Name)
@@ -359,6 +548,65 @@ func (self *ApiServer) LoadArtifactPack(
 	}
 
 	return result, nil
+}
+
+func getZipReader(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	in *api_proto.LoadArtifactPackRequest) (*zip.Reader, func() error, error) {
+
+	// Create a temp file and store the data in it.
+	if len(in.Data) > 0 {
+		// Check the file is a valid zip file first, before we cache
+		// it locally.
+		buffer := bytes.NewReader(in.Data)
+		zipfd, err := zip.NewReader(buffer, int64(len(in.Data)))
+		if err != nil {
+			return nil, nil, err
+		}
+
+		path_manager := paths.NewTempPathManager("")
+		file_store_factory := file_store.GetFileStore(config_obj)
+		fd, err := file_store_factory.WriteFile(path_manager.Path())
+		if err != nil {
+			return nil, nil, err
+		}
+		defer fd.Close()
+
+		_, err = utils.Copy(ctx, fd, bytes.NewReader(in.Data))
+		if err != nil {
+			return nil, nil, err
+		}
+		in.VfsPath = path_manager.Path().Components()
+		return zipfd, func() error { return nil }, nil
+	}
+
+	// Otherwise open the filestore path
+	if len(in.VfsPath) < 2 {
+		return nil, nil, errors.New("vfs_path should be specified")
+	}
+
+	if in.VfsPath[0] != paths.TEMP_ROOT.Components()[0] {
+		return nil, nil, errors.New("vfs_path should be a temp path")
+	}
+
+	pathspec := path_specs.NewUnsafeFilestorePath(in.VfsPath...).
+		SetType(api.PATH_TYPE_FILESTORE_ANY)
+
+	file_store_factory := file_store.GetFileStore(config_obj)
+	fd, err := file_store_factory.ReadFile(pathspec)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	stat, err := fd.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	zip_reader, err := zip.NewReader(
+		utils.MakeReaderAtter(fd), stat.Size())
+	return zip_reader, fd.Close, err
 }
 
 // MakeCollectorRequest is a convenience function for creating

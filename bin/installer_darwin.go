@@ -1,8 +1,8 @@
 // +build darwin
 
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -29,7 +29,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	errors "github.com/pkg/errors"
+	errors "github.com/go-errors/errors"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
@@ -44,10 +44,12 @@ var (
 )
 
 func doRemove() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().WithRequiredClient().
 		WithWriteback().LoadAndValidate()
 	if err != nil {
-		return errors.Wrap(err, "Unable to load config file")
+		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
 	if config_obj.Client.DarwinInstaller == nil {
@@ -65,10 +67,12 @@ func doRemove() error {
 }
 
 func doInstall() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().WithRequiredClient().
 		WithWriteback().LoadAndValidate()
 	if err != nil {
-		return errors.Wrap(err, "Unable to load config file")
+		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
 	executable, err := os.Executable()
@@ -85,24 +89,27 @@ func doInstall() error {
 
 	// Try to copy the executable to the target_path.
 	err = utils.CopyFile(ctx, executable, target_path, 0755)
-	if err != nil && os.IsNotExist(errors.Cause(err)) {
+	if err != nil && errors.Is(err, os.ErrNotExist) {
 		dirname := filepath.Dir(target_path)
 		logger.Info("Attempting to create intermediate directory %s.",
 			dirname)
 		err = os.MkdirAll(dirname, 0700)
 		if err != nil {
-			return errors.Wrap(err, "Create intermediate directories")
+			return fmt.Errorf("Create intermediate directories: %w", err)
 		}
 		err = utils.CopyFile(ctx, executable, target_path, 0755)
 	}
 	if err != nil {
-		return errors.Wrap(err, "Cant copy binary into destination dir.")
+		return fmt.Errorf("Cant copy binary into destination dir: %w", err)
 	}
 
 	logger.Info("Copied binary to %s", target_path)
 
-	// If the installer was invoked with the --config arg then we
-	// need to copy the config to the target path.
+	config_path_plist := ""
+
+	// If the installer was invoked with the --config arg then we need
+	// to copy the config to the target path. Otherwise the config may
+	// be embedded so we dont need to use it at all.
 	if *config_path != "" {
 		config_target_path := strings.TrimSuffix(
 			target_path, filepath.Ext(target_path)) + ".config.yaml"
@@ -116,6 +123,10 @@ func doInstall() error {
 				config_target_path, err)
 			return err
 		}
+		config_path_plist = fmt.Sprintf(`
+                <string>--config</string>
+                <string>%v.config.yaml</string>
+`, target_path)
 	}
 
 	plist_path := "/Library/LaunchDaemons/" + service_name + ".plist"
@@ -130,13 +141,13 @@ func doInstall() error {
         <array>
                 <string>%v</string>
                 <string>client</string>
-                <string>--config</string>
-                <string>%v.config.yaml</string>
+%v
+                <string>--quiet</string>
         </array>
         <key>KeepAlive</key>
         <true/>
 </dict>
-</plist>`, service_name, target_path, target_path)
+</plist>`, service_name, target_path, config_path_plist)
 
 	err = ioutil.WriteFile(plist_path, []byte(plist), 0644)
 	if err != nil {

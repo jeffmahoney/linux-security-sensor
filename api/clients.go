@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -21,19 +21,14 @@ import (
 	"context"
 	"errors"
 	"os"
-	"regexp"
 	"time"
 
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
+	"github.com/Velocidex/ordereddict"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"www.velocidex.com/golang/velociraptor/acls"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	"www.velocidex.com/golang/velociraptor/datastore"
-	"www.velocidex.com/golang/velociraptor/flows"
-	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/paths"
-	"www.velocidex.com/golang/velociraptor/search"
 	"www.velocidex.com/golang/velociraptor/services"
 )
 
@@ -41,26 +36,32 @@ func (self *ApiServer) GetClientMetadata(
 	ctx context.Context,
 	in *api_proto.GetClientRequest) (*api_proto.ClientMetadata, error) {
 
-	user_name := GetGRPCUserInfo(self.config, ctx, self.ca_pool).Name
+	users := services.GetUserManager()
+	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	user_name := user_record.Name
 	permissions := acls.READ_RESULTS
 	if in.ClientId == "server" {
 		permissions = acls.SERVER_ADMIN
 	}
 
-	perm, err := acls.CheckAccess(self.config, user_name, permissions)
+	perm, err := services.CheckAccess(org_config_obj, user_name, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to view clients.")
 	}
 
 	client_path_manager := paths.NewClientPathManager(in.ClientId)
-	db, err := datastore.GetDB(self.config)
+	db, err := datastore.GetDB(org_config_obj)
 	if err != nil {
-		return nil, err
+		return nil, Status(self.verbose, err)
 	}
 
 	result := &api_proto.ClientMetadata{}
-	err = db.GetSubject(self.config, client_path_manager.Metadata(), result)
+	err = db.GetSubject(org_config_obj, client_path_manager.Metadata(), result)
 	if errors.Is(err, os.ErrNotExist) {
 		// Metadata not set, start with empty set.
 		err = nil
@@ -70,98 +71,92 @@ func (self *ApiServer) GetClientMetadata(
 
 func (self *ApiServer) SetClientMetadata(
 	ctx context.Context,
-	in *api_proto.ClientMetadata) (*emptypb.Empty, error) {
+	in *api_proto.SetClientMetadataRequest) (*emptypb.Empty, error) {
 
-	user_name := GetGRPCUserInfo(self.config, ctx, self.ca_pool).Name
+	users := services.GetUserManager()
+	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	user_name := user_record.Name
 	permissions := acls.LABEL_CLIENT
-	perm, err := acls.CheckAccess(self.config, user_name, permissions)
+	perm, err := services.CheckAccess(org_config_obj, user_name, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to modify client labels.")
 	}
 
-	client_path_manager := paths.NewClientPathManager(in.ClientId)
-	db, err := datastore.GetDB(self.config)
+	client_info_manager, err := services.GetClientInfoManager(org_config_obj)
 	if err != nil {
-		return nil, err
+		return nil, Status(self.verbose, err)
 	}
 
-	err = db.SetSubject(self.config, client_path_manager.Metadata(), in)
-	return &emptypb.Empty{}, err
+	metadata := ordereddict.NewDict()
+	for _, env := range in.Add {
+		metadata.Set(env.Key, env.Value)
+	}
+
+	for _, key := range in.Remove {
+		_, pres := metadata.Get(key)
+		if !pres {
+			metadata.Set(key, nil)
+		}
+	}
+
+	err = client_info_manager.SetMetadata(ctx, in.ClientId, metadata, user_name)
+	return &emptypb.Empty{}, Status(self.verbose, err)
 }
 
 func (self *ApiServer) GetClient(
 	ctx context.Context,
 	in *api_proto.GetClientRequest) (*api_proto.ApiClient, error) {
 
-	user_name := GetGRPCUserInfo(self.config, ctx, self.ca_pool).Name
+	users := services.GetUserManager()
+	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	user_name := user_record.Name
 	permissions := acls.READ_RESULTS
-	perm, err := acls.CheckAccess(self.config, user_name, permissions)
+	perm, err := services.CheckAccess(org_config_obj, user_name, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to view clients.")
+	}
+
+	indexer, err := services.GetIndexer(org_config_obj)
+	if err != nil {
+		return nil, Status(self.verbose, err)
 	}
 
 	// Update the user's MRU
 	if in.UpdateMru {
-		err = search.UpdateMRU(self.config, user_name, in.ClientId)
+		err = indexer.UpdateMRU(org_config_obj, user_name, in.ClientId)
 		if err != nil {
-			return nil, err
+			return nil, Status(self.verbose, err)
 		}
 	}
 
-	api_client, err := search.FastGetApiClient(ctx, self.config, in.ClientId)
+	api_client, err := indexer.FastGetApiClient(ctx, org_config_obj, in.ClientId)
 	if err != nil {
-		return nil, err
+		return &api_proto.ApiClient{}, nil
 	}
 
 	if self.server_obj != nil {
-		if !in.Lightweight &&
+		if !in.Lightweight {
 			// Wait up to 2 seconds to find out if clients are connected.
-			services.GetNotifier().IsClientConnected(ctx,
-				self.config, in.ClientId, 2) {
-			api_client.LastSeenAt = uint64(time.Now().UnixNano() / 1000)
+			notifier, err := services.GetNotifier(org_config_obj)
+			if err != nil {
+				return nil, Status(self.verbose, err)
+			}
+			if notifier.IsClientConnected(ctx,
+				org_config_obj, in.ClientId, 2) {
+				api_client.LastSeenAt = uint64(time.Now().UnixNano() / 1000)
+			}
 		}
 	}
 
 	return api_client, nil
-}
-
-func (self *ApiServer) GetClientFlows(
-	ctx context.Context,
-	in *api_proto.ApiFlowRequest) (*api_proto.ApiFlowResponse, error) {
-
-	user_name := GetGRPCUserInfo(self.config, ctx, self.ca_pool).Name
-	permissions := acls.READ_RESULTS
-	perm, err := acls.CheckAccess(self.config, user_name, permissions)
-	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
-			"User is not allowed to view flows.")
-	}
-
-	filter := func(flow *flows_proto.ArtifactCollectorContext) bool {
-		return true
-	}
-
-	if in.Artifact != "" {
-		regex, err := regexp.Compile(in.Artifact)
-		if err != nil {
-			return nil, err
-		}
-
-		filter = func(flow *flows_proto.ArtifactCollectorContext) bool {
-			if flow.Request == nil {
-				return false
-			}
-
-			for _, name := range flow.Request.Artifacts {
-				if regex.MatchString(name) {
-					return true
-				}
-			}
-			return false
-		}
-	}
-	return flows.GetFlows(self.config, in.ClientId,
-		in.IncludeArchived, filter, in.Offset, in.Count)
 }

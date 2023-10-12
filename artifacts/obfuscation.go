@@ -1,9 +1,9 @@
 package artifacts
 
 import (
+	"fmt"
 	"regexp"
 
-	"github.com/pkg/errors"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/crypto"
@@ -36,17 +36,15 @@ func Obfuscate(
 			}
 		}
 
-		query.Description = ""
-
 		// Parse and re-serialize the query into standard
 		// forms. This removes comments.
 		ast, err := vfilter.Parse(query.VQL)
 		if err != nil {
-			return errors.Wrap(err, "While parsing VQL: "+query.VQL)
+			return fmt.Errorf("While parsing VQL: %v: %w", query.VQL, err)
 		}
 
 		// TODO: Compress the AST.
-		query.VQL = ast.ToString(scope)
+		query.VQL = vfilter.FormatToString(scope, ast)
 	}
 
 	return nil

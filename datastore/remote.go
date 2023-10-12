@@ -4,9 +4,12 @@ package datastore
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
@@ -22,10 +25,51 @@ var (
 	remote_mu             sync.Mutex
 	remote_datastopre_imp = NewRemoteDataStore(context.Background())
 	RPC_TIMEOUT           = 100 // Seconds
+	RPC_BACKOFF           = 10.0
+	RPC_RETRY             = 10
+	timeoutError          = errors.New("Timeout")
 )
 
-func Retry(ctx context.Context, cb func() error) error {
-	return utils.Retry(ctx, cb, 100, 10*time.Second)
+func Retry(ctx context.Context,
+	config_obj *config_proto.Config, cb func() error) error {
+	var err error
+
+	for i := 0; i < RPC_RETRY; i++ {
+		err = cb()
+		if err == nil {
+			return nil
+		}
+
+		// Figure out if the error is retryable - only some errors
+		// mean a retry is appropriate (see
+		// https://pkg.go.dev/google.golang.org/grpc/codes)
+		st, ok := status.FromError(err)
+		if !ok {
+			return err
+		}
+
+		switch st.Code() {
+
+		// These ones are retryable errors - sleep a bit and retry
+		// again.
+		case codes.DeadlineExceeded, codes.ResourceExhausted,
+			codes.Aborted, codes.Unavailable:
+			logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+			logger.Error("While connecting to remote datastore: %v", err)
+			select {
+			case <-ctx.Done():
+				return timeoutError
+			case <-time.After(time.Duration(RPC_BACKOFF) * time.Second):
+			}
+
+		case codes.Internal, codes.Unknown:
+			return err
+
+		default:
+			return err
+		}
+	}
+	return err
 }
 
 type RemoteDataStore struct {
@@ -36,7 +80,7 @@ func (self *RemoteDataStore) GetSubject(
 	config_obj *config_proto.Config,
 	urn api.DSPathSpec,
 	message proto.Message) error {
-	return Retry(self.ctx, func() error {
+	return Retry(self.ctx, config_obj, func() error {
 		return self._GetSubject(config_obj, urn, message)
 	})
 }
@@ -56,6 +100,7 @@ func (self *RemoteDataStore) _GetSubject(
 	defer closer()
 
 	result, err := conn.GetSubject(ctx, &api_proto.DataRequest{
+		OrgId: config_obj.OrgId,
 		Pathspec: &api_proto.DSPathSpec{
 			Components: urn.Components(),
 			PathType:   int64(urn.Type()),
@@ -99,7 +144,17 @@ func (self *RemoteDataStore) SetSubjectWithCompletion(
 	urn api.DSPathSpec,
 	message proto.Message,
 	completion func()) error {
-	return Retry(self.ctx, func() error {
+
+	// Make sure to always call the completion regardless of error
+	// paths.
+	defer func() {
+		if completion != nil &&
+			!utils.CompareFuncs(completion, utils.SyncCompleter) {
+			completion()
+		}
+	}()
+
+	return Retry(self.ctx, config_obj, func() error {
 		return self._SetSubjectWithCompletion(
 			config_obj, urn, message, completion)
 	})
@@ -137,17 +192,14 @@ func (self *RemoteDataStore) _SetSubjectWithCompletion(
 	defer closer()
 
 	_, err = conn.SetSubject(ctx, &api_proto.DataRequest{
-		Data: value,
-		Sync: completion != nil,
+		OrgId: config_obj.OrgId,
+		Data:  value,
+		Sync:  completion != nil,
 		Pathspec: &api_proto.DSPathSpec{
 			Components: urn.Components(),
 			PathType:   int64(urn.Type()),
 			Tag:        urn.Tag(),
 		}})
-
-	if completion != nil {
-		completion()
-	}
 
 	return err
 }
@@ -155,7 +207,7 @@ func (self *RemoteDataStore) _SetSubjectWithCompletion(
 func (self *RemoteDataStore) DeleteSubjectWithCompletion(
 	config_obj *config_proto.Config,
 	urn api.DSPathSpec, completion func()) error {
-	return Retry(self.ctx, func() error {
+	return Retry(self.ctx, config_obj, func() error {
 		return self._DeleteSubjectWithCompletion(config_obj, urn, completion)
 	})
 }
@@ -174,7 +226,8 @@ func (self *RemoteDataStore) _DeleteSubjectWithCompletion(
 	defer closer()
 
 	_, err = conn.DeleteSubject(ctx, &api_proto.DataRequest{
-		Sync: completion != nil,
+		OrgId: config_obj.OrgId,
+		Sync:  completion != nil,
 		Pathspec: &api_proto.DSPathSpec{
 			Components: urn.Components(),
 			PathType:   int64(urn.Type()),
@@ -191,7 +244,7 @@ func (self *RemoteDataStore) _DeleteSubjectWithCompletion(
 func (self *RemoteDataStore) DeleteSubject(
 	config_obj *config_proto.Config,
 	urn api.DSPathSpec) error {
-	return Retry(self.ctx, func() error {
+	return Retry(self.ctx, config_obj, func() error {
 		return self._DeleteSubject(config_obj, urn)
 	})
 }
@@ -210,6 +263,7 @@ func (self *RemoteDataStore) _DeleteSubject(
 	defer closer()
 
 	_, err = conn.DeleteSubject(ctx, &api_proto.DataRequest{
+		OrgId: config_obj.OrgId,
 		Pathspec: &api_proto.DSPathSpec{
 			Components: urn.Components(),
 			PathType:   int64(urn.Type()),
@@ -226,7 +280,7 @@ func (self *RemoteDataStore) ListChildren(
 	var result []api.DSPathSpec
 	var err error
 
-	err = Retry(self.ctx, func() error {
+	err = Retry(self.ctx, config_obj, func() error {
 		result, err = self._ListChildren(config_obj, urn)
 		return err
 	})
@@ -249,6 +303,7 @@ func (self *RemoteDataStore) _ListChildren(
 	defer closer()
 
 	result, err := conn.ListChildren(ctx, &api_proto.DataRequest{
+		OrgId: config_obj.OrgId,
 		Pathspec: &api_proto.DSPathSpec{
 			Components: urn.Components(),
 			PathType:   int64(urn.Type()),
@@ -282,7 +337,7 @@ func NewRemoteDataStore(ctx context.Context) *RemoteDataStore {
 	return result
 }
 
-func StartRemoteDatastore(
+func StartDatastore(
 	ctx context.Context, wg *sync.WaitGroup,
 	config_obj *config_proto.Config) error {
 
@@ -301,6 +356,8 @@ func StartRemoteDatastore(
 		remote_datastopre_imp = NewRemoteDataStore(ctx)
 		g_impl = nil
 		remote_mu.Unlock()
+	} else if implementation == "FileBaseDataStore" {
+		return startFullDiskChecker(ctx, wg, config_obj)
 	}
 	return nil
 }

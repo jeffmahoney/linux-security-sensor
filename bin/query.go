@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -23,9 +23,11 @@ import (
 	"io"
 	"log"
 	"os"
+	"time"
 
 	"github.com/Velocidex/ordereddict"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	"www.velocidex.com/golang/velociraptor/actions"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/csv"
@@ -38,6 +40,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/uploads"
 	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -47,12 +50,25 @@ var (
 	queries = query.Arg("queries", "The VQL Query to run.").
 		Required().Strings()
 
-	rate = app.Flag("ops_per_second", "Rate of execution").
-		Default("1000000").Float64()
+	query_command_collect_timeout = query.Flag(
+		"timeout", "Time collection out after this many seconds.").
+		Default("0").Float64()
+
+	query_org_id = query.Flag(
+		"org", "The Org ID to target with this query").
+		Default("root").String()
+
+	query_command_collect_cpu_limit = query.Flag(
+		"cpu_limit", "A number between 0 to 100 representing maximum CPU utilization.").
+		Default("0").Float64()
+
 	format = query.Flag("format", "Output format to use (text,json,csv,jsonl).").
 		Default("json").Enum("text", "json", "csv", "jsonl")
 
 	dump_dir = query.Flag("dump_dir", "Directory to dump output files.").
+			Default("").String()
+
+	output_file = query.Flag("output", "A file to store the output.").
 			Default("").String()
 
 	env_map = query.Flag("env", "Environment for the query.").
@@ -102,6 +118,7 @@ func outputJSONL(ctx context.Context,
 }
 
 func outputCSV(ctx context.Context,
+	config_obj *config_proto.Config,
 	scope vfilter.Scope,
 	vql *vfilter.VQL,
 	out io.Writer) error {
@@ -109,8 +126,8 @@ func outputCSV(ctx context.Context,
 		vql_subsystem.MarshalJson(scope),
 		10, *max_wait)
 
-	csv_writer := csv.GetCSVAppender(
-		scope, &StdoutWrapper{out}, true /* write_headers */)
+	csv_writer := csv.GetCSVAppender(config_obj,
+		scope, &StdoutWrapper{out}, csv.WriteHeaders, json.DefaultEncOpts())
 	defer csv_writer.Close()
 
 	for result := range result_chan {
@@ -138,7 +155,12 @@ func outputCSV(ctx context.Context,
 func doRemoteQuery(
 	config_obj *config_proto.Config, format string,
 	queries []string, env *ordereddict.Dict) error {
-	ctx := context.Background()
+
+	logging.DisableLogging()
+
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
 	client, closer, err := grpc_client.Factory.GetAPIClient(ctx, config_obj)
 	if err != nil {
 		return err
@@ -148,8 +170,11 @@ func doRemoteQuery(
 	logger := logging.GetLogger(config_obj, &logging.ToolComponent)
 
 	request := &actions_proto.VQLCollectorArgs{
-		MaxRow:  1000,
-		MaxWait: 1,
+		OrgId:    *query_org_id,
+		MaxRow:   1000,
+		MaxWait:  1,
+		CpuLimit: float32(*query_command_collect_cpu_limit),
+		Timeout:  uint64(*query_command_collect_timeout),
 	}
 
 	if env != nil {
@@ -217,8 +242,9 @@ func doRemoteQuery(
 		case "csv":
 			scope := vql_subsystem.MakeScope()
 
-			csv_writer := csv.GetCSVAppender(
-				scope, &StdoutWrapper{os.Stdout}, true /* write_headers */)
+			csv_writer := csv.GetCSVAppender(config_obj,
+				scope, &StdoutWrapper{os.Stdout},
+				csv.WriteHeaders, json.DefaultEncOpts())
 			defer csv_writer.Close()
 
 			for _, row := range rows {
@@ -229,32 +255,31 @@ func doRemoteQuery(
 	return nil
 }
 
-func startEssentialServices(config_obj *config_proto.Config) (
-	*services.Service, error) {
-
-	sm := services.NewServiceManager(context.Background(), config_obj)
-	err := startup.StartupEssentialServices(sm)
-	if err != nil {
-		return nil, err
-	}
-
-	// Load any artifacts defined in the config file after all the
-	// services are up.
-	err = load_config_artifacts(config_obj)
-	return sm, err
-}
-
 func doQuery() error {
-	config_obj, err := APIConfigLoader.WithNullLoader().LoadAndValidate()
+	logging.DisableLogging()
+
+	config_obj, err := APIConfigLoader.WithNullLoader().
+		LoadAndValidate()
 	if err != nil {
 		return err
 	}
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return fmt.Errorf("Starting services: %w", err)
+	config_obj.Services = services.GenericToolServices()
+	if config_obj.Datastore != nil && config_obj.Datastore.Location != "" {
+		config_obj.Services.IndexServer = true
+		config_obj.Services.ClientInfo = true
+		config_obj.Services.Label = true
 	}
+
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
+
+	if err != nil {
+		return err
+	}
 
 	env := ordereddict.NewDict()
 	for k, v := range *env_map {
@@ -273,15 +298,16 @@ func doQuery() error {
 		return fmt.Errorf("Artifact GetGlobalRepository: %w ", err)
 	}
 
+	logger := &LogWriter{config_obj: config_obj}
 	builder := services.ScopeBuilder{
 		Config:     config_obj,
-		ACLManager: vql_subsystem.NullACLManager{},
-		Logger:     log.New(&LogWriter{config_obj}, "", 0),
+		ACLManager: acl_managers.NullACLManager{},
+		Logger:     log.New(logger, "", 0),
 		Env:        ordereddict.NewDict(),
 	}
 
 	if *run_as != "" {
-		builder.ACLManager = vql_subsystem.NewServerACLManager(config_obj, *run_as)
+		builder.ACLManager = acl_managers.NewServerACLManager(config_obj, *run_as)
 	}
 
 	// Configure an uploader if required.
@@ -297,7 +323,7 @@ func doQuery() error {
 		}
 	}
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return err
 	}
@@ -323,10 +349,43 @@ func doQuery() error {
 
 	}
 
-	// Install throttler into the scope.
-	vfilter.InstallThrottler(scope, vfilter.NewTimeThrottler(float64(*rate)))
+	if *query_command_collect_timeout > 0 {
+		start := time.Now()
+		timed_ctx, timed_cancel := context.WithTimeout(ctx,
+			time.Second*time.Duration(*query_command_collect_timeout))
 
-	ctx := InstallSignalHandler(scope)
+		go func() {
+			select {
+			case <-ctx.Done():
+				timed_cancel()
+			case <-timed_ctx.Done():
+				scope.Log("collect: <red>Timeout Error:</> Collection timed out after %v",
+					time.Now().Sub(start))
+				// Cancel the main context.
+				cancel()
+				timed_cancel()
+			}
+		}()
+	}
+
+	// Install throttler into the scope.
+	scope.SetThrottler(actions.NewThrottler(ctx, scope,
+		0, *query_command_collect_cpu_limit, 0))
+
+	out_fd := os.Stdout
+	if *output_file != "" {
+		out_fd, err = os.OpenFile(*output_file,
+			os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+		if err != nil {
+			return err
+		}
+		defer out_fd.Close()
+	}
+
+	start_time := time.Now()
+	defer func() {
+		scope.Log("Completed query in %v", time.Now().Sub(start_time))
+	}()
 
 	if *trace_vql_flag {
 		scope.SetTracer(log.New(os.Stderr, "VQL Trace: ", 0))
@@ -338,28 +397,28 @@ func doQuery() error {
 		for _, vql := range statements {
 			switch *format {
 			case "text":
-				table := reporting.EvalQueryToTable(ctx, scope, vql, os.Stdout)
+				table := reporting.EvalQueryToTable(ctx, scope, vql, out_fd)
 				table.Render()
 			case "json":
-				err = outputJSON(ctx, scope, vql, os.Stdout)
+				err = outputJSON(ctx, scope, vql, out_fd)
 				if err != nil {
 					return err
 				}
 
 			case "jsonl":
-				err = outputJSONL(ctx, scope, vql, os.Stdout)
+				err = outputJSONL(ctx, scope, vql, out_fd)
 				if err != nil {
 					return err
 				}
 			case "csv":
-				err = outputCSV(ctx, scope, vql, os.Stdout)
+				err = outputCSV(ctx, builder.Config, scope, vql, out_fd)
 				if err != nil {
 					return err
 				}
 			}
 		}
 	}
-	return nil
+	return logger.Error
 }
 
 func init() {

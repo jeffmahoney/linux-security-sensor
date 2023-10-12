@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -18,6 +18,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -27,16 +28,19 @@ import (
 	"strings"
 
 	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	file_store_accessor "www.velocidex.com/golang/velociraptor/accessors/file_store"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store"
-	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/file_store/uploader"
 	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/reporting"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/startup"
 	"www.velocidex.com/golang/velociraptor/uploads"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	vfilter "www.velocidex.com/golang/vfilter"
 )
 
@@ -74,7 +78,9 @@ var (
 )
 
 func eval_query(
-	config_obj *config_proto.Config, format, query string, scope vfilter.Scope,
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	format, query string, scope vfilter.Scope,
 	env *ordereddict.Dict) error {
 	if config_obj.ApiConfig != nil && config_obj.ApiConfig.Name != "" {
 		logging.GetLogger(config_obj, &logging.ToolComponent).
@@ -82,10 +88,11 @@ func eval_query(
 		return doRemoteQuery(config_obj, format, []string{query}, env)
 	}
 
-	return eval_local_query(config_obj, *fs_command_format, query, scope)
+	return eval_local_query(ctx, config_obj, *fs_command_format, query, scope)
 }
 
 func eval_local_query(
+	ctx context.Context,
 	config_obj *config_proto.Config, format string,
 	query string, scope vfilter.Scope) error {
 
@@ -94,8 +101,6 @@ func eval_local_query(
 		return fmt.Errorf("Unable to parse VQL Query: %w", err)
 	}
 
-	ctx := InstallSignalHandler(scope)
-
 	for _, vql := range vqls {
 		switch format {
 		case "text":
@@ -103,7 +108,7 @@ func eval_local_query(
 			table.Render()
 
 		case "csv":
-			return outputCSV(ctx, scope, vql, os.Stdout)
+			return outputCSV(ctx, config_obj, scope, vql, os.Stdout)
 
 		case "jsonl":
 			return outputJSONL(ctx, scope, vql, os.Stdout)
@@ -116,16 +121,23 @@ func eval_local_query(
 }
 
 func doLS(path, accessor string) error {
+	logging.DisableLogging()
+
 	config_obj, err := APIConfigLoader.WithNullLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return fmt.Errorf("Starting services: %w", err)
-	}
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	config_obj.Services = services.GenericToolServices()
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
+
+	if err != nil {
+		return err
+	}
 
 	matches := accessor_reg.FindStringSubmatch(path)
 	if matches != nil {
@@ -138,18 +150,19 @@ func doLS(path, accessor string) error {
 		path += "*"
 	}
 
+	logger := &LogWriter{config_obj: config_obj}
 	builder := services.ScopeBuilder{
 		Config:     config_obj,
-		ACLManager: vql_subsystem.NullACLManager{},
-		Logger:     log.New(os.Stderr, "velociraptor: ", 0),
+		ACLManager: acl_managers.NullACLManager{},
+		Logger:     log.New(logger, "", 0),
 		Env: ordereddict.NewDict().
 			Set(vql_subsystem.ACL_MANAGER_VAR,
-				vql_subsystem.NewRoleACLManager("administrator")).
+				acl_managers.NewRoleACLManager(config_obj, "administrator")).
 			Set("accessor", accessor).
 			Set("path", path),
 	}
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return err
 	}
@@ -167,20 +180,32 @@ func doLS(path, accessor string) error {
 		query += " WHERE Sys.name_type != 'DOS' "
 	}
 
-	return eval_query(config_obj, *fs_command_format, query, scope, builder.Env)
+	err = eval_query(sm.Ctx, config_obj,
+		*fs_command_format, query, scope, builder.Env)
+	if err != nil {
+		return err
+	}
+
+	return logger.Error
 }
 
 func doRM(path, accessor string) error {
+	logging.DisableLogging()
+
 	config_obj, err := APIConfigLoader.WithNullLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return fmt.Errorf("Starting services: %w", err)
-	}
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
+
+	if err != nil {
+		return err
+	}
 
 	matches := accessor_reg.FindStringSubmatch(path)
 	if matches != nil {
@@ -197,15 +222,16 @@ func doRM(path, accessor string) error {
 		return fmt.Errorf("Only fs:// URLs support removal")
 	}
 
+	logger := &LogWriter{config_obj: config_obj}
 	builder := services.ScopeBuilder{
 		Config:     config_obj,
-		ACLManager: vql_subsystem.NewRoleACLManager("administrator"),
-		Logger:     log.New(os.Stderr, "velociraptor: ", 0),
+		ACLManager: acl_managers.NewRoleACLManager(config_obj, "administrator"),
+		Logger:     log.New(logger, "", 0),
 		Env: ordereddict.NewDict().
 			Set("accessor", accessor).
 			Set("path", path),
 	}
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return err
 	}
@@ -216,21 +242,33 @@ func doRM(path, accessor string) error {
 		"file_store_delete(path=FullPath) AS Deletion " +
 		"FROM glob(globs=path, accessor=accessor) "
 
-	return eval_query(config_obj, *fs_command_format, query, scope, builder.Env)
+	err = eval_query(sm.Ctx,
+		config_obj, *fs_command_format, query, scope, builder.Env)
+	if err != nil {
+		return err
+	}
+
+	return logger.Error
 }
 
 func doCp(path, accessor string, dump_dir string) error {
+	logging.DisableLogging()
+
 	config_obj, err := APIConfigLoader.
 		WithNullLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return fmt.Errorf("Starting services: %w", err)
-	}
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
+
+	if err != nil {
+		return err
+	}
 
 	matches := accessor_reg.FindStringSubmatch(path)
 	if matches != nil {
@@ -256,13 +294,14 @@ func doCp(path, accessor string, dump_dir string) error {
 		output_path = matches[2]
 	}
 
+	logger := &LogWriter{config_obj: config_obj}
 	builder := services.ScopeBuilder{
 		Config: config_obj,
-		Logger: log.New(&LogWriter{config_obj}, "Velociraptor: ", 0),
+		Logger: log.New(logger, "", 0),
 		Env: ordereddict.NewDict().
 			Set("accessor", accessor).
 			Set("path", path),
-		ACLManager: vql_subsystem.NewRoleACLManager("administrator"),
+		ACLManager: acl_managers.NewRoleACLManager(config_obj, "administrator"),
 	}
 
 	switch output_accessor {
@@ -273,7 +312,7 @@ func doCp(path, accessor string, dump_dir string) error {
 
 	case "fs":
 		output_path_spec := path_specs.NewSafeFilestorePath(output_path)
-		builder.Uploader = api.NewFileStoreUploader(
+		builder.Uploader = uploader.NewFileStoreUploader(
 			config_obj,
 			file_store.GetFileStore(config_obj),
 			output_path_spec)
@@ -282,7 +321,7 @@ func doCp(path, accessor string, dump_dir string) error {
 		return fmt.Errorf("Can not write to accessor %v\n", output_accessor)
 	}
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return err
 	}
@@ -292,7 +331,7 @@ func doCp(path, accessor string, dump_dir string) error {
 	scope.Log("Copy from %v (%v) to %v (%v)",
 		path, accessor, output_path, output_accessor)
 
-	return eval_query(config_obj, *fs_command_format, `
+	err = eval_query(sm.Ctx, config_obj, *fs_command_format, `
 SELECT * from foreach(
   row={
     SELECT Name, Size, Mode.String AS Mode,
@@ -303,9 +342,16 @@ SELECT * from foreach(
      upload(file=FullPath, accessor=accessor, name=Name) AS Upload
      FROM scope()
   })`, scope, builder.Env)
+	if err != nil {
+		return err
+	}
+
+	return logger.Error
 }
 
 func doCat(path, accessor_name string) error {
+	logging.DisableLogging()
+
 	_, err := APIConfigLoader.
 		WithNullLoader().LoadAndValidate()
 	if err != nil {
@@ -319,7 +365,7 @@ func doCat(path, accessor_name string) error {
 	}
 
 	scope := vql_subsystem.MakeScope()
-	accessor, err := glob.GetAccessor(accessor_name, scope)
+	accessor, err := accessors.GetAccessor(accessor_name, scope)
 	if err != nil {
 		return err
 	}
@@ -333,20 +379,12 @@ func doCat(path, accessor_name string) error {
 	return err
 }
 
-// Install a fs accessor to enable access to the file store. But make
-// it lazy - no need to connect to the file store un-neccesarily.
-type FileStoreAccessorFactory struct {
-	config_obj *config_proto.Config
-}
-
-func (self FileStoreAccessorFactory) New(scope vfilter.Scope) (glob.FileSystemAccessor, error) {
-	return file_store.GetFileStoreFileSystemAccessor(self.config_obj)
-}
-
 // Only register the filesystem accessor if we have a proper valid server config.
 func initFilestoreAccessor(config_obj *config_proto.Config) error {
 	if config_obj.Datastore != nil {
-		glob.Register("fs", &FileStoreAccessorFactory{config_obj}, `Provide access the the server's filestore and datastore.
+		fs_factory := file_store_accessor.NewFileStoreFileSystemAccessor(config_obj)
+		accessors.Register("fs", fs_factory,
+			`Provide access to the server's filestore and datastore.
 
 Many VQL plugins produce references to files stored on the server. This accessor can be used to open those files and read them. Typically references to filestore or datastore files have the "fs:" or "ds:" prefix.
 `)

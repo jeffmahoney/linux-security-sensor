@@ -10,7 +10,7 @@ required_permissions:
 
 parameters:
    - name: ExchangeURL
-     default: https://github.com/Velocidex/velociraptor-docs/raw/gh-pages/exchange/artifact_exchange.zip
+     default: https://github.com/Velocidex/velociraptor-docs/raw/gh-pages/exchange/artifact_exchange_v2.zip
    - name: Prefix
      description: Add artifacts with this prefix
      default: Exchange.
@@ -23,8 +23,13 @@ sources:
              remove_last=TRUE,
              tempfile_extension=".zip", url=ExchangeURL)
         }, query={
-          SELECT read_file(accessor="zip", filename=FullPath) AS Definition
-          FROM glob(globs=url(path=Content, fragment='/**/*.yaml'), accessor="zip")
+          SELECT read_file(accessor="zip", filename=OSPath) AS Definition
+          FROM glob(
+             globs='/**/*.yaml',
+             root=pathspec(
+                DelegateAccessor="auto",
+                DelegatePath=Content),
+             accessor="zip")
         })
 
         SELECT Definition.name AS Name,

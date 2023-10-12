@@ -3,10 +3,10 @@ package services
 import (
 	"context"
 	"errors"
-	"sync"
 
 	"github.com/Velocidex/ordereddict"
-	"www.velocidex.com/golang/velociraptor/file_store/directory"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/file_store/api"
 )
 
 // The broadcast service allows VQL to implement fan out
@@ -40,32 +40,22 @@ import (
 //    to the async=TRUE option, the queries will all run in parallel.
 
 var (
-	broadcast_mu     sync.Mutex
-	broadcastService BroadcastService
-
 	AlreadyRegisteredError = errors.New("Already Registered")
 )
 
-func RegisterBroadcast(b BroadcastService) {
-	broadcast_mu.Lock()
-	defer broadcast_mu.Unlock()
-
-	broadcastService = b
-}
-
-func GetBroadcastService() (BroadcastService, error) {
-	broadcast_mu.Lock()
-	defer broadcast_mu.Unlock()
-
-	if broadcastService == nil {
-		return nil, errors.New("Broadcast service not ready")
+func GetBroadcastService(
+	config_obj *config_proto.Config) (BroadcastService, error) {
+	org_manager, err := GetOrgManager()
+	if err != nil {
+		return nil, err
 	}
 
-	return broadcastService, nil
+	return org_manager.Services(config_obj.OrgId).BroadcastService()
 }
 
 type BroadcastService interface {
 	RegisterGenerator(input <-chan *ordereddict.Dict, name string) error
-	Watch(ctx context.Context, name string, options directory.QueueOptions) (
+	Watch(ctx context.Context, name string, options api.QueueOptions) (
 		output <-chan *ordereddict.Dict, cancel func(), err error)
+	WaitForListeners(ctx context.Context, name string, count int64)
 }

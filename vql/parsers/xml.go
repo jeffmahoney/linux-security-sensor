@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -22,15 +22,17 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"github.com/clbanning/mxj"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 type _ParseXMLFunctionArgs struct {
-	File     string `vfilter:"required,field=file,doc=XML file to open."`
-	Accessor string `vfilter:"optional,field=accessor,doc=The accessor to use"`
+	File     *accessors.OSPath `vfilter:"required,field=file,doc=XML file to open."`
+	Accessor string            `vfilter:"optional,field=accessor,doc=The accessor to use"`
 }
 type _ParseXMLFunction struct{}
 
@@ -47,16 +49,16 @@ func (self _ParseXMLFunction) Call(
 
 	err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
 	if err != nil {
-		scope.Log("parse_xml: %s", err)
+		scope.Log("parse_xml: %v", err)
 		return vfilter.Null{}
 	}
 
-	accessor, err := glob.GetAccessor(arg.Accessor, scope)
+	accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
 		scope.Log("parse_xml: %v", err)
 		return vfilter.Null{}
 	}
-	file, err := accessor.Open(arg.File)
+	file, err := accessor.OpenWithOSPath(arg.File)
 	if err != nil {
 		scope.Log("Unable to open file %s", arg.File)
 		return vfilter.Null{}
@@ -75,9 +77,10 @@ func (self _ParseXMLFunction) Call(
 
 func (self _ParseXMLFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "parse_xml",
-		Doc:     "Parse an XML document into a map.",
-		ArgType: type_map.AddType(scope, &_ParseXMLFunctionArgs{}),
+		Name:     "parse_xml",
+		Doc:      "Parse an XML document into a map.",
+		ArgType:  type_map.AddType(scope, &_ParseXMLFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

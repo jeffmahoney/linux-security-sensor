@@ -8,11 +8,11 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/accessors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/glob"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -53,7 +53,7 @@ func NewSyslogWatcherService(config_obj *config_proto.Config) *SyslogWatcherServ
 }
 
 func (self *SyslogWatcherService) Register(
-	filename string,
+	filename *accessors.OSPath,
 	accessor string,
 	ctx context.Context,
 	scope vfilter.Scope,
@@ -69,13 +69,13 @@ func (self *SyslogWatcherService) Register(
 		output_chan: output_chan,
 		scope:       scope}
 
-	key := filename + accessor
+	key := filename.String() + accessor
 	registration, pres := self.registrations[key]
 	if !pres {
 		registration = []*Handle{}
 		self.registrations[key] = registration
 
-		go self.StartMonitoring(filename, accessor)
+		go self.StartMonitoring(scope, filename, accessor)
 	}
 
 	registration = append(registration, handle)
@@ -89,21 +89,31 @@ func (self *SyslogWatcherService) Register(
 // Monitor the filename for new events and emit them to all interested
 // listeners. If no listeners exist we terminate.
 func (self *SyslogWatcherService) StartMonitoring(
-	filename string, accessor_name string) {
+	base_scope vfilter.Scope, filename *accessors.OSPath,
+	accessor_name string) {
 
 	defer utils.CheckForPanic("StartMonitoring")
 
-	scope := vql_subsystem.MakeScope()
+	manager, err := services.GetRepositoryManager(self.config_obj)
+	if err != nil {
+		return
+	}
+
+	// Build a new scope with totally different lifetime than the
+	// watching scope so we can outlast them. We still want things
+	// like ACL managers etc though.
+	builder := services.ScopeBuilderFromScope(base_scope)
+	scope := manager.BuildScope(builder)
 	defer scope.Close()
 
-	accessor, err := glob.GetAccessor(accessor_name, scope)
+	accessor, err := accessors.GetAccessor(accessor_name, scope)
 	if err != nil {
-		//scope.Log("Registering watcher error: %v", err)
+		scope.Log("Registering watcher error: %v", err)
 		return
 	}
 
 	cursor := self.findLastLineOffset(filename, accessor)
-	key := filename + accessor_name
+	key := filename.String() + accessor_name
 	for {
 		self.mu.Lock()
 		registration, pres := self.registrations[key]
@@ -121,17 +131,17 @@ func (self *SyslogWatcherService) StartMonitoring(
 }
 
 func (self *SyslogWatcherService) findLastLineOffset(
-	filename string,
-	accessor glob.FileSystemAccessor) *Cursor {
+	filename *accessors.OSPath,
+	accessor accessors.FileSystemAccessor) *Cursor {
 
 	cursor := &Cursor{}
 
-	stat, err := accessor.Lstat(filename)
+	stat, err := accessor.LstatWithOSPath(filename)
 	if err != nil {
 		return cursor
 	}
 
-	fd, err := accessor.Open(filename)
+	fd, err := accessor.OpenWithOSPath(filename)
 	if err != nil {
 		return cursor
 	}
@@ -166,15 +176,15 @@ func (self *SyslogWatcherService) findLastLineOffset(
 }
 
 func (self *SyslogWatcherService) monitorOnce(
-	filename string,
+	filename *accessors.OSPath,
 	accessor_name string,
-	accessor glob.FileSystemAccessor,
+	accessor accessors.FileSystemAccessor,
 	cursor *Cursor) *Cursor {
 
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	stat, err := accessor.Lstat(filename)
+	stat, err := accessor.LstatWithOSPath(filename)
 	if err != nil {
 		return cursor
 	}
@@ -195,13 +205,13 @@ func (self *SyslogWatcherService) monitorOnce(
 
 	cursor.file_size = stat.Size()
 
-	key := filename + accessor_name
+	key := filename.String() + accessor_name
 	handles, pres := self.registrations[key]
 	if !pres {
 		return cursor
 	}
 
-	fd, err := accessor.Open(filename)
+	fd, err := accessor.OpenWithOSPath(filename)
 	if err != nil {
 		return cursor
 	}
@@ -263,7 +273,9 @@ func (self *SyslogWatcherService) monitorOnce(
 
 // Send the syslog line to all listeners.
 func (self *SyslogWatcherService) distributeLine(
-	line, filename, key string,
+	line string,
+	filename *accessors.OSPath,
+	key string,
 	handles []*Handle) []*Handle {
 	event := ordereddict.NewDict().Set("Line", line)
 

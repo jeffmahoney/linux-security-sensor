@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -35,6 +35,7 @@ import (
 	ole "github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -121,13 +122,24 @@ func Query(query string, namespace string) ([]*ordereddict.Dict, error) {
 					row.Set(property, &vfilter.Null{})
 					continue
 				}
+
 				defer func() {
 					_ = property_raw.Clear()
 				}()
 
 				// If it is an array we convert it here.
 				if property_raw.VT&ole.VT_ARRAY > 0 {
-					row.Set(property, property_raw.ToArray().ToValueArray())
+					result := []interface{}{}
+					for _, item := range property_raw.ToArray().ToValueArray() {
+						switch item.(type) {
+						case *ole.IDispatch:
+						case *ole.IUnknown:
+						default:
+							result = append(result, item)
+						}
+					}
+
+					row.Set(property, result)
 					continue
 				}
 
@@ -195,20 +207,20 @@ func runWMIQuery(
 
 	err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
 	if err != nil {
-		scope.Log("wmi: %s", err)
+		scope.Log("wmi: %v", err)
 		return result
 	}
 
 	arg := &WMIQueryArgs{}
 	err = arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
-		scope.Log("wmi: %s", err.Error())
+		scope.Log("wmi: %v", err)
 		return result
 	}
 
 	query_result, err := Query(arg.Query, arg.Namespace)
 	if err != nil {
-		scope.Log("wmi: %s", err.Error())
+		scope.Log("wmi: %v", err)
 		return result
 	}
 	for _, item := range query_result {
@@ -224,5 +236,6 @@ func init() {
 		Doc:        "Execute simple WMI queries synchronously.",
 		Function:   runWMIQuery,
 		ArgType:    &WMIQueryArgs{},
+		Metadata:   vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	})
 }

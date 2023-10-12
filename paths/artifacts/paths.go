@@ -10,6 +10,7 @@ import (
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
@@ -18,21 +19,42 @@ import (
 // The path manager is responsible for telling the file store where to
 // store the rows.
 type ArtifactPathManager struct {
-	config_obj                             *config_proto.Config
-	client_id, flow_id, full_artifact_name string
-	base_artifact_name, source             string
-	mode                                   int
-	Clock                                  utils.Clock
-	file_store                             api.FileStore
+	config_obj                         *config_proto.Config
+	ClientId, FlowId, FullArtifactName string
+	base_artifact_name, source         string
+	mode                               int
+	Clock                              utils.Clock
+	file_store                         api.FileStore
+}
+
+func NewArtifactPathManagerWithMode(
+	config_obj *config_proto.Config,
+	client_id, flow_id, full_artifact_name string,
+	mode int) *ArtifactPathManager {
+
+	artifact_name, artifact_source := paths.SplitFullSourceName(full_artifact_name)
+
+	file_store_factory := file_store.GetFileStore(config_obj)
+	return &ArtifactPathManager{
+		config_obj:         config_obj,
+		ClientId:           client_id,
+		FlowId:             flow_id,
+		FullArtifactName:   full_artifact_name,
+		base_artifact_name: artifact_name,
+		source:             artifact_source,
+		mode:               mode,
+		Clock:              utils.RealClock{},
+		file_store:         file_store_factory,
+	}
 }
 
 func NewArtifactPathManager(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	client_id, flow_id, full_artifact_name string) (
 	*ArtifactPathManager, error) {
 	artifact_name, artifact_source := paths.SplitFullSourceName(full_artifact_name)
 
-	mode, err := GetArtifactMode(config_obj, artifact_name)
+	mode, err := GetArtifactMode(ctx, config_obj, artifact_name)
 	if err != nil {
 		return nil, err
 	}
@@ -40,9 +62,9 @@ func NewArtifactPathManager(
 	file_store_factory := file_store.GetFileStore(config_obj)
 	return &ArtifactPathManager{
 		config_obj:         config_obj,
-		client_id:          client_id,
-		flow_id:            flow_id,
-		full_artifact_name: full_artifact_name,
+		ClientId:           client_id,
+		FlowId:             flow_id,
+		FullArtifactName:   full_artifact_name,
 		base_artifact_name: artifact_name,
 		source:             artifact_source,
 		mode:               mode,
@@ -76,11 +98,15 @@ func (self *ArtifactPathManager) Logs() *ArtifactLogPathManager {
 }
 
 func (self *ArtifactPathManager) GetQueueName() string {
-	return self.full_artifact_name
+	return self.FullArtifactName
 }
 
 func (self *ArtifactPathManager) Path() api.FSPathSpec {
-	result, _ := self.GetPathForWriting()
+	result, err := self.GetPathForWriting()
+	if err != nil {
+		logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
+		logger.Error("ArtifactPathManager: %v\n", err)
+	}
 	return result
 }
 
@@ -90,20 +116,20 @@ func (self *ArtifactPathManager) GetRootPath() api.FSPathSpec {
 	switch self.mode {
 	case paths.MODE_CLIENT, paths.MODE_SERVER:
 		return paths.CLIENTS_ROOT.AddChild(
-			self.client_id, "collections",
-			self.flow_id).AsFilestorePath()
+			self.ClientId, "collections",
+			self.FlowId).AsFilestorePath()
 
 	case paths.MODE_SERVER_EVENT:
 		return paths.SERVER_MONITORING_ROOT
 
 	case paths.MODE_CLIENT_EVENT:
-		if self.client_id == "" {
+		if self.ClientId == "" {
 			// Should never normally happen.
 			return paths.CLIENTS_ROOT.AddChild("nobody").
 				AsFilestorePath()
 		} else {
 			return paths.CLIENTS_ROOT.AddChild(
-				self.client_id, "monitoring").
+				self.ClientId, "monitoring").
 				AsFilestorePath()
 		}
 	default:
@@ -131,16 +157,16 @@ func (self *ArtifactPathManager) GetPathForWriting() (api.FSPathSpec, error) {
 			return paths.CLIENTS_ROOT.AsFilestorePath().
 				SetType(api.PATH_TYPE_FILESTORE_JSON).
 				AddChild(
-					self.client_id, "artifacts",
-					self.base_artifact_name, self.flow_id,
+					self.ClientId, "artifacts",
+					self.base_artifact_name, self.FlowId,
 					self.source), nil
 		} else {
 			return paths.CLIENTS_ROOT.AsFilestorePath().
 				SetType(api.PATH_TYPE_FILESTORE_JSON).
 				AddChild(
-					self.client_id, "artifacts",
+					self.ClientId, "artifacts",
 					self.base_artifact_name,
-					self.flow_id), nil
+					self.FlowId), nil
 		}
 
 	case paths.MODE_SERVER:
@@ -149,13 +175,13 @@ func (self *ArtifactPathManager) GetPathForWriting() (api.FSPathSpec, error) {
 				SetType(api.PATH_TYPE_FILESTORE_JSON).
 				AddChild(
 					"server", "artifacts", self.base_artifact_name,
-					self.flow_id, self.source), nil
+					self.FlowId, self.source), nil
 		} else {
 			return paths.CLIENTS_ROOT.AsFilestorePath().
 				SetType(api.PATH_TYPE_FILESTORE_JSON).
 				AddChild(
 					"server", "artifacts", self.base_artifact_name,
-					self.flow_id), nil
+					self.FlowId), nil
 		}
 
 	case paths.MODE_SERVER_EVENT:
@@ -172,7 +198,7 @@ func (self *ArtifactPathManager) GetPathForWriting() (api.FSPathSpec, error) {
 		}
 
 	case paths.MODE_CLIENT_EVENT:
-		if self.client_id == "" {
+		if self.ClientId == "" {
 			// Should never normally happen.
 			return paths.CLIENTS_ROOT.AsFilestorePath().
 				SetType(api.PATH_TYPE_FILESTORE_JSON).
@@ -185,14 +211,14 @@ func (self *ArtifactPathManager) GetPathForWriting() (api.FSPathSpec, error) {
 				return paths.CLIENTS_ROOT.AsFilestorePath().
 					SetType(api.PATH_TYPE_FILESTORE_JSON).
 					AddChild(
-						self.client_id, "monitoring",
+						self.ClientId, "monitoring",
 						self.base_artifact_name, self.source,
 						self.getDayName()), nil
 			} else {
 				return paths.CLIENTS_ROOT.AsFilestorePath().
 					SetType(api.PATH_TYPE_FILESTORE_JSON).
 					AddChild(
-						self.client_id, "monitoring",
+						self.ClientId, "monitoring",
 						self.base_artifact_name,
 						self.getDayName()), nil
 			}
@@ -278,8 +304,10 @@ func DayNameToTimestamp(name string) time.Time {
 	return time.Time{}
 }
 
-func GetArtifactMode(config_obj *config_proto.Config, artifact_name string) (int, error) {
-	manager, err := services.GetRepositoryManager()
+func GetArtifactMode(
+	ctx context.Context, config_obj *config_proto.Config,
+	artifact_name string) (int, error) {
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return 0, err
 	}
@@ -289,7 +317,8 @@ func GetArtifactMode(config_obj *config_proto.Config, artifact_name string) (int
 		return 0, err
 	}
 
-	artifact_type, err := repository.GetArtifactType(config_obj, artifact_name)
+	artifact_type, err := repository.GetArtifactType(
+		ctx, config_obj, artifact_name)
 	if err != nil {
 		return 0, err
 	}

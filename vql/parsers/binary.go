@@ -4,7 +4,10 @@ import (
 	"context"
 
 	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/readers"
 	vfilter "www.velocidex.com/golang/vfilter"
@@ -15,19 +18,20 @@ import (
 // VQL bindings to binary parsing.
 
 type ParseBinaryFunctionArg struct {
-	Filename string `vfilter:"required,field=filename,doc=Binary file to open."`
-	Accessor string `vfilter:"optional,field=accessor,doc=The accessor to use"`
-	Profile  string `vfilter:"optional,field=profile,doc=Profile to use (see https://github.com/Velocidex/vtypes)."`
-	Struct   string `vfilter:"required,field=struct,doc=Name of the struct in the profile to instantiate."`
-	Offset   int64  `vfilter:"optional,field=offset,doc=Start parsing from this offset"`
+	Filename *accessors.OSPath `vfilter:"required,field=filename,doc=Binary file to open."`
+	Accessor string            `vfilter:"optional,field=accessor,doc=The accessor to use"`
+	Profile  string            `vfilter:"optional,field=profile,doc=Profile to use (see https://github.com/Velocidex/vtypes)."`
+	Struct   string            `vfilter:"required,field=struct,doc=Name of the struct in the profile to instantiate."`
+	Offset   int64             `vfilter:"optional,field=offset,doc=Start parsing from this offset"`
 }
 type ParseBinaryFunction struct{}
 
 func (self ParseBinaryFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "parse_binary",
-		Doc:     "Parse a binary file into a datastructure using a profile.",
-		ArgType: type_map.AddType(scope, &ParseBinaryFunctionArg{}),
+		Name:     "parse_binary",
+		Doc:      "Parse a binary file into a datastructure using a profile.",
+		ArgType:  type_map.AddType(scope, &ParseBinaryFunctionArg{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

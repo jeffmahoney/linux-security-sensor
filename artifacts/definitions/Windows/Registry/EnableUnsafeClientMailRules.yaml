@@ -22,7 +22,8 @@ sources:
   - query: |
         LET UserProfiles = Select Name as Username,
             {
-                SELECT FullPath FROM glob(globs=expand(path=Directory) + "//NTUSER.DAT", accessor="file")
+                SELECT OSPath FROM glob(root=expand(path=Directory),
+                   globs="/NTUSER.DAT", accessor="auto")
             } as NTUser,
             expand(path=Directory) as Directory
         FROM Artifact.Windows.Sys.Users()
@@ -35,14 +36,13 @@ sources:
            query={
               SELECT Username,
                 NTUser as Userhive,
-                url(parse=key.FullPath).fragment as Key,
+                OSPath.Path as Key,
                 key.Mtime AS LastModified,
                 EnableUnsafeClientMailRules,
                 OutlookSecureTempFolder
               FROM read_reg_key(
-                 globs=url(scheme="file",
-                    path=FullPath,
-                    fragment=KeyGlob).String,
+                 globs=KeyGlob,
+                 root=pathspec(DelegatePath=OSPath),
                  accessor="raw_reg")
               WHERE EnableUnsafeClientMailRules = 1
            })

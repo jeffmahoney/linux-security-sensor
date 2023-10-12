@@ -1,4 +1,4 @@
-// These are the messages used in client actions.
+// This file represents the configuration file schema.
 syntax = "proto3";
 
 import "proto/semantic.proto";
@@ -34,14 +34,33 @@ message Version {
             description: "When the client was built."
         }];
 
+    // Populated by reading the writeback file.
+    uint64 install_time = 8;
+
     string ci_build_url = 6;
+
+    string compiler = 7;
+}
+
+// A pointer to cuurently executing flows.
+message FlowCheckPoint {
+    string flow_id = 1;
+    string path = 2;
 }
 
 // The client's state which are persisted in the writeback file.
 message Writeback {
+    // When the client was installed (basically the timestamp of the
+    // writeback file).
+    uint64 install_time = 16;
+
     string private_key = 7 [(sem_type) = {
             description: "The client's private key in PEM encoding."
         }];
+
+    // This is calculated from the public key above so it is only here
+    // for information.
+    string client_id = 15;
 
     uint64 hunt_last_timestamp = 13 [(sem_type) = {
             description: "The last hunt timestamp this client ran."
@@ -52,6 +71,17 @@ message Writeback {
         }];
 
     VQLEventTable event_queries = 1;
+
+    repeated FlowCheckPoint checkpoints = 17;
+}
+
+// TODO - refactor from api/orgs.proto
+message InitialOrgRecord {
+    string org_id = 1;
+    string name = 2;
+
+    // If this is empty we use the org id
+    string nonce = 3;
 }
 
 // Configuration for the windows installer. NOTE: This is not used
@@ -139,6 +169,12 @@ message ClientConfig {
             description: "A path where windows clients will write local state."
         }];
 
+    // If this is set we use a second file for the level2
+    // writeback. The string expected here is added to the regular
+    // writeback filename. For example setting to "l2" will create a
+    // file named "velociraptor.writeback.yaml.l2"
+    string level2_writeback_suffix = 44;
+
     // A path to set the temp directory. If not set we use the system
     // default. The path may be relative to the current directory
     // (usually the location of the executable). If the path does not
@@ -147,6 +183,12 @@ message ClientConfig {
     string tempdir_windows = 2;
     string tempdir_darwin = 3;
 
+    // Number of seconds to wait between polls (default 1
+    // second). NOTE: Velociraptor typically holds the connection up
+    // for at least max_poll time and then refreshes the
+    // connection. The min poll is used to determine how quickly
+    // connections should resume.
+    uint64 min_poll = 14;
     uint64 max_poll = 15 [(sem_type) = {
             description: "The maximum number of seconds between server polls."
             default: "600",
@@ -156,6 +198,13 @@ message ClientConfig {
             description: "The standard deviation between polls."
             default: "30",
         }];
+
+    // If this is set, the nanny will exit if we are not able to send
+    // messages to the server within this many seconds. NOTE - even a
+    // failed connection will reset the counter, the nanny will only
+    // fire if the client has failed in some way - e.g. the
+    // communicator is stopped for some reason
+    uint64 nanny_max_connection_delay = 36;
 
     WindowsInstallerConfig windows_installer = 16 [(sem_type) = {
             description: "Configuration of the windows installer.",
@@ -205,6 +254,46 @@ message ClientConfig {
     uint64 connection_timeout = 35;
 
     CryptoConfig Crypto = 33;
+
+    bool disable_compression = 37;
+
+    // How often clients inform the server about flow progress
+    // (default 5 seconds).
+    uint64 default_server_flow_stats_update = 39;
+
+    // Clients will send a Server.Internal.ClientInfo message to the
+    // server every this many seconds.This helps to keep the server
+    // info up to date about each client. This should not be sent too
+    // frequently. The default is 1 day (86400 seconds).
+    int64 client_info_update_time = 40;
+
+    // Clients may not be able to reach a given host in the
+    // internet. For that case, this mapping contains alternatives
+    // which may be used instead. It's crucial that the addresses
+    // include the port after a colon (see net.Dial).
+    //
+    // Example (yaml):
+    //  Client:
+    //    fallback_addresses:
+    //      "my-velociraptor-server.com:443": "123.123.123.123:443"
+    //
+    // This makes that if https://my-velociraptor-server.com is not
+    // reachable (for example if DNS is not available due to a network
+    // isolation because of an ongoing incident), 123.123.123.123:443
+    // will be used as a fallback.
+    map<string, string> fallback_addresses = 41 [(sem_type) = {
+            description: "This mapping provides fallback addresses for network targets so that a connection may still be established."
+        }];
+
+    // If set we disable client checkpoints and so we can not report
+    // to the server when the client crashes while collecting an
+    // artifact.
+    bool disable_checkpoints = 42;
+
+    // Here you can specify a list of event artifacts to automatically
+    // collect in addition to the list sent by the server. This is
+    // most useful to initialize the client.
+    repeated string additional_event_artifacts = 43;
 }
 
 message APIConfig {
@@ -260,6 +349,23 @@ message ApiClientConfig {
 message GUILink {
     string text = 1;
     string url = 2;
+    string icon_url = 3;
+
+    // This can be "sidebar" (default), "context"
+    string type = 4;
+
+    // If set we open in new tab
+    bool new_tab = 5;
+
+    // Encode value first using this (can be "plain", "base64")
+    string encode = 6;
+    string parameter = 7;
+
+    // Can be GET (default) or POST
+    string method = 8;
+
+    // If set we ignore this entry completely
+    bool disabled = 9;
 }
 
 message Authenticator {
@@ -269,6 +375,10 @@ message Authenticator {
     string oidc_issuer = 4 [(sem_type) = {
             description: "URL to OIDC Configuration Document. The configuration should be available in the 'oidc_issuer + /.well-known/openid-configuration' endpoint. ",
         }];
+    string oidc_name = 18;
+
+    // Can be an img src for the avatar
+    string avatar = 19;
     string oauth_client_id = 5 [(sem_type) = {
             description: "If set we use oauth authentication flow.",
         }];
@@ -295,6 +405,24 @@ message Authenticator {
     string saml_user_attribute = 16 [(sem_type) = {
             description: "SAML attribute containing value for user identification."
         }];
+
+    // MultiAuthenticator delegates to multiple other authenticators.
+    repeated Authenticator sub_authenticators = 17;
+
+    string auth_redirect_template = 21 [(sem_type) = {
+            description: "URL to redirect to on Unauthorized API call",
+        }];
+
+    // Certs authenticator: If a user presents a certificate but does
+    // not exist in the system, the user will receive a default
+    // role. If this is not set the user will be rejected.
+    repeated string default_roles_for_unknown_user = 22;
+
+    // Defaults - no need to change these generally.
+
+    // How long to keep the session alive between auth flows - default
+    // 24 hours
+    uint64 default_session_expiry_min = 20;
 }
 
 message GUIConfig {
@@ -305,6 +433,19 @@ message GUIConfig {
     uint32 bind_port = 2 [(sem_type) = {
             description: "Port to bind to."
         }];
+
+    // A list of CIDR addresses from permitted networks. If this is
+    // not set, permit all connections to the GUI from anywhere.
+    repeated string allowed_cidr = 23;
+
+    // Header defined by the proxy containing the remote address. This
+    // header will be used in the allowed_cidr matching if specified.
+    // NOTE: Only use this if you do have a reverse proxy in front of
+    // the server. Otherwise an attacker can simply send this header
+    // to pretent to come from any IP address. If this setting is
+    // specified we take the src address from the header, otherwise
+    // from the remote IP address.
+    string forwarded_proxy_header = 24;
 
     // Allows the GUI to start with no encryption - **WARNING** This
     // only makes sense if you have TLS proxy in front. In fact the
@@ -325,13 +466,6 @@ message GUIConfig {
             description: "The private key of the frontend server encoded in PEM format."
         }];
 
-    repeated string internal_cidr = 3 [(sem_type) = {
-            description: "CIDR addresses of internal networks (e.g. 192.168.0.0/16). We use this to show the internal/external icon."
-        }];
-
-    repeated string vpn_cidr = 4 [(sem_type) = {
-            description: "CIDR addresses of vpn networks (e.g. 192.168.0.0/16). We use this to show the internal/external icon."
-        }];
 
     string public_url = 7 [(sem_type) = {
             description: "The public URL of this server.",
@@ -345,9 +479,12 @@ message GUIConfig {
             description: "Additional links to present in the GUI."
         }];
 
-    // These users are created if they do no already exist in the data
-    // store.
+    // These users are created with administrator role if they do not
+    // already exist in the data store. This is useful for
+    // initializing the server with some valid administrators.
     repeated GUIUser initial_users = 17;
+
+    repeated InitialOrgRecord initial_orgs = 22;
 
     // The authenticator to use - can not be null.
     Authenticator authenticator = 19;
@@ -358,12 +495,13 @@ message GUIConfig {
     // packs).
     string artifact_search_filter = 18;
 
-    // SAML info deprecated - will be moved to a sample authenticator.
+    // SAML info deprecated - will be moved to a saml authenticator.
     string saml_certificate = 12;
     string saml_private_key = 13;
     string saml_idp_metadata_url = 14;
     string saml_root_url = 15;
     string saml_user_attribute = 16;
+
     // DEPRECATED: Will be moved to a Google authenticator
     string google_oauth_client_id = 5;
     string google_oauth_client_secret = 6;
@@ -373,7 +511,6 @@ message GUIUser {
     string name = 1;
     string password_hash = 2;
     string password_salt = 3;
-
 }
 
 message CAConfig {
@@ -381,7 +518,6 @@ message CAConfig {
             description: "The private key of the CA encoded in PEM. This must correspond with the certificate in Client.ca_certificate."
         }];
 }
-
 
 message ReverseProxyConfig {
     string route = 1;
@@ -398,6 +534,12 @@ message DynDNSConfig {
     string ddns_password = 3;
     string update_url = 4;
     uint64 frequency = 5;
+
+    // The url we will use to check the ip. Should return a plain IP address
+    string checkip_url = 6;
+
+    // DNS server we query for our own hostname/ip mapping (default 8.8.8.8:53)
+    string dns_server = 7;
 }
 
 message FrontendResourceControl {
@@ -417,13 +559,12 @@ message FrontendResourceControl {
     int64 enrollments_per_second = 3;
 
     // The maximum number of concurrent client connections we can
-    // process. The actual concurrency level can be dynamically
-    // adjusted to try to control the target_heap_size below. As the
-    // heap size increases, the frontend will reduce the concurrency
-    // level in order to reduce memory pressure. Low concurrency
-    // levels increase average latency and in the worse case cause
-    // clients to time out. When clients timeout, they will back off
-    // and try to send data later.
+    // process. Concurrency limits helps to ensure the server is not
+    // overloaded serving too many clients at the same time.
+    // Concurrency refers to the actual serving time of a client
+    // (i.e. time taken to read the response and write to the
+    // datastore), not the total number of clients served by
+    // server. Default is number of cores * 2.
     uint64 concurrency = 9;
 
     // Aim for this heap size (default 2Gb). If actual memory usage
@@ -475,6 +616,30 @@ message FrontendResourceControl {
     // client info from cache too frequently can result in a lot more
     // IO. Default size of this cache is the expected_clients above.
     uint64 client_info_lru_ttl = 27;
+
+    // How often to sync client info records (ms)
+    uint64 client_info_sync_time = 29;
+    uint64 client_info_write_time = 30;
+
+    // The journal files are used to queue messages between event
+    // generators and event consumers when the consumer is unable to
+    // drain these quickly enough. The setting specifies the maximum
+    // size of the file - when it is exceeded, the file will be
+    // truncated and events will be lost. Default is 1gb
+    int64 max_journal_buffer_size = 28;
+
+    // The maximum time in seconds the client will batch log messages
+    // before forwarding them to the server (default 1 second).
+    uint64 default_log_batch_time = 31;
+
+    // The maximum time in seconds the client will batch minitoring
+    // log messages before forwarding them to the server (default 600
+    // second).
+    uint64 default_monitoring_log_batch_time = 32;
+
+    // Disables file buffering for event queues. This may result in
+    // poor performance under load.
+    bool disable_file_buffering = 33;
 }
 
 
@@ -571,10 +736,6 @@ message FrontendConfig {
     int64 GRPC_pool_max_size = 17;
     int64 GRPC_pool_max_wait = 18;
 
-    // The services that will run on this frontend. If not set, all
-    // services will run on the primary frontend.
-    ServerServicesConfig server_services = 20;
-
     FrontendResourceControl resources = 27;
 
     // Used internally to tag this frontend as the master.
@@ -608,6 +769,10 @@ message FrontendConfig {
     // Load artifacts from this directory at startup
     string artifact_definitions_directory = 32;
 
+    // A regular expression that if matches any log messages from the
+    // client's query represent a failure of the collection.
+    string collection_error_regex = 35;
+
     // DEPRECATED - ignored.
     bool do_not_redirect = 26;
 }
@@ -638,6 +803,17 @@ message DatastoreConfig {
     // For FileBaseDataStore
     string location = 2;
     string filestore_directory = 3;
+
+    // Used by the default FileBaseDataStore
+
+    // Set to the min required disk space. When we fall below this
+    // available disk space, we refuse to write files. This avoids the
+    // possibility of writing corrupted files. Default is 50mb. Set to
+    // -1 to disable disk space checking.
+    int64 min_allowed_file_space_mb = 15;
+
+    // How often to check the disk space (default 10 sec)
+    int64 disk_check_frequency_sec = 16;
 
     // Cap directories to this size after reporting error - this
     // should not happen normally but may happen if the deployment has
@@ -699,6 +875,8 @@ message MailConfig {
     string auth_password = 5 [(sem_type) = {
             description: "password to authenticate with.",
         }];
+
+    bool skip_verify = 6;
 }
 
 message LoggingRetentionConfig {
@@ -735,6 +913,10 @@ message LoggingConfig {
     LoggingRetentionConfig debug = 5;
     LoggingRetentionConfig info = 6;
     LoggingRetentionConfig error = 7;
+
+    string remote_syslog_server = 8;
+    string remote_syslog_protocol = 9;
+    repeated string remote_syslog_components = 10;
 }
 
 message MonitoringConfig {
@@ -752,6 +934,12 @@ message AutoExecConfig {
     repeated Artifact artifact_definitions = 2;
 }
 
+// When a binary starts it initializes some services depending on its
+// role. The startup code will update the config object to request the
+// right services, depending on the required role. Services are
+// actually started by the org manager.
+
+// Do not set these in the configuration file - they are used internally.
 message ServerServicesConfig {
    bool hunt_manager = 1;
    bool hunt_dispatcher = 2;
@@ -769,11 +957,106 @@ message ServerServicesConfig {
    bool frontend_server = 14;
    bool gui_server = 15;
    bool index_server = 16;
+   bool journal_service = 17;
+   bool replication_service = 26;
+   bool notification_service = 18;
+   bool repository_manager = 19;
+   bool test_repository_manager = 25;
+   bool inventory_service = 20;
+   bool client_info = 21;
+   bool label = 22;
+   bool launcher = 23;
+   bool notebook_service = 24;
+
+    // Client services
+   bool http_communicator = 27;
+   bool client_event_table = 28;
 }
 
 message Defaults {
     int64 hunt_expiry_hours = 1;
     int64 notebook_cell_timeout_min = 2;
+
+    // When calculating a new cell we do not start calculation until
+    // the process memory is smaller than the low memory mark.
+    uint64 notebook_memory_low_water_mark = 36;
+
+    // When the process memory exceeds the high water marrk, we
+    // actively cancel in flight notebook cell calculations.
+    uint64 notebook_memory_high_water_mark = 37;
+
+    // The default CSV delimiter
+    string csv_delimiter = 3;
+
+    uint64 event_max_wait = 4;
+    uint64 event_max_wait_jitter = 5;
+
+    // If set we actively notify all clients as soon as event table is
+    // changed. This causes a lot of load on large deployments so it
+    // is off by default.
+    bool event_change_notify_all_clients = 6;
+
+    uint64 max_vfs_directory_size = 7;
+
+    repeated string artifact_definitions_directories = 8;
+
+    // The number of rows to keep in memory during a group by
+    // operation. Once this is exceeded we switch to disk mode which
+    // is a lot slower. Default 30000
+    uint64 max_in_memory_group_by = 9;
+
+    // If these are set we enforce VQL to only have the specified
+    // allowed VQL plugins and functions. This is a way to harden the
+    // server by removing potentially sensitive functionality to allow
+    // only approved VQL plugins to run.
+    repeated string allowed_plugins = 10;
+    repeated string allowed_functions = 11;
+    repeated string allowed_accessors = 12;
+
+    // How long to cache ACL policies (default 60 sec)
+    uint64 acl_lru_timeout_sec = 13;
+
+    // Ignore messages from unauthenticated clients for this long -
+    // gives them a chance to enrol first (default 10 sec).
+    int64 unauthenticated_lru_timeout_sec = 14;
+
+    // The Maximum size of a sparse file that can be expanded. Files
+    // larger than this will not be expanded. This protects the server
+    // from expanding potentially Tb worth of sparse files when
+    // requested.
+    uint64 max_sparse_expand_size = 15;
+
+    // Control GUI features
+    bool disable_server_events = 26;
+    string auth_redirect_template = 27;
+    bool disable_quarantine_button = 28;
+    string default_theme = 29;
+
+    // Defaults for client communication limits. Decrease those if
+    // your clients are behind a proxy that only accepts very small
+    // POST messages. If not set we use client defaults.
+    uint64 max_rows = 30;
+    uint64 max_row_buffer_size = 31;
+    uint64 max_batch_wait = 35;
+
+    // When the server is in lockdown mode the following permissions
+    // will be denied (Even for administrators).
+    // The default list is:
+    // - ARTIFACT_WRITER
+    // - SERVER_ARTIFACT_WRITER
+    // - EXECVE
+    // - SERVER_ADMIN
+    // - FILESYSTEM_WRITE
+    // - FILESYSTEM_READ
+    // - MACHINE_STATE
+    repeated string lockdown_denied_permissions = 32;
+
+    // Default expiry of certificate issuances (default 365 days)
+    int64 certificate_validity_days = 33;
+
+    // Normally the inventory service attempts to download tools in
+    // its own but if this is set, we prevent any external access.
+    bool disable_inventory_service_external_access = 34;
 }
 
 // Configures crypto preferences
@@ -781,6 +1064,78 @@ message CryptoConfig {
     // Include these root CA's to verify certificates (in addition to
     // built in CA's). Certs should be concatenated in PEM format.
     string root_certs = 1;
+
+    // Clients may connect to servers which use a self-signed certificate.
+    // This list allows to specify a set of certificate thumbprints (SHA256)
+    // which are used to validate TLS server certificates.
+    //
+    // Fingerprints can be generated with the OpenSSL command line utility:
+    //   openssl s_client -connect www.google.com:443 < /dev/null | openssl x509 -fingerprint -sha256 -noout
+    //
+    // Certificate thumbprints may or may not include colon characters. Capitalization
+    // of the hex digits is ignored by Velociraptor. A thumbprint of any of the
+    // following forms (or combinations thereof) is fine:
+    //   E6:E2:8B:35:CE:C5:BA:C4:53:C5:AF:BF:2B:76:34:62:40:5C:D0:60:80:E1:30:1A:A7:A5:A9:DA:0C:8B:11:E1
+    //   E6E28B35CEC5BAC453C5AFBF2B763462405CD06080E1301AA7A5A9DA0C8B11E1
+    //   e6e28b35cec5bac453c5afbf2b763462405cd06080e1301aa7a5a9da0c8b11e1
+    repeated string certificate_thumbprints = 2 [(sem_type) = {
+            description: "SHA256 thumbprints of certificates that the client will trust."
+        }];
+
+    // Velociraptor supports several ways of verifying TLS certificates. The
+    // certificate_verification_mode specifies which of the three modes is applied.
+    // Currently, three modes are available:
+    //   - PKI (the default): verify TLS certs against public CA lists, the list
+    //                        of additional root_certs, and the built-in CA cert
+    //   - PKI_OR_THUMBPRINT: the same as PKI with the addition that certificates
+    //                        which have a thumbprint that is present in
+    //                        certificate_thumbprints will be accepted as well
+    //   - THUMBPRINT_ONLY: Velociraptor only accepts certificates which have a
+    //                      matching thumbprint in certificate_thumbprints. All
+    //                      other certificates will be rejected. This mode is
+    //                      also known as certificate pinning.
+    string certificate_verification_mode = 3 [(sem_type) = {
+            description: "Selects the way in which Velociraptor verifies TLS certificates. Allowed values: PKI (the default), PKI_OR_THUMBPRINT, THUMBPRINT_ONLY"
+        }];
+
+    // If this is set we do not enforce minimum configuration for TLS
+    // servers. This is required when connecting to Velociraptor with
+    // some legacy clients (like Powershell) who do not support TLS13
+    bool allow_weak_tls_server = 4;
+}
+
+message MountPoint {
+    string accessor = 1;
+    string prefix = 2;
+    string path_type = 3;
+}
+
+message RemappingConfig {
+    // Operation: Currently mount, identify
+    string type = 1;
+
+    // Human readable description of what this mapping rule should
+    // produce.
+    string description = 10;
+
+    // For mount options
+    MountPoint from = 2;
+    MountPoint on = 3;
+
+    // For type=permissions - permissions come from acls/acls.go
+    repeated string permissions = 4;
+
+    // For type=impersonation - can be windows, linux, darwin
+    string os = 5;
+    string hostname = 6;
+
+    // Variables to be added to environment strings.
+    repeated VQLEnv env = 7;
+
+    // Disable these plugins and functions (usually for OS specific
+    // things that make no sense on an image).
+    repeated string disabled_functions = 8;
+    repeated string disabled_plugins = 9;
 }
 
 message Config {
@@ -811,9 +1166,9 @@ message Config {
 
     DatastoreConfig Datastore = 6;
 
-    Writeback Writeback = 9 [(sem_type) = {
-            description: "Contents of the client's state as stored in the writeback file."
-        }];
+    // Deprecated - Should not appear in new configs and will be
+    // ignored. It is only here for backwards compatibility.
+    Writeback Writeback = 9 [deprecated=true];
 
     // Deprecated - Mail plugin setting are now provided by args.
     MailConfig Mail = 11;
@@ -851,4 +1206,34 @@ message Config {
 
     // Various defaults can be changed here (usually not needed).
     Defaults defaults = 33;
+
+    // The Operating System of the analysis target. Only useful in conjunction
+    // with the `device' parameter in case the host's operating system differs
+    // from the operating system used on the device. DEPRECATED!
+    string analysis_target = 34;
+
+    // The list of data sources which Velociraptor should map instead of the
+    // host's own file system.
+    repeated RemappingConfig remappings = 35;
+
+    // These should **not** be set by the user - they are tags
+    // internally that mark each org's config object. They should
+    // definitely not be set on the client's config because the client
+    // does not know or use its own org id.
+    string org_id = 36;
+    string org_name = 37;
+
+
+    // The services that will run at initialization. Note this is not
+    // set in the config file by the user but is propagated from the
+    // startup code.
+    ServerServicesConfig services = 38;
+
+    // The Velociraptor server may be placed into "lockdown"
+    // mode. While in lockdown mode certain permissions are denied -
+    // even for administrators. This additional protection mode helps
+    // to mitigate the case when a Velociraptor administrator's
+    // account is compromised. The server can be taken out of lockdown
+    // mode by setting lockdown to false and restarting the server.
+    bool lockdown = 39;
 }

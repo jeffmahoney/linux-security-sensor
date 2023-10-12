@@ -21,7 +21,7 @@ description: |
   own malware to make sure they're able to execute in elevated
   contexts in the future [2].
 
-  ## References:
+reference:
   - https://attack.mitre.org/techniques/T1166/
 
 parameters:
@@ -31,8 +31,8 @@ parameters:
 sources:
   - query: |
       SELECT Mode.String AS Mode,
-               FullPath, Size,
+               OSPath, Size,
                Mtime,
                Sys.Uid AS OwnerID,
                Sys.Gid AS GroupID
-      FROM glob(globs=GlobExpression) WHERE Mode =~ '^u'
+      FROM glob(globs=GlobExpression) WHERE Mode =~ '^g|u'

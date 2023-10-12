@@ -1,8 +1,8 @@
 // +build server_vql
 
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -26,11 +26,15 @@ import (
 	"strings"
 
 	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store"
+	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -74,6 +78,11 @@ func (self *DeleteFileStore) Call(ctx context.Context,
 	file_store_factory := file_store.GetFileStore(config_obj)
 
 	vfs_path := arg.VFSPath.Reduce(ctx)
+	principal := vql_subsystem.GetPrincipal(scope)
+	services.LogAudit(ctx,
+		config_obj, principal, "file_store_delete",
+		ordereddict.NewDict().Set("vfs", vfs_path))
+
 	switch t := vfs_path.(type) {
 	case *path_specs.DSPathSpec:
 		err = db.DeleteSubject(config_obj, t)
@@ -86,6 +95,11 @@ func (self *DeleteFileStore) Call(ctx context.Context,
 
 	case path_specs.FSPathSpec:
 		err = file_store_factory.Delete(t)
+
+	case *accessors.OSPath:
+		path_spec := path_specs.NewSafeFilestorePath(t.Components...).
+			SetType(api.PATH_TYPE_FILESTORE_ANY)
+		err = file_store_factory.Delete(path_spec)
 
 	case string:
 		// Things that produce strings normally encode the path spec
@@ -116,9 +130,10 @@ func (self *DeleteFileStore) Call(ctx context.Context,
 
 func (self DeleteFileStore) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "file_store_delete",
-		Doc:     "Delete file store paths into full filesystem paths. ",
-		ArgType: type_map.AddType(scope, &DeleteFileStoreArgs{}),
+		Name:     "file_store_delete",
+		Doc:      "Delete file store paths into full filesystem paths. ",
+		ArgType:  type_map.AddType(scope, &DeleteFileStoreArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.SERVER_ADMIN).Build(),
 	}
 }
 
@@ -157,6 +172,9 @@ func (self *FileStore) Call(ctx context.Context,
 
 	case path_specs.DSPathSpec:
 		return t.AsDatastoreFilename(config_obj)
+
+	case *accessors.OSPath:
+		return path_specs.NewUnsafeFilestorePath(t.Components...).AsFilestoreFilename(config_obj)
 
 	case string:
 		// Things that produce strings normally encode the path spec

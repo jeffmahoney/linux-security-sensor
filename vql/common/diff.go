@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -145,7 +145,7 @@ func NewDiffCache(
 	})
 	if err != nil {
 		close(result.done)
-		scope.Log("AddDestructor: %s", err)
+		scope.Log("NewDiffCache AddDestructor: %s", err)
 	}
 
 	return result
@@ -186,19 +186,21 @@ func (self _DiffPlugin) Call(ctx context.Context,
 			arg.Query)
 
 		for {
+			scope.Log("diff: Running query")
+			for _, row := range diff_cache.Eval(ctx, scope) {
+				select {
+				case <-ctx.Done():
+					return
+
+				case output_chan <- row:
+				}
+			}
+
 			select {
 			case <-ctx.Done():
 				return
 
 			case <-time.After(time.Duration(arg.Period) * time.Second):
-				for _, row := range diff_cache.Eval(ctx, scope) {
-					select {
-					case <-ctx.Done():
-						return
-
-					case output_chan <- row:
-					}
-				}
 			}
 		}
 

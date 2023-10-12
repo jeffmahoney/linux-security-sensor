@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -25,15 +25,19 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	rotatelogs "github.com/Velocidex/file-rotatelogs"
+	"github.com/go-errors/errors"
 	"github.com/mattn/go-isatty"
-	"github.com/pkg/errors"
+
 	"github.com/rifflock/lfshook"
 	"github.com/sirupsen/logrus"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
@@ -51,9 +55,10 @@ var (
 	Audit = "VelociraptorAudit"
 
 	// Lock for log manager.
-	mu        sync.Mutex
-	Manager   *LogManager
-	node_name = ""
+	mu                   sync.Mutex
+	Manager              *LogManager
+	disable_log_to_files bool
+	node_name            = ""
 
 	// Lock for memory logs and prelogs.
 	memory_log_mu sync.Mutex
@@ -71,23 +76,39 @@ func SetNodeName(name string) {
 	node_name = name
 }
 
+// Turn off logging to files from now on. This is needed for commands
+// that manipulate the config file and we dont want to attempt to
+// write to random log files.
+func DisableLogging() {
+	mu.Lock()
+	disable_log_to_files = true
+	mu.Unlock()
+}
+
 func InitLogging(config_obj *config_proto.Config) error {
 	mu.Lock()
 	Manager = &LogManager{
 		contexts: make(map[*string]*LogContext),
 	}
 
-	for _, component := range []*string{&GenericComponent,
-		&FrontendComponent, &ClientComponent,
+	for _, component := range []*string{
+		&GenericComponent, &FrontendComponent, &ClientComponent,
 		&GUIComponent, &ToolComponent, &APICmponent, &Audit} {
 
 		logger, err := Manager.makeNewComponent(config_obj, component)
 		if err != nil {
+			mu.Unlock()
 			return err
 		}
 		Manager.contexts[component] = logger
 	}
+
+	err := maybeAddRemoteSyslog(config_obj, Manager)
 	mu.Unlock()
+
+	if err != nil {
+		return err
+	}
 
 	FlushPrelogs(config_obj)
 
@@ -95,7 +116,9 @@ func InitLogging(config_obj *config_proto.Config) error {
 }
 
 func ClearMemoryLogs() {
+	memory_log_mu.Lock()
 	memory_logs = nil
+	memory_log_mu.Unlock()
 }
 
 func GetMemoryLogs() []string {
@@ -136,6 +159,9 @@ func FlushPrelogs(config_obj *config_proto.Config) {
 
 type LogContext struct {
 	*logrus.Logger
+
+	mu      sync.Mutex
+	enabled map[string]bool
 }
 
 func (self *LogContext) Debug(format string, v ...interface{}) {
@@ -159,6 +185,28 @@ func (self *LogContext) Warn(format string, v ...interface{}) {
 func (self *LogContext) Error(format string, v ...interface{}) {
 	if self.Logger != nil {
 		self.Logger.Error(fmt.Sprintf(format, v...))
+	}
+}
+
+func (self *LogContext) IsEnabled(level string) bool {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	ok, _ := self.enabled[level]
+	return ok
+}
+
+func (self *LogContext) LogWithLevel(level string, format string, v ...interface{}) {
+	switch level {
+	case ERROR:
+		self.Error(format, v...)
+	case WARNING:
+		self.Warn(format, v...)
+	case INFO:
+		self.Info(format, v...)
+	case DEBUG:
+		self.Debug(format, v...)
+	default:
+		self.Info(format, v...)
 	}
 }
 
@@ -192,6 +240,7 @@ func (self *LogManager) GetLogger(
 				Hooks:     make(logrus.LevelHooks),
 				Level:     logrus.DebugLevel,
 			},
+			enabled: make(map[string]bool),
 		}
 	}
 	return ctx
@@ -213,7 +262,7 @@ func Reset() {
 func getRotator(
 	config_obj *config_proto.Config,
 	rotator_config *config_proto.LoggingRetentionConfig,
-	base_path string) (io.Writer, error) {
+	base_path string) (io.Writer, error, bool) {
 
 	if rotator_config == nil {
 		rotator_config = &config_proto.LoggingRetentionConfig{
@@ -223,7 +272,7 @@ func getRotator(
 	}
 
 	if rotator_config.Disabled {
-		return ioutil.Discard, nil
+		return ioutil.Discard, nil, false
 	}
 
 	max_age := rotator_config.MaxAge
@@ -245,24 +294,30 @@ func getRotator(
 		rotatelogs.WithRotationTime(time.Duration(rotation)*time.Second),
 	)
 	if err != nil {
-		return nil, err
+		return nil, err, false
 	}
 
 	// Make sure to write one message to confirm that we can actually
 	// write to the file.
-	_, err = result.Write([]byte("Starting...\n"))
-	return result, err
+	now := utils.GetTime().Now().UTC()
+	_, err = result.Write([]byte(json.Format(
+		"{\"level\": \"info\", \"msg\": \"Starting...\", \"time\": %q}\n", now)))
+	return result, err, true
 }
 
 func (self *LogManager) makeNewComponent(
 	config_obj *config_proto.Config,
 	component *string) (*LogContext, error) {
 
+	enabled := make(map[string]bool)
+
 	Log := logrus.New()
 	Log.Out = inMemoryLogWriter{}
 	Log.Level = logrus.DebugLevel
 
-	if config_obj != nil && config_obj.Logging != nil &&
+	if !disable_log_to_files &&
+		config_obj != nil &&
+		config_obj.Logging != nil &&
 		config_obj.Logging.OutputDirectory != "" {
 
 		base_directory := filepath.Join(
@@ -275,35 +330,40 @@ func (self *LogManager) makeNewComponent(
 		base_filename := filepath.Join(base_directory, *component)
 		pathMap := lfshook.WriterMap{}
 
-		rotator, err := getRotator(
+		Prelog("Initializing logging for %v\n", base_filename)
+
+		rotator, err, enable := getRotator(
 			config_obj, config_obj.Logging.Debug,
 			base_filename+"_debug.log")
 		if err != nil {
 			return nil, err
 		}
 		pathMap[logrus.DebugLevel] = rotator
+		enabled[DEBUG] = enable
 
-		rotator, err = getRotator(
+		rotator, err, enable = getRotator(
 			config_obj, config_obj.Logging.Info,
 			base_filename+"_info.log")
 		if err != nil {
 			return nil, err
 		}
 		pathMap[logrus.InfoLevel] = rotator
+		enabled[INFO] = enable
 
-		rotator, err = getRotator(
+		rotator, err, enable = getRotator(
 			config_obj, config_obj.Logging.Error,
 			base_filename+"_error.log")
 		if err != nil {
 			return nil, err
 		}
 		pathMap[logrus.ErrorLevel] = rotator
+		enabled[ERROR] = enable
 
 		hook := lfshook.NewHook(
 			pathMap,
-			&logrus.JSONFormatter{
+			&JSONFormatter{&logrus.JSONFormatter{
 				DisableHTMLEscape: true,
-			},
+			}},
 		)
 		Log.Hooks.Add(hook)
 	}
@@ -325,7 +385,10 @@ func (self *LogManager) makeNewComponent(
 		NoColor = true
 	}
 
-	return &LogContext{Log}, nil
+	return &LogContext{
+		Logger:  Log,
+		enabled: enabled,
+	}, nil
 }
 
 func AddLogFile(filename string) error {
@@ -344,12 +407,25 @@ func AddLogFile(filename string) error {
 
 	for _, log := range Manager.contexts {
 		log.Hooks.Add(lfshook.NewHook(
-			writer_map, &logrus.JSONFormatter{
+			writer_map, &JSONFormatter{&logrus.JSONFormatter{
 				DisableHTMLEscape: true,
-			},
+			}},
 		))
 	}
 	return nil
+}
+
+func SplitIntoLevelAndLog(b []byte) (level, message string) {
+	parts := strings.SplitN(string(b), ":", 2)
+	if len(parts) == 2 {
+		level := strings.ToUpper(parts[0])
+		switch level {
+		case DEFAULT, ERROR, INFO, WARNING, DEBUG, ALERT:
+			return level, parts[1]
+		}
+	}
+
+	return DEFAULT, string(b)
 }
 
 type logWriter struct {
@@ -357,7 +433,8 @@ type logWriter struct {
 }
 
 func (self *logWriter) Write(b []byte) (int, error) {
-	self.logger.Info("%s", string(b))
+	level, msg := SplitIntoLevelAndLog(b)
+	self.logger.LogWithLevel(level, "%v", msg)
 	return len(b), nil
 }
 
@@ -388,14 +465,12 @@ func GetLogger(config_obj *config_proto.Config, component *string) *LogContext {
 }
 
 type stackTracer interface {
-	StackTrace() errors.StackTrace
+	Stack() []byte
 }
 
 func GetStackTrace(err error) string {
-	if err, ok := err.(stackTracer); ok {
-		for _, f := range err.StackTrace() {
-			return fmt.Sprintf("%+s:%d\n", f, f)
-		}
+	if serr, ok := err.(stackTracer); ok {
+		return string(serr.Stack())
 	}
 	return ""
 }

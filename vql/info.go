@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -21,18 +21,24 @@ import (
 	"context"
 	"os"
 	"runtime"
+	"time"
 
 	fqdn "github.com/Showmax/go-fqdn"
 	"github.com/Velocidex/ordereddict"
-	"github.com/shirou/gopsutil/v3/host"
 
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql/psutils"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
-func getInfo(host *host.InfoStat) *ordereddict.Dict {
+var (
+	start_time = time.Now()
+)
+
+func GetInfo(host *psutils.InfoStat) *ordereddict.Dict {
 	me, _ := os.Executable()
+	cwd, _ := os.Getwd()
 	return ordereddict.NewDict().
 		Set("Hostname", host.Hostname).
 		Set("Uptime", host.Uptime).
@@ -45,15 +51,19 @@ func getInfo(host *host.InfoStat) *ordereddict.Dict {
 		Set("KernelVersion", host.KernelVersion).
 		Set("VirtualizationSystem", host.VirtualizationSystem).
 		Set("VirtualizationRole", host.VirtualizationRole).
+		Set("CompilerVersion", runtime.Version()).
 		Set("HostID", host.HostID).
 		Set("Exe", me).
-		Set("IsAdmin", IsAdmin())
+		Set("CWD", cwd).
+		Set("IsAdmin", IsAdmin()).
+		Set("ClientStart", start_time)
 }
 
 func init() {
 	RegisterPlugin(
 		vfilter.GenericListPlugin{
 			PluginName: "info",
+			Metadata:   VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 			Function: func(
 				ctx context.Context,
 				scope vfilter.Scope,
@@ -76,9 +86,9 @@ func init() {
 				// It turns out that host.Info() is
 				// actually rather slow so we cache it
 				// in the scope cache.
-				info, ok := CacheGet(scope, "__info").(*host.InfoStat)
+				info, ok := CacheGet(scope, "__info").(*psutils.InfoStat)
 				if !ok {
-					info, err = host.Info()
+					info, err = psutils.InfoWithContext(ctx)
 					if err != nil {
 						scope.Log("info: %s", err)
 						return result
@@ -86,7 +96,7 @@ func init() {
 					CacheSet(scope, "__info", info)
 				}
 
-				item := getInfo(info).
+				item := GetInfo(info).
 					Set("Fqdn", fqdn.Get()).
 					Set("Architecture", runtime.GOARCH)
 				result = append(result, item)

@@ -5,9 +5,12 @@ import (
 	"os"
 
 	"github.com/Velocidex/ordereddict"
+	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/reporting"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/startup"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -20,29 +23,37 @@ var (
 )
 
 func doCSV() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithNullLoader().LoadAndValidate()
 	if err != nil {
 		return err
 	}
 
-	sm, err := startEssentialServices(config_obj)
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	config_obj.Services = services.GenericToolServices()
+	sm, err := startup.StartToolServices(ctx, config_obj)
+	defer sm.Close()
+
 	if err != nil {
 		return err
 	}
-	defer sm.Close()
 
+	logger := &LogWriter{config_obj: config_obj}
 	builder := services.ScopeBuilder{
 		Config:     config_obj,
-		ACLManager: vql_subsystem.NullACLManager{},
-		Logger:     log.New(os.Stderr, "velociraptor: ", 0),
+		ACLManager: acl_managers.NullACLManager{},
+		Logger:     log.New(logger, "", 0),
 		Env: ordereddict.NewDict().
 			Set(vql_subsystem.ACL_MANAGER_VAR,
-				vql_subsystem.NewRoleACLManager("administrator")).
+				acl_managers.NewRoleACLManager(config_obj, "administrator")).
 			Set("Files", *csv_cmd_files),
 	}
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return err
 	}
@@ -61,20 +72,25 @@ func doCSV() error {
 		return err
 	}
 
-	ctx := InstallSignalHandler(scope)
-
 	switch *csv_format {
 	case "text":
 		table := reporting.EvalQueryToTable(ctx, scope, vql, os.Stdout)
 		table.Render()
 
 	case "jsonl":
-		return outputJSONL(ctx, scope, vql, os.Stdout)
+		err = outputJSONL(ctx, scope, vql, os.Stdout)
+		if err != nil {
+			return err
+		}
 
 	case "json":
-		return outputJSON(ctx, scope, vql, os.Stdout)
+		err = outputJSON(ctx, scope, vql, os.Stdout)
+		if err != nil {
+			return err
+		}
+
 	}
-	return nil
+	return logger.Error
 }
 
 func init() {

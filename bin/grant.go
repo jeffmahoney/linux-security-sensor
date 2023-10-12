@@ -5,10 +5,13 @@ import (
 	"io"
 	"strings"
 
-	jsonpatch "github.com/evanphx/json-patch"
+	jsonpatch "github.com/evanphx/json-patch/v5"
 	"www.velocidex.com/golang/velociraptor/acls"
 	acl_proto "www.velocidex.com/golang/velociraptor/acls/proto"
 	"www.velocidex.com/golang/velociraptor/json"
+	logging "www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/startup"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
@@ -30,6 +33,8 @@ var (
 	grant_command = acl_command.Command(
 		"grant", "Grant a principal  a policy.")
 
+	grant_command_org = grant_command.Flag("org", "OrgID to grant").String()
+
 	grant_command_principal = grant_command.Arg(
 		"principal", "Name of principal (User or cert) to grant.").
 		Required().String()
@@ -48,6 +53,8 @@ var (
 )
 
 func doGrant() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredFrontend().
 		WithRequiredUser().
@@ -56,17 +63,39 @@ func doGrant() error {
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return fmt.Errorf("Starting services: %w", err)
-	}
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	config_obj.Services = services.GenericToolServices()
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
+
+	if err != nil {
+		return err
+	}
 
 	principal := *grant_command_principal
 
-	existing_policy, err := acls.GetPolicy(config_obj, principal)
+	// Check the user actually exists first
+	user_manager := services.GetUserManager()
+	_, err = user_manager.GetUser(ctx, principal)
+	if err != nil {
+		return err
+	}
+
+	org_manager, err := services.GetOrgManager()
+	if err != nil {
+		return err
+	}
+
+	org_config_obj, err := org_manager.GetOrgConfig(*grant_command_org)
+	if err != nil {
+		return err
+	}
+
+	existing_policy, err := services.GetPolicy(org_config_obj, principal)
 	if err != nil && err != io.EOF {
-		return fmt.Errorf("Unable to load existing policy for %v", principal)
+		existing_policy = &acl_proto.ApiClientACL{}
 	}
 
 	new_policy := &acl_proto.ApiClientACL{}
@@ -109,30 +138,39 @@ func doGrant() error {
 		}
 	}
 
-	return acls.SetPolicy(config_obj, principal, new_policy)
+	return services.SetPolicy(org_config_obj, principal, new_policy)
 }
 
 func doShow() error {
-	config_obj, err := makeDefaultConfigLoader().WithRequiredFrontend().LoadAndValidate()
+	logging.DisableLogging()
+
+	config_obj, err := makeDefaultConfigLoader().
+		WithRequiredFrontend().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return fmt.Errorf("Starting services: %w", err)
-	}
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	config_obj.Services = services.GenericToolServices()
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
 
-	principal := *show_command_principal
-	existing_policy, err := acls.GetPolicy(config_obj, principal)
 	if err != nil {
-		return fmt.Errorf("Unable to load existing policy for '%v' ",
-			principal)
+		return err
+	}
+
+	principal := *show_command_principal
+
+	existing_policy, err := services.GetPolicy(config_obj, principal)
+	if err != nil {
+		return fmt.Errorf("Unable to load existing policy for '%v': %v ",
+			principal, err)
 	}
 
 	if *show_command_effective {
-		existing_policy, err = acls.GetEffectivePolicy(config_obj, principal)
+		existing_policy, err = services.GetEffectivePolicy(config_obj, principal)
 		if err != nil {
 			return fmt.Errorf("Unable to load existing policy for '%v' ",
 				principal)

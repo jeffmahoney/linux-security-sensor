@@ -9,23 +9,34 @@ import (
 	"path"
 
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/api/authenticators"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
-	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	file_store "www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
 )
 
-func toolUploadHandler(
-	config_obj *config_proto.Config) http.Handler {
+func toolUploadHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		org_id := authenticators.GetOrgIdFromRequest(r)
+		org_manager, err := services.GetOrgManager()
+		if err != nil {
+			returnError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+
+		org_config_obj, err := org_manager.GetOrgConfig(org_id)
+		if err != nil {
+			returnError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+
 		// Check for acls
-		userinfo := GetUserInfo(r.Context(), config_obj)
+		userinfo := GetUserInfo(r.Context(), org_config_obj)
 		permissions := acls.ARTIFACT_WRITER
-		perm, err := acls.CheckAccess(config_obj, userinfo.Name, permissions)
+		perm, err := services.CheckAccess(org_config_obj, userinfo.Name, permissions)
 		if !perm || err != nil {
 			returnError(w, http.StatusUnauthorized,
 				"User is not allowed to upload tools.")
@@ -34,7 +45,7 @@ func toolUploadHandler(
 
 		// Parse our multipart form, 10 << 20 specifies a maximum
 		// upload of 10 MB files.
-		err = r.ParseMultipartForm(10 << 20)
+		err = r.ParseMultipartForm(10 << 25)
 		if err != nil {
 			returnError(w, http.StatusBadRequest, "Unsupported params")
 			return
@@ -67,9 +78,13 @@ func toolUploadHandler(
 		tool.Filename = path.Base(handler.Filename)
 		tool.ServeLocally = true
 
-		file_store_factory := file_store.GetFileStore(config_obj)
-		path_manager := paths.NewInventoryPathManager(config_obj, tool)
-		writer, err := file_store_factory.WriteFile(path_manager.Path())
+		path_manager := paths.NewInventoryPathManager(org_config_obj, tool)
+		pathspec, file_store_factory, err := path_manager.Path()
+		if err != nil {
+			returnError(w, 404, err.Error())
+		}
+
+		writer, err := file_store_factory.WriteFile(pathspec)
 		if err != nil {
 			returnError(w, http.StatusInternalServerError,
 				fmt.Sprintf("Error: %v", err))
@@ -95,7 +110,15 @@ func toolUploadHandler(
 
 		tool.Hash = hex.EncodeToString(sha_sum.Sum(nil))
 
-		err = services.GetInventory().AddTool(config_obj, tool,
+		inventory, err := services.GetInventory(org_config_obj)
+		if err != nil {
+			returnError(w, http.StatusInternalServerError,
+				fmt.Sprintf("Error: %v", err))
+			return
+		}
+
+		ctx := r.Context()
+		err = inventory.AddTool(ctx, org_config_obj, tool,
 			services.ToolOptions{
 				AdminOverride: true,
 			})
@@ -106,8 +129,8 @@ func toolUploadHandler(
 		}
 
 		// Now materialize the tool
-		tool, err = services.GetInventory().GetToolInfo(
-			r.Context(), config_obj, tool.Name)
+		tool, err = inventory.GetToolInfo(
+			r.Context(), org_config_obj, tool.Name, tool.Version)
 		if err != nil {
 			returnError(w, http.StatusInternalServerError,
 				fmt.Sprintf("Error: %v", err))
@@ -117,19 +140,31 @@ func toolUploadHandler(
 		serialized, _ := json.Marshal(tool)
 		_, err = w.Write(serialized)
 		if err != nil {
-			logger := logging.GetLogger(config_obj, &logging.GUIComponent)
+			logger := logging.GetLogger(org_config_obj, &logging.GUIComponent)
 			logger.Error("toolUploadHandler: %v", err)
 		}
 	})
 }
 
-func formUploadHandler(
-	config_obj *config_proto.Config) http.Handler {
+func formUploadHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		org_id := authenticators.GetOrgIdFromRequest(r)
+		org_manager, err := services.GetOrgManager()
+		if err != nil {
+			returnError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+
+		org_config_obj, err := org_manager.GetOrgConfig(org_id)
+		if err != nil {
+			returnError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+
 		// Check for acls
-		userinfo := GetUserInfo(r.Context(), config_obj)
+		userinfo := GetUserInfo(r.Context(), org_config_obj)
 		permissions := acls.COLLECT_CLIENT
-		perm, err := acls.CheckAccess(config_obj, userinfo.Name, permissions)
+		perm, err := services.CheckAccess(org_config_obj, userinfo.Name, permissions)
 		if !perm || err != nil {
 			returnError(w, http.StatusUnauthorized,
 				"User is not allowed to upload files for forms.")
@@ -170,13 +205,18 @@ func formUploadHandler(
 
 		form_desc.Filename = path.Base(handler.Filename)
 
-		file_store_factory := file_store.GetFileStore(config_obj)
 		path_manager := paths.NewFormUploadPathManager(
-			config_obj, form_desc.Filename)
+			org_config_obj, form_desc.Filename)
+
+		pathspec, file_store_factory, err := path_manager.Path()
+		if err != nil {
+			returnError(w, 403, fmt.Sprintf("Error: %v", err))
+			return
+		}
 
 		form_desc.Url = path_manager.URL()
 
-		writer, err := file_store_factory.WriteFile(path_manager.Path())
+		writer, err := file_store_factory.WriteFile(pathspec)
 		if err != nil {
 			returnError(w, http.StatusInternalServerError,
 				fmt.Sprintf("Error: %v", err))
@@ -201,7 +241,7 @@ func formUploadHandler(
 		serialized, _ := json.Marshal(form_desc)
 		_, err = w.Write(serialized)
 		if err != nil {
-			logger := logging.GetLogger(config_obj, &logging.GUIComponent)
+			logger := logging.GetLogger(org_config_obj, &logging.GUIComponent)
 			logger.Error("toolUploadHandler: %v", err)
 		}
 	})

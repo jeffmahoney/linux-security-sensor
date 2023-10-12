@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	errors "github.com/pkg/errors"
+	errors "github.com/go-errors/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -30,10 +30,10 @@ func (self *Concurrency) StartConcurrencyControl(ctx context.Context) (func(), e
 		return self.EndConcurrencyControl, nil
 
 	case <-ctx.Done():
-		return nil, errors.New("Timed out")
+		return nil, errors.New("Concurrency: Timed out due to cancellation")
 
 	case <-time.After(self.timeout):
-		return nil, errors.New("Timed out")
+		return nil, errors.New("Timed out in concurrency control")
 	}
 }
 

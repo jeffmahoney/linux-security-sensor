@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -27,6 +27,7 @@
 package vql
 
 import (
+	"fmt"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -46,9 +47,20 @@ var (
 	})
 )
 
+// Used when we deliberately want to override a registered plugin.
 func OverridePlugin(plugin vfilter.PluginGeneratorInterface) {
 	name := plugin.Info(nil, nil).Name
 	exportedPlugins[name] = plugin
+
+	ResetGlobalScopeCache()
+}
+
+// Used when we deliberately want to override a registered function.
+func OverrideFunction(function vfilter.FunctionInterface) {
+	name := function.Info(nil, nil).Name
+	exportedFunctions[name] = function
+
+	ResetGlobalScopeCache()
 }
 
 func RegisterPlugin(plugin vfilter.PluginGeneratorInterface) {
@@ -59,6 +71,8 @@ func RegisterPlugin(plugin vfilter.PluginGeneratorInterface) {
 	}
 
 	exportedPlugins[name] = plugin
+
+	ResetGlobalScopeCache()
 }
 
 func RegisterFunction(plugin vfilter.FunctionInterface) {
@@ -69,15 +83,61 @@ func RegisterFunction(plugin vfilter.FunctionInterface) {
 	}
 
 	exportedFunctions[name] = plugin
+
+	ResetGlobalScopeCache()
 }
 
 func RegisterProtocol(plugin vfilter.Any) {
 	exportedProtocolImpl = append(exportedProtocolImpl, plugin)
+
+	ResetGlobalScopeCache()
 }
 
 func GetFunction(name string) (vfilter.FunctionInterface, bool) {
 	res, pres := exportedFunctions[name]
 	return res, pres
+}
+
+func EnforceVQLAllowList(
+	allowed_plugins []string, allowed_functions []string) error {
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	base_scope := vfilter.NewScope()
+
+	exported_plugins := exportedPlugins
+	exportedPlugins = make(map[string]vfilter.PluginGeneratorInterface)
+	for _, plugin_name := range allowed_plugins {
+		impl, ok := exported_plugins[plugin_name]
+		if !ok {
+			// Maybe this is provided by the base scope.
+			impl, ok = base_scope.GetPlugin(plugin_name)
+			if !ok {
+				return fmt.Errorf("Unknown plugin %v", plugin_name)
+			}
+		}
+		exportedPlugins[plugin_name] = impl
+	}
+
+	exported_functions := exportedFunctions
+	exportedFunctions = make(map[string]vfilter.FunctionInterface)
+	for _, func_name := range allowed_functions {
+		impl, ok := exported_functions[func_name]
+		if !ok {
+			// Maybe this is provided by the base scope.
+			impl, ok = base_scope.GetFunction(func_name)
+			if !ok {
+				return fmt.Errorf("Unknown VQL Function %v", func_name)
+			}
+		}
+		exportedFunctions[func_name] = impl
+	}
+
+	// Reset the global scope so we will be forced to recreate it.
+	globalScope = nil
+
+	return nil
 }
 
 var (
@@ -133,4 +193,11 @@ func MakeNewScope() vfilter.Scope {
 	}
 
 	return result
+}
+
+// Used in tests to flush the global scope - needed **after** .
+func ResetGlobalScopeCache() {
+	mu.Lock()
+	defer mu.Unlock()
+	globalScope = nil
 }

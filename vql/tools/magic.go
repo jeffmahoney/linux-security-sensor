@@ -9,7 +9,9 @@ import (
 	"github.com/Velocidex/go-magic/magic"
 	"github.com/Velocidex/go-magic/magic_files"
 	"github.com/Velocidex/ordereddict"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -20,10 +22,10 @@ const (
 )
 
 type MagicFunctionArgs struct {
-	Path     string `vfilter:"required,field=path,doc=Path to open and hash."`
-	Accessor string `vfilter:"optional,field=accessor,doc=The accessor to use"`
-	Type     string `vfilter:"optional,field=type,doc=Magic type (can be empty or 'mime' or 'extension')"`
-	Magic    string `vfilter:"optional,field=magic,doc=Additional magic to load"`
+	Path     *accessors.OSPath `vfilter:"required,field=path,doc=Path to open and hash."`
+	Accessor string            `vfilter:"optional,field=accessor,doc=The accessor to use"`
+	Type     string            `vfilter:"optional,field=type,doc=Magic type (can be empty or 'mime' or 'extension')"`
+	Magic    string            `vfilter:"optional,field=magic,doc=Additional magic to load"`
 }
 
 type MagicFunction struct{}
@@ -91,7 +93,7 @@ func (self MagicFunction) Call(
 
 	// Just let libmagic handle the path
 	if arg.Accessor == "" {
-		return handle.File(arg.Path)
+		return handle.File(arg.Path.String())
 	}
 
 	err = vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
@@ -101,13 +103,13 @@ func (self MagicFunction) Call(
 	}
 
 	// Read a header from the file and pass to the libmagic
-	accessor, err := glob.GetAccessor(arg.Accessor, scope)
+	accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
 		scope.Log("magic: %v", err)
 		return vfilter.Null{}
 	}
 
-	fd, err := accessor.Open(arg.Path)
+	fd, err := accessor.OpenWithOSPath(arg.Path)
 	if err != nil {
 		return vfilter.Null{}
 	}
@@ -123,10 +125,11 @@ func (self MagicFunction) Call(
 
 func (self MagicFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "magic",
-		Doc:     "Identify a file using magic rules.",
-		ArgType: type_map.AddType(scope, &MagicFunctionArgs{}),
-		Version: 1,
+		Name:     "magic",
+		Doc:      "Identify a file using magic rules.",
+		ArgType:  type_map.AddType(scope, &MagicFunctionArgs{}),
+		Version:  1,
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

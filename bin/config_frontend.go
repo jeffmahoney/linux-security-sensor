@@ -5,9 +5,10 @@ package main
 import (
 	"fmt"
 
-	"github.com/Velocidex/survey"
-	errors "github.com/pkg/errors"
+	"github.com/AlecAivazis/survey/v2"
+	errors "github.com/go-errors/errors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
@@ -34,6 +35,8 @@ func reportCurrentSetup(config_obj *config_proto.Config) string {
 }
 
 func doConfigFrontend() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredFrontend().LoadAndValidate()
 	if err != nil {

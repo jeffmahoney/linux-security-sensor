@@ -14,6 +14,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/protobuf/proto"
+	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	"www.velocidex.com/golang/velociraptor/datastore"
@@ -32,23 +33,11 @@ var (
 
 	Clock utils.Clock = &utils.RealClock{}
 	g_id  uint64
-)
 
-type TASKS_AVAILABLE_STATUS int
-
-const (
-	// We dont know the client has any tasks or not - we need to check
-	// the datastore.
-	TASKS_AVAILABLE_STATUS_UNKNOWN TASKS_AVAILABLE_STATUS = iota
-
-	// Client definitely has tasks - we will check the datastore when
-	// we need them.
-	TASKS_AVAILABLE_STATUS_YES
-
-	// Client definitely does not have tasks. The master will inform
-	// us when new tasks are added to it, until then we do not check
-	// the datastore at all.
-	TASKS_AVAILABLE_STATUS_NO
+	clientCancellationCounter = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "client_flow_cancellations",
+		Help: "Total number of client cancellation messages sent.",
+	})
 )
 
 func (self *ClientInfoManager) ProcessNotification(
@@ -56,25 +45,23 @@ func (self *ClientInfoManager) ProcessNotification(
 	row *ordereddict.Dict) error {
 	client_id, pres := row.GetString("ClientId")
 	if pres {
-		cached_info, err := self.GetCacheInfo(client_id)
+		record, err := self.storage.GetRecord(client_id)
 		if err != nil {
-			return err
+			// If a record does not exist we ignore the notification.
+			return nil
 		}
-
-		// Next access will check for real.
-		tasksClearCount.Inc()
-		cached_info.SetHasTasks(TASKS_AVAILABLE_STATUS_YES)
-
-		notifier := services.GetNotifier()
-		if notifier != nil {
+		record.HasTasks = true
+		notifier, err := services.GetNotifier(config_obj)
+		if err == nil {
 			notifier.NotifyDirectListener(client_id)
 		}
+		return self.storage.SetRecord(record)
 	}
 	return nil
 }
 
 func (self *ClientInfoManager) UnQueueMessageForClient(
-	client_id string,
+	ctx context.Context, client_id string,
 	message *crypto_proto.VeloMessage) error {
 	db, err := datastore.GetDB(self.config_obj)
 	if err != nil {
@@ -87,12 +74,13 @@ func (self *ClientInfoManager) UnQueueMessageForClient(
 }
 
 func (self *ClientInfoManager) QueueMessagesForClient(
+	ctx context.Context,
 	client_id string,
 	req []*crypto_proto.VeloMessage,
 	/* Also notify the client about the new task */
 	notify bool) error {
 
-	journal, err := services.GetJournal()
+	journal, err := services.GetJournal(self.config_obj)
 	if err != nil {
 		return err
 	}
@@ -103,9 +91,19 @@ func (self *ClientInfoManager) QueueMessagesForClient(
 	}
 
 	// When the completer is done send a message to all the minions
-	// that the tasks are ready to be read.
+	// that the tasks are ready to be read. This will cause all nodes
+	// to update the client record's has_tasks field. On the master
+	// node this information will be flushed on the next snapshot
+	// write.
 	completer := utils.NewCompleter(func() {
-		journal.PushRowsToArtifactAsync(self.config_obj,
+		record, err := self.storage.GetRecord(client_id)
+		if err != nil {
+			return
+		}
+		record.HasTasks = true
+		self.storage.SetRecord(record)
+
+		journal.PushRowsToArtifactAsync(ctx, self.config_obj,
 			ordereddict.NewDict().
 				Set("ClientId", client_id).
 				Set("Notify", notify),
@@ -132,14 +130,19 @@ func (self *ClientInfoManager) QueueMessagesForClient(
 }
 
 func (self *ClientInfoManager) QueueMessageForClient(
+	ctx context.Context,
 	client_id string,
 	req *crypto_proto.VeloMessage, notify bool,
 	completion func()) error {
 
+	if req.Cancel != nil {
+		clientCancellationCounter.Inc()
+	}
+
 	// Task ID is related to time.
 	req.TaskId = currentTaskId()
 
-	journal, err := services.GetJournal()
+	journal, err := services.GetJournal(self.config_obj)
 	if err != nil {
 		return err
 	}
@@ -157,7 +160,9 @@ func (self *ClientInfoManager) QueueMessageForClient(
 				completion()
 			}
 
-			journal.PushRowsToArtifactAsync(self.config_obj,
+			// This message will be received by all nodes and cause
+			// the client's recrod to update the has_tasks field.
+			journal.PushRowsToArtifactAsync(ctx, self.config_obj,
 				ordereddict.NewDict().
 					Set("ClientId", client_id).
 					Set("Notify", notify),
@@ -167,8 +172,20 @@ func (self *ClientInfoManager) QueueMessageForClient(
 
 // Get the client tasks but do not dequeue them (Generally only called
 // by tests).
-func (self *ClientInfoManager) PeekClientTasks(client_id string) (
-	[]*crypto_proto.VeloMessage, error) {
+func (self *ClientInfoManager) PeekClientTasks(ctx context.Context,
+	client_id string) ([]*crypto_proto.VeloMessage, error) {
+
+	record, err := self.storage.GetRecord(client_id)
+	if err != nil {
+		// Not an error if the client does not exist.
+		return nil, nil
+	}
+
+	// This is by far the most common case - we know the client has no
+	// tasks outstanding. We can return immediately without any IO
+	if !record.HasTasks {
+		return nil, nil
+	}
 
 	db, err := datastore.GetDB(self.config_obj)
 	if err != nil {
@@ -185,8 +202,6 @@ func (self *ClientInfoManager) PeekClientTasks(client_id string) (
 	for _, task_urn := range tasks {
 		task_urn = task_urn.SetTag("ClientTask")
 
-		// Here we read the task from the task_urn and remove
-		// it from the queue.
 		message := &crypto_proto.VeloMessage{}
 		err = db.GetSubject(self.config_obj, task_urn, message)
 		if err != nil {
@@ -198,61 +213,42 @@ func (self *ClientInfoManager) PeekClientTasks(client_id string) (
 	return result, nil
 }
 
-func (self *ClientInfoManager) GetClientTasks(client_id string) (
+// Gets all the tasks from the client and remove from the datastore.
+func (self *ClientInfoManager) GetClientTasks(
+	ctx context.Context, client_id string) (
 	[]*crypto_proto.VeloMessage, error) {
-	cached_info, err := self.GetCacheInfo(client_id)
+
+	record, err := self.storage.GetRecord(client_id)
 	if err != nil {
+		// Not an error if the client does not exist.
 		return nil, nil
 	}
 
 	// This is by far the most common case - we know the client has no
 	// tasks outstanding. We can return immediately without any IO
-	if cached_info.GetHasTasks() == TASKS_AVAILABLE_STATUS_NO {
+	if !record.HasTasks {
 		return nil, nil
 	}
 
 	var tasks []api.DSPathSpec
 
-	// We really do not know - lets check
-	if cached_info.GetHasTasks() == TASKS_AVAILABLE_STATUS_UNKNOWN {
-		db, err := datastore.GetDB(self.config_obj)
-		if err != nil {
-			return nil, err
-		}
-
-		client_path_manager := paths.NewClientPathManager(client_id)
-		tasks, err = db.ListChildren(
-			self.config_obj, client_path_manager.TasksDirectory())
-		if err != nil {
-			return nil, err
-		}
-
-		if len(tasks) > 0 {
-			cached_info.SetHasTasks(TASKS_AVAILABLE_STATUS_YES)
-
-		} else {
-			// No tasks available.
-			cached_info.SetHasTasks(TASKS_AVAILABLE_STATUS_NO)
-			return nil, nil
-		}
-	}
-
-	// From here on we have TASKS_AVAILABLE_STATUS_YES
-
+	// Fetch all the tasks.
 	db, err := datastore.GetDB(self.config_obj)
 	if err != nil {
 		return nil, err
 	}
 
-	// We know that there are tasks available but we dont have them,
-	// let's get them.
-	if len(tasks) == 0 {
-		client_path_manager := paths.NewClientPathManager(client_id)
-		tasks, err = db.ListChildren(
-			self.config_obj, client_path_manager.TasksDirectory())
-		if err != nil {
-			return nil, err
-		}
+	client_path_manager := paths.NewClientPathManager(client_id)
+	tasks, err = db.ListChildren(
+		self.config_obj, client_path_manager.TasksDirectory())
+	if err != nil {
+		return nil, err
+	}
+
+	record.HasTasks = false
+	err = self.storage.SetRecord(record)
+	if err != nil {
+		return nil, err
 	}
 
 	result := []*crypto_proto.VeloMessage{}
@@ -273,11 +269,37 @@ func (self *ClientInfoManager) GetClientTasks(client_id string) (
 		if err != nil {
 			return nil, err
 		}
+
+		// Handle backwards compatibility with older clients by expanding
+		// FlowRequest into separate VQLClientActions. Newer clients will
+		// ignore bare VQLClientActions and older clients will ignore
+		// FlowRequest.
+		if message.FlowRequest != nil &&
+			len(message.FlowRequest.VQLClientActions) > 0 {
+
+			// Tack the first VQLClientAction on top of the
+			// FlowRequest for backwards compatibility. Newer clients
+			// procees FlowRequest first and ignore VQLClientAction
+			// while older clients will process the VQLClientAction
+			// and ignore the FlowRequest message. In both cases the
+			// message will be valid.
+			message.VQLClientAction = proto.Clone(
+				message.FlowRequest.VQLClientActions[0]).(*actions_proto.VQLCollectorArgs)
+
+			// Send the rest of the VQLClientAction as distinct messages.
+			for idx, request := range message.FlowRequest.VQLClientActions {
+				if idx > 0 {
+					result = append(result, &crypto_proto.VeloMessage{
+						SessionId:       message.SessionId,
+						RequestId:       message.RequestId,
+						VQLClientAction: request,
+					})
+				}
+			}
+		}
+
 		result = append(result, message)
 	}
-
-	// No more tasks available.
-	cached_info.SetHasTasks(TASKS_AVAILABLE_STATUS_NO)
 
 	return result, nil
 }

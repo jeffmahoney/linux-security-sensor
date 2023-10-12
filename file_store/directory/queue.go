@@ -33,13 +33,11 @@ import (
 	"github.com/Velocidex/ordereddict"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
-
-type QueueOptions struct {
-	DisableFileBuffering bool
-}
 
 // A Queue manages a set of registrations at a specific queue name
 // (artifact name).
@@ -65,7 +63,7 @@ func (self *QueuePool) GetWatchers() []string {
 
 func (self *QueuePool) Register(
 	ctx context.Context, vfs_path string,
-	options QueueOptions) (<-chan *ordereddict.Dict, func()) {
+	options api.QueueOptions) (<-chan *ordereddict.Dict, func()) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
@@ -74,6 +72,9 @@ func (self *QueuePool) Register(
 	subctx, cancel := context.WithCancel(ctx)
 	new_registration, err := NewListener(self.config_obj, subctx, vfs_path, options)
 	if err != nil {
+		logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
+		logger.Warn("Failed to register QueuePool for %s: %v", vfs_path, err)
+
 		cancel()
 		output_chan := make(chan *ordereddict.Dict)
 		close(output_chan)
@@ -141,6 +142,24 @@ func (self *QueuePool) Broadcast(vfs_path string, row *ordereddict.Dict) {
 	}
 }
 
+func (self *QueuePool) BroadcastJsonl(vfs_path string, jsonl []byte) {
+	// Ensure we do not hold the lock for very long here.
+	registrations := self.getRegistrations(vfs_path)
+	if len(registrations) > 0 {
+		// If there are any registrations, we must parse the JSON and
+		// relay each row to each listener - this is expensive but
+		// necessary.
+		rows, err := utils.ParseJsonToDicts(jsonl)
+		if err == nil {
+			for _, row := range rows {
+				for _, item := range registrations {
+					item.Send(row)
+				}
+			}
+		}
+	}
+}
+
 func (self *QueuePool) Debug() *ordereddict.Dict {
 	self.mu.Lock()
 	defer self.mu.Unlock()
@@ -170,6 +189,10 @@ type DirectoryQueueManager struct {
 	Clock      utils.Clock
 }
 
+func (self *DirectoryQueueManager) SetClock(clock utils.Clock) {
+	self.Clock = clock
+}
+
 func (self *DirectoryQueueManager) Debug() *ordereddict.Dict {
 	return self.queue_pool.Debug()
 }
@@ -189,7 +212,8 @@ func (self *DirectoryQueueManager) PushEventRows(
 
 	// Writes are asyncronous.
 	rs_writer, err := result_sets.NewTimedResultSetWriter(
-		self.FileStore, path_manager, nil, nil)
+		self.FileStore, path_manager, json.DefaultEncOpts(),
+		utils.BackgroundWriter)
 	if err != nil {
 		return err
 	}
@@ -204,12 +228,36 @@ func (self *DirectoryQueueManager) PushEventRows(
 	return nil
 }
 
+func (self *DirectoryQueueManager) PushEventJsonl(
+	path_manager api.PathManager, jsonl []byte, row_count int) error {
+
+	// Writes are asyncronous.
+	rs_writer, err := result_sets.NewTimedResultSetWriter(
+		self.FileStore, path_manager, json.DefaultEncOpts(),
+		utils.BackgroundWriter)
+	if err != nil {
+		return err
+	}
+	defer rs_writer.Close()
+
+	jsonl = json.AppendJsonlItem(jsonl, "_ts", int(self.Clock.Now().Unix()))
+	rs_writer.WriteJSONL(jsonl, row_count)
+	self.queue_pool.BroadcastJsonl(path_manager.GetQueueName(), jsonl)
+
+	return nil
+}
+
 func (self *DirectoryQueueManager) GetWatchers() []string {
 	return self.queue_pool.GetWatchers()
 }
 
-func (self *DirectoryQueueManager) Watch(ctx context.Context,
-	queue_name string) (<-chan *ordereddict.Dict, func()) {
+func (self *DirectoryQueueManager) Watch(
+	ctx context.Context, queue_name string,
+	queue_options *api.QueueOptions) (<-chan *ordereddict.Dict, func()) {
+
+	if queue_options == nil {
+		queue_options = &api.QueueOptions{}
+	}
 
 	// If the caller of Watch no longer cares about watching the queue
 	// they will call the cancellation function. This must abandon the
@@ -217,7 +265,7 @@ func (self *DirectoryQueueManager) Watch(ctx context.Context,
 	// dropped on the floor.
 	subctx, cancel := context.WithCancel(ctx)
 	output_chan, pool_cancel := self.queue_pool.Register(
-		subctx, queue_name, QueueOptions{})
+		subctx, queue_name, *queue_options)
 	return output_chan, func() {
 		cancel()
 		pool_cancel()

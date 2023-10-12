@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -22,10 +22,10 @@ import (
 	context "golang.org/x/net/context"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/file_store/csv"
+	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -38,14 +38,14 @@ func RunVQL(
 
 	result := &api_proto.GetTableResponse{}
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return nil, err
 	}
 	scope := manager.BuildScope(services.ScopeBuilder{
 		Config:     config_obj,
 		Env:        env,
-		ACLManager: vql_subsystem.NewServerACLManager(config_obj, principal),
+		ACLManager: acl_managers.NewServerACLManager(config_obj, principal),
 		Logger:     logging.NewPlainLogger(config_obj, &logging.ToolComponent),
 	})
 	defer scope.Close()
@@ -69,7 +69,8 @@ func RunVQL(
 			if !pres {
 				value = ""
 			}
-			new_row.Cell = append(new_row.Cell, csv.AnyToString(value))
+			new_row.Cell = append(new_row.Cell,
+				json.AnyToString(value, json.DefaultEncOpts()))
 		}
 
 		result.Rows = append(result.Rows, new_row)

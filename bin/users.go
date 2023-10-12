@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -24,10 +24,12 @@ import (
 	"strings"
 
 	"golang.org/x/crypto/ssh/terminal"
-	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/api/authenticators"
 	"www.velocidex.com/golang/velociraptor/json"
-	"www.velocidex.com/golang/velociraptor/users"
+	logging "www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/users"
+	"www.velocidex.com/golang/velociraptor/startup"
 )
 
 var (
@@ -44,6 +46,8 @@ var (
 	user_show      = user_command.Command("show", "Display information about a user")
 	user_show_name = user_show.Arg(
 		"username", "Username to show").Required().String()
+	user_show_hashes = user_show.Flag("with_hashes", "Displays the password hashes too.").
+				Bool()
 
 	user_lock = user_command.Command(
 		"lock", "Lock a user immediately by locking their account.")
@@ -52,6 +56,8 @@ var (
 )
 
 func doAddUser() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredFrontend().
 		WithRequiredUser().LoadAndValidate()
@@ -59,18 +65,28 @@ func doAddUser() error {
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
+	config_obj.Services = services.GenericToolServices()
+
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	if err != nil {
 		return fmt.Errorf("Starting services: %w", err)
 	}
 	defer sm.Close()
 
-	user_record, err := users.NewUserRecord(*user_add_name)
+	err = sm.Start(users.StartUserManager)
+	if err != nil {
+		return err
+	}
+
+	user_record, err := users.NewUserRecord(config_obj, *user_add_name)
 	if err != nil {
 		return fmt.Errorf("add user: %s", err)
 	}
 
-	err = acls.GrantRoles(config_obj, *user_add_name,
+	err = services.GrantRoles(config_obj, *user_add_name,
 		strings.Split(*user_add_roles, ","))
 	if err != nil {
 		return err
@@ -105,7 +121,9 @@ func doAddUser() error {
 	}
 
 	users.SetPassword(user_record, *user_add_password)
-	err = users.SetUser(config_obj, user_record)
+
+	users_manager := services.GetUserManager()
+	err = users_manager.SetUser(ctx, user_record)
 	if err != nil {
 		return fmt.Errorf("Unable to set user account: %w", err)
 	}
@@ -114,21 +132,40 @@ func doAddUser() error {
 }
 
 func doShowUser() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredFrontend().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
+	config_obj.Services = services.GenericToolServices()
+
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	if err != nil {
 		return fmt.Errorf("Starting services: %w", err)
 	}
 	defer sm.Close()
 
-	user_record, err := users.GetUser(config_obj, *user_show_name)
+	users_manager := services.GetUserManager()
+	user_record, err := users_manager.GetUser(ctx, *user_show_name)
 	if err != nil {
-		return fmt.Errorf("Unable to find user %s", *user_show_name)
+		return err
+	}
+
+	if *user_show_hashes {
+		user_record, err := users_manager.GetUserWithHashes(ctx, *user_show_name)
+		if err != nil {
+			return err
+		}
+
+		fmt.Println("The following are suitable to add into the initial users field of the config file.")
+		fmt.Printf("Password hash is %02x\n", user_record.PasswordHash)
+		fmt.Printf("Password salt is %02x\n", user_record.PasswordSalt)
 	}
 
 	s, err := json.MarshalIndent(user_record)
@@ -140,26 +177,34 @@ func doShowUser() error {
 }
 
 func doLockUser() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredFrontend().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
+	config_obj.Services = services.GenericToolServices()
+
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	if err != nil {
 		return fmt.Errorf("Starting services: %w", err)
 	}
 	defer sm.Close()
 
-	user_record, err := users.GetUser(config_obj, *user_lock_name)
+	users_manager := services.GetUserManager()
+	user_record, err := users_manager.GetUser(ctx, *user_lock_name)
 	if err != nil {
 		return fmt.Errorf("Unable to find user %s", *user_lock_name)
 	}
 
 	user_record.Locked = true
 
-	err = users.SetUser(config_obj, user_record)
+	err = users_manager.SetUser(ctx, user_record)
 	if err != nil {
 		return fmt.Errorf("Unable to set user account: %w", err)
 	}

@@ -7,8 +7,10 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/evtx"
+	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/constants"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/repository"
 	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
@@ -33,7 +35,7 @@ func NewEventLogWatcherService() *EventLogWatcherService {
 }
 
 func (self *EventLogWatcherService) Register(
-	filename string,
+	filename *accessors.OSPath,
 	accessor string,
 	ctx context.Context,
 	scope vfilter.Scope,
@@ -49,7 +51,7 @@ func (self *EventLogWatcherService) Register(
 		output_chan: output_chan,
 		scope:       scope}
 
-	key := filename + accessor
+	key := filename.String() + accessor
 	registration, pres := self.registrations[key]
 	if !pres {
 		registration = []*Handle{}
@@ -58,7 +60,17 @@ func (self *EventLogWatcherService) Register(
 		frequency := vql_subsystem.GetIntFromRow(
 			scope, scope, constants.EVTX_FREQUENCY)
 
-		go self.StartMonitoring(filename, accessor, frequency)
+		// Create a scope with a completely different lifespan since
+		// it may outlive this query (if another query starts watching
+		// the same file). The query will inherit the same ACL
+		// manager, log manager etc but this is usually fine as there
+		// are not different ACLs managers on the client side.
+		manager := &repository.RepositoryManager{}
+		builder := services.ScopeBuilderFromScope(scope)
+		subscope := manager.BuildScope(builder)
+
+		go self.StartMonitoring(
+			subscope, filename, accessor, frequency)
 	}
 
 	registration = append(registration, handle)
@@ -72,29 +84,30 @@ func (self *EventLogWatcherService) Register(
 // Monitor the filename for new events and emit them to all interested
 // listeners. If no listeners exist we terminate.
 func (self *EventLogWatcherService) StartMonitoring(
-	filename string, accessor_name string, frequency uint64) {
+	scope vfilter.Scope,
+	filename *accessors.OSPath,
+	accessor_name string, frequency uint64) {
+	defer scope.Close()
 
+	scope.Log("StartMonitoring")
 	defer utils.CheckForPanic("StartMonitoring")
 
-	// By default check every 3 seconds.
+	// By default check every 15 seconds. Event logs are not flushed
+	// that often so checking more frequently does not help much.
 	if frequency == 0 {
-		frequency = 3
+		frequency = 15
 	}
 
 	// A resolver for messages
 	resolver, _ := evtx.GetNativeResolver()
-
-	scope := vql_subsystem.MakeScope()
-	defer scope.Close()
-
-	accessor, err := glob.GetAccessor(accessor_name, scope)
+	accessor, err := accessors.GetAccessor(accessor_name, scope)
 	if err != nil {
-		//scope.Log("Registering watcher error: %v", err)
+		scope.Log("Registering watcher error: %v", err)
 		return
 	}
 
-	last_event := self.findLastEvent(filename, accessor)
-	key := filename + accessor_name
+	last_event := self.findLastEvent(scope, filename, accessor)
+	key := filename.String() + accessor_name
 	for {
 		self.mu.Lock()
 		registration, pres := self.registrations[key]
@@ -113,18 +126,21 @@ func (self *EventLogWatcherService) StartMonitoring(
 }
 
 func (self *EventLogWatcherService) findLastEvent(
-	filename string,
-	accessor glob.FileSystemAccessor) int {
+	scope vfilter.Scope,
+	filename *accessors.OSPath,
+	accessor accessors.FileSystemAccessor) int {
 	last_event := 0
 
-	fd, err := accessor.Open(filename)
+	fd, err := accessor.OpenWithOSPath(filename)
 	if err != nil {
+		scope.Log("findLastEvent Open error: %v", err)
 		return 0
 	}
 	defer fd.Close()
 
 	chunks, err := evtx.GetChunks(fd)
 	if err != nil {
+		scope.Log("findLastEvent GetChunks error: %v", err)
 		return 0
 	}
 
@@ -172,22 +188,22 @@ func (self *EventLogWatcherService) getActiveHandles(key string) []*Handle {
 }
 
 func (self *EventLogWatcherService) monitorOnce(
-	filename string,
+	filename *accessors.OSPath,
 	accessor_name string,
-	accessor glob.FileSystemAccessor,
+	accessor accessors.FileSystemAccessor,
 	last_event int,
 	resolver evtx.MessageResolver) int {
 
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	key := filename + accessor_name
+	key := filename.String() + accessor_name
 	handles := self.getActiveHandles(key)
 	if len(handles) == 0 {
 		return 0
 	}
 
-	fd, err := accessor.Open(filename)
+	fd, err := accessor.OpenWithOSPath(filename)
 	if err != nil {
 		for _, handle := range handles {
 			handle.scope.Log("Unable to open file %s: %v",

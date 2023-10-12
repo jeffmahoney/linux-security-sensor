@@ -8,11 +8,13 @@ package directory
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
 
 	"github.com/Velocidex/ordereddict"
+	"github.com/sirupsen/logrus"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/json"
@@ -75,21 +77,30 @@ type FileBasedRingBuffer struct {
 	// messages this wg is added, then callers can decrement it as
 	// needed.
 	Wg sync.WaitGroup
+
+	max_size int64
 }
 
 // Enqueue the item into the ring buffer and append to the end.
-func (self *FileBasedRingBuffer) Enqueue(item interface{}) error {
-	serialized, err := json.Marshal(item)
-	if err != nil {
-		return err
-	}
-
+func (self *FileBasedRingBuffer) EnqueueSerialized(serialized []byte) error {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
+	// If the file is too large we truncate it and report that we lost
+	// some data.
+	if self.max_size > 0 && self.header.WritePointer > self.max_size {
+		logger := logging.GetLogger(
+			self.config_obj, &logging.FrontendComponent)
+		logger.WithFields(logrus.Fields{
+			"name":       self.fd.Name(),
+			"bytes_lost": self.header.WritePointer - self.header.ReadPointer,
+		}).Error("Buffer file too large")
+		self._Truncate()
+	}
+
 	// Write the new message to the end of the file at the WritePointer
 	binary.LittleEndian.PutUint64(self.write_buf, uint64(len(serialized)))
-	_, err = self.fd.WriteAt(self.write_buf, int64(self.header.WritePointer))
+	_, err := self.fd.WriteAt(self.write_buf, int64(self.header.WritePointer))
 	if err != nil {
 		// File is corrupt now, reset it.
 		self._Truncate()
@@ -118,64 +129,103 @@ func (self *FileBasedRingBuffer) Enqueue(item interface{}) error {
 	return nil
 }
 
+func (self *FileBasedRingBuffer) Enqueue(item interface{}) error {
+	serialized, err := json.Marshal(item)
+	if err != nil {
+		return err
+	}
+
+	return self.EnqueueSerialized(serialized)
+}
+
 // Returns some messages message from the file.
-func (self *FileBasedRingBuffer) Lease(count int) []*ordereddict.Dict {
+func (self *FileBasedRingBuffer) lease(count int, unserialize func(serialized []byte) error) error {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	result := make([]*ordereddict.Dict, 0, count)
+	results := 0
 
 	// The file contains more data.
 	for self.header.WritePointer > self.header.ReadPointer {
-
 		// Read the next chunk (length+value) from the current leased pointer.
 		n, err := self.fd.ReadAt(self.read_buf, self.header.ReadPointer)
 		if err != nil || n != len(self.read_buf) {
-			self.log_ctx.Error(
+			err = fmt.Errorf(
 				"Possible corruption detected: file too short Writer %v, Reader %v.",
 				self.header.WritePointer, self.header.ReadPointer)
 			self._Truncate()
-			return nil
+			return err
 		}
 
 		length := int64(binary.LittleEndian.Uint64(self.read_buf))
 		// File might be corrupt - just reset the
 		// entire file.
 		if length > constants.MAX_MEMORY*2 || length <= 0 {
-			self.log_ctx.Error("Possible corruption detected - item length is too large.")
+			err = errors.New("Possible corruption detected - item length is too large.")
 			self._Truncate()
-			return nil
+			return err
 		}
 
 		// Unmarshal one item at a time.
 		serialized := make([]byte, length)
 		n, _ = self.fd.ReadAt(serialized, self.header.ReadPointer+8)
 		if int64(n) != length {
-			self.log_ctx.Errorf(
+			err = fmt.Errorf(
 				"Possible corruption detected - expected item of length %v received %v.",
 				length, n)
 			self._Truncate()
-			return nil
+			return err
 		}
 
-		item := ordereddict.NewDict()
-		err = item.UnmarshalJSON(serialized)
+		err = unserialize(serialized)
 		if err == nil {
-			result = append(result, item)
+			results += 1
 		}
 
 		self.header.ReadPointer += 8 + int64(n)
+
 		// We read up to the write pointer, we may truncate the file now.
 		if self.header.ReadPointer == self.header.WritePointer {
 			self._Truncate()
 		}
 
-		if len(result) >= count {
+		if results >= count {
 			break
 		}
 	}
 
-	self.Wg.Add(len(result))
+	self.Wg.Add(results)
+	return nil
+}
+
+func (self *FileBasedRingBuffer) LeaseSerialized(count int) [][]byte {
+	result := make([][]byte, 0, count)
+	err := self.lease(count, func(serialized []byte) error {
+			result = append(result, serialized)
+			return nil
+		})
+	if err != nil {
+		self.log_ctx.Error(err.Error())
+		return nil
+	}
+
+	return result
+}
+
+func (self *FileBasedRingBuffer) Lease(count int) []*ordereddict.Dict {
+	result := make([]*ordereddict.Dict, 0, count)
+	err := self.lease(count, func(serialized []byte) error {
+			item := ordereddict.NewDict()
+			err := item.UnmarshalJSON(serialized)
+			if err == nil {
+				result = append(result, item)
+			}
+			return err
+		})
+	if err != nil {
+		self.log_ctx.Error(err.Error())
+		return nil
+	}
 	return result
 }
 
@@ -187,6 +237,12 @@ func (self *FileBasedRingBuffer) _Truncate() {
 	self.header.WritePointer = FirstRecordOffset
 	serialized, _ := self.header.MarshalBinary()
 	_, _ = self.fd.WriteAt(serialized, 0)
+}
+
+func (self *FileBasedRingBuffer) PendingSize() int64 {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+	return self.header.WritePointer - self.header.ReadPointer
 }
 
 func (self *FileBasedRingBuffer) Reset() {
@@ -205,7 +261,6 @@ func NewFileBasedRingBuffer(
 	config_obj *config_proto.Config, fd *os.File) (*FileBasedRingBuffer, error) {
 
 	log_ctx := logging.GetLogger(config_obj, &logging.FrontendComponent)
-
 	header := &Header{
 		// Pad the header a bit to allow for extensions.
 		WritePointer: FirstRecordOffset,
@@ -241,6 +296,12 @@ func NewFileBasedRingBuffer(
 		read_buf:   make([]byte, 8),
 		write_buf:  make([]byte, 8),
 		log_ctx:    log_ctx,
+		max_size:   1024 * 1024 * 1024, // 1Gb
+	}
+
+	if config_obj.Frontend != nil && config_obj.Frontend.Resources != nil &&
+		config_obj.Frontend.Resources.MaxJournalBufferSize > 0 {
+		result.max_size = config_obj.Frontend.Resources.MaxJournalBufferSize
 	}
 
 	return result, nil

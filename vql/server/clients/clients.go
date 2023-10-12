@@ -1,8 +1,8 @@
 // +build server_vql
 
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -27,8 +27,8 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/json"
-	"www.velocidex.com/golang/velociraptor/search"
-	vsearch "www.velocidex.com/golang/velociraptor/search"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -73,7 +73,13 @@ func (self ClientsPlugin) Call(
 
 		// If a client id is specified we do not need to search at all.
 		if arg.ClientId != "" {
-			api_client, err := vsearch.FastGetApiClient(
+			indexer, err := services.GetIndexer(config_obj)
+			if err != nil {
+				scope.Log("clients: %v", err)
+				return
+			}
+
+			api_client, err := indexer.FastGetApiClient(
 				ctx, config_obj, arg.ClientId)
 			if err == nil {
 				select {
@@ -95,7 +101,13 @@ func (self ClientsPlugin) Call(
 			limit = 100000
 		}
 
-		search_chan, err := search.SearchClientsChan(ctx, scope,
+		indexer, err := services.GetIndexer(config_obj)
+		if err != nil {
+			scope.Log("client_info: %s", err.Error())
+			return
+		}
+
+		search_chan, err := indexer.SearchClientsChan(ctx, scope,
 			config_obj, search_term, vql_subsystem.GetPrincipal(scope))
 		if err != nil {
 			scope.Log("clients: %v", err)
@@ -108,7 +120,6 @@ func (self ClientsPlugin) Call(
 				return
 			case output_chan <- json.ConvertProtoToOrderedDict(api_client):
 			}
-			vfilter.ChargeOp(scope)
 		}
 	}()
 
@@ -117,9 +128,10 @@ func (self ClientsPlugin) Call(
 
 func (self ClientsPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "clients",
-		Doc:     "Retrieve the list of clients.",
-		ArgType: type_map.AddType(scope, &ClientsPluginArgs{}),
+		Name:     "clients",
+		Doc:      "Retrieve the list of clients.",
+		ArgType:  type_map.AddType(scope, &ClientsPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 
@@ -152,7 +164,13 @@ func (self *ClientInfoFunction) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
-	api_client, err := search.FastGetApiClient(ctx,
+	indexer, err := services.GetIndexer(config_obj)
+	if err != nil {
+		scope.Log("client_info: %s", err.Error())
+		return vfilter.Null{}
+	}
+
+	api_client, err := indexer.FastGetApiClient(ctx,
 		config_obj, arg.ClientId)
 	if err != nil {
 		scope.Log("client_info: %s", err.Error())
@@ -164,9 +182,10 @@ func (self *ClientInfoFunction) Call(ctx context.Context,
 func (self ClientInfoFunction) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "client_info",
-		Doc:     "Returns client info (like the fqdn) from the datastore.",
-		ArgType: type_map.AddType(scope, &ClientInfoFunctionArgs{}),
+		Name:     "client_info",
+		Doc:      "Returns client info (like the fqdn) from the datastore.",
+		ArgType:  type_map.AddType(scope, &ClientInfoFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 

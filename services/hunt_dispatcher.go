@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -23,16 +23,12 @@ package services
 // client requests.
 
 import (
-	"sync"
+	"context"
 
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-)
-
-var (
-	mu sync.Mutex
-
-	global_hunt_dispatcher IHuntDispatcher
+	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/vfilter"
 )
 
 // How was the hunt modified and what should be done about it?
@@ -74,37 +70,52 @@ type IHuntDispatcher interface {
 
 	// Modify a hunt under lock. The hunt will be synchronized to
 	// all frontends. Return true to indicate the hunt was modified.
-	ModifyHunt(hunt_id string,
+	ModifyHuntObject(ctx context.Context, hunt_id string,
 		cb func(hunt *api_proto.Hunt) HuntModificationAction,
 	) HuntModificationAction
+
+	ModifyHunt(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		hunt_modification *api_proto.Hunt,
+		user string) error
 
 	// Gets read only access to the hunt object.
 	GetHunt(hunt_id string) (*api_proto.Hunt, bool)
 
+	GetFlows(ctx context.Context, config_obj *config_proto.Config,
+		scope vfilter.Scope,
+		hunt_id string, start int) chan *api_proto.FlowDetails
+
+	CreateHunt(ctx context.Context,
+		config_obj *config_proto.Config,
+		acl_manager vql_subsystem.ACLManager,
+		hunt *api_proto.Hunt) (string, error)
+
+	ListHunts(ctx context.Context,
+		config_obj *config_proto.Config,
+		in *api_proto.ListHuntsRequest) (*api_proto.ListHuntsResponse, error)
+
 	// Send a mutation to a hunt object.
-	MutateHunt(config_obj *config_proto.Config,
+	MutateHunt(ctx context.Context,
+		config_obj *config_proto.Config,
 		mutation *api_proto.HuntMutation) error
 
 	// Re-read the hunts from the data store. This happens
 	// periodically and can also be triggered when a change is
 	// written to the datastore (e.g. new hunt scheduled) to pick
 	// up the latest hunts.
-	Refresh(config_obj *config_proto.Config) error
+	Refresh(ctx context.Context, config_obj *config_proto.Config) error
 
 	// Clean up and close the hunt dispatcher. Only used in tests.
 	Close(config_obj *config_proto.Config)
 }
 
-func RegisterHuntDispatcher(dispatcher IHuntDispatcher) {
-	mu.Lock()
-	defer mu.Unlock()
+func GetHuntDispatcher(config_obj *config_proto.Config) (IHuntDispatcher, error) {
+	org_manager, err := GetOrgManager()
+	if err != nil {
+		return nil, err
+	}
 
-	global_hunt_dispatcher = dispatcher
-}
-
-func GetHuntDispatcher() IHuntDispatcher {
-	mu.Lock()
-	defer mu.Unlock()
-
-	return global_hunt_dispatcher
+	return org_manager.Services(config_obj.OrgId).HuntDispatcher()
 }

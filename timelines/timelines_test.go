@@ -1,4 +1,4 @@
-package timelines
+package timelines_test
 
 import (
 	"context"
@@ -16,6 +16,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/result_sets"
+	"www.velocidex.com/golang/velociraptor/timelines"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
@@ -46,7 +47,7 @@ func (self *TimelineTestSuite) TestSuperTimelineWriter() {
 		Name: "Test",
 		Root: paths.NewNotebookPathManager("N.1234").Path(),
 	}
-	super, err := NewSuperTimelineWriter(self.config_obj, path_manager)
+	super, err := timelines.NewSuperTimelineWriter(self.config_obj, path_manager)
 	assert.NoError(self.T(), err)
 
 	timeline, err := super.AddChild("1")
@@ -67,7 +68,7 @@ func (self *TimelineTestSuite) TestSuperTimelineWriter() {
 	super.Close()
 
 	// test_utils.GetMemoryFileStore(self.T(), self.config_obj).Debug()
-	reader, err := NewSuperTimelineReader(self.config_obj, path_manager, nil)
+	reader, err := timelines.NewSuperTimelineReader(self.config_obj, path_manager, nil)
 	assert.NoError(self.T(), err)
 	defer reader.Close()
 
@@ -98,31 +99,46 @@ func (self *TimelineTestSuite) TestTimelineWriter() {
 		SuperTimeline("T.1234").GetChild("Test")
 
 	file_store_factory := file_store.GetFileStore(self.config_obj)
-	timeline, err := NewTimelineWriter(file_store_factory, path_manager,
+	timeline, err := timelines.NewTimelineWriter(file_store_factory, path_manager,
 		utils.SyncCompleter, result_sets.TruncateMode)
 	assert.NoError(self.T(), err)
 
+	total_rows := 0
 	for i := int64(0); i <= 10; i++ {
 		timeline.Write(time.Unix(i*2, 0), ordereddict.NewDict().Set("Item", i*2))
+		total_rows++
 	}
 	timeline.Close()
 
-	//	test_utils.GetMemoryFileStore(self.T(), self.config_obj).Debug()
+	// Make sure the index is correct. Each IndexRecord is 3 * 8 bytes
+	// = 24 and there should be exactly one record for each row.
+	index_data := test_utils.FileReadAll(self.T(), self.config_obj,
+		path_manager.Index())
+	assert.Equal(self.T(), len(index_data), total_rows*24)
 
-	reader, err := NewTimelineReader(file_store_factory, path_manager)
+	//test_utils.GetMemoryFileStore(self.T(), self.config_obj).Debug()
+
+	reader, err := timelines.NewTimelineReader(file_store_factory, path_manager)
 	assert.NoError(self.T(), err)
 	defer reader.Close()
 
 	ctx := context.Background()
 
 	for _, ts := range []int64{3, 4, 7} {
-		reader.SeekToTime(time.Unix(ts, 0))
+		err := reader.SeekToTime(time.Unix(ts, 0))
+		assert.NoError(self.T(), err)
+
 		for row := range reader.Read(ctx) {
 			value, ok := row.Row.GetInt64("Item")
 			assert.True(self.T(), ok)
 			assert.True(self.T(), value >= ts)
 		}
 	}
+
+	// Ensure we get EOF when reading past the end of the
+	// timeline. Last timestamp in the file is 20 so read time 21.
+	err = reader.SeekToTime(time.Unix(21, 0))
+	assert.Error(self.T(), err, "EOF")
 }
 
 func TestTimelineWriter(t *testing.T) {

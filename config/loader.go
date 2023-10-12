@@ -9,38 +9,56 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"runtime"
 
 	"github.com/Velocidex/yaml/v2"
-	errors "github.com/pkg/errors"
-	"google.golang.org/protobuf/encoding/protojson"
-	"google.golang.org/protobuf/proto"
+	"github.com/go-errors/errors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
 	"www.velocidex.com/golang/velociraptor/utils"
+)
+
+var (
+	noEmbeddedConfig = errors.New(
+		"No embedded config - you can pack one with the `config repack` command")
+
+	embedded_re = regexp.MustCompile(`#{3}<Begin Embedded Config>\r?\n`)
+
+	EmbeddedFile = ""
 )
 
 // A hard error causes the loader to stop immediately.
 type HardError struct {
-	err error
+	Err error
 }
 
 func (self HardError) Error() string {
-	return self.err.Error()
+	return self.Err.Error()
 }
 
-type loader_func func(self *Loader) (*config_proto.Config, error)
-type config_mutator_func func(self *config_proto.Config) error
-type validator func(self *Loader, config_obj *config_proto.Config) error
+type loaderFunction struct {
+	name        string
+	loader_func func(self *Loader) (*config_proto.Config, error)
+}
+
+type configMutator struct {
+	name                string
+	config_mutator_func func(self *config_proto.Config) error
+}
+
+type validatorFunction struct {
+	name      string
+	validator func(self *Loader, config_obj *config_proto.Config) error
+}
 
 type Loader struct {
 	verbose, use_writeback, required_logging bool
 
-	write_back_path string
-
-	loaders         []loader_func
-	config_mutators []config_mutator_func
-	validators      []validator
+	loaders         []loaderFunction
+	config_mutators []configMutator
+	validators      []validatorFunction
 
 	logger *logging.LogContext
 }
@@ -51,8 +69,9 @@ func (self *Loader) WithTempdir(tmpdir string) *Loader {
 	}
 
 	self = self.Copy()
-	self.validators = append(self.validators,
-		func(self *Loader, config_obj *config_proto.Config) error {
+	self.validators = append(self.validators, validatorFunction{
+		name: "WithTempdir",
+		validator: func(self *Loader, config_obj *config_proto.Config) error {
 			// Expand the tmpdir if needed.
 			tmpdir = utils.ExpandEnv(tmpdir)
 
@@ -81,7 +100,7 @@ func (self *Loader) WithTempdir(tmpdir string) *Loader {
 			self.Log("Setting temp directory to <green>%v", tmpdir)
 
 			return nil
-		})
+		}})
 	return self
 }
 
@@ -91,34 +110,41 @@ func (self *Loader) WithLogFile(filename string) *Loader {
 	}
 
 	self = self.Copy()
-	self.validators = append(self.validators,
-		func(self *Loader, config_obj *config_proto.Config) error {
-			return logging.AddLogFile(filename)
-		})
+	self.validators = append(self.validators, validatorFunction{
+		name: "WithLogFile",
+		validator: func(self *Loader, config_obj *config_proto.Config) error {
+			err := logging.AddLogFile(filename)
+			if err != nil {
+				return HardError{err}
+			}
+			return nil
+		}})
 	return self
 }
 
 func (self *Loader) WithRequiredFrontend() *Loader {
 	self = self.Copy()
-	self.validators = append(self.validators,
-		func(self *Loader, config_obj *config_proto.Config) error {
+	self.validators = append(self.validators, validatorFunction{
+		name: "WithRequiredFrontend",
+		validator: func(self *Loader, config_obj *config_proto.Config) error { //
 			if config_obj.Frontend == nil {
 				return errors.New("Frontend config is required")
 			}
 			return nil
-		})
+		}})
 	return self
 }
 
 func (self *Loader) WithRequiredClient() *Loader {
 	self = self.Copy()
-	self.validators = append(self.validators,
-		func(self *Loader, config_obj *config_proto.Config) error {
+	self.validators = append(self.validators, validatorFunction{
+		name: "WithRequiredClient",
+		validator: func(self *Loader, config_obj *config_proto.Config) error {
 			if config_obj.Client == nil {
 				return errors.New("Client config is required")
 			}
 			return nil
-		})
+		}})
 	return self
 }
 
@@ -127,8 +153,9 @@ func (self *Loader) WithRequiredClient() *Loader {
 // create as the wrong user will not be readable by the frontend.
 func (self *Loader) WithRequiredUser() *Loader {
 	self = self.Copy()
-	self.validators = append(self.validators,
-		func(self *Loader, config_obj *config_proto.Config) error {
+	self.validators = append(self.validators, validatorFunction{
+		name: "WithRequiredUser",
+		validator: func(self *Loader, config_obj *config_proto.Config) error {
 			if config_obj.Datastore == nil ||
 				config_obj.Datastore.Implementation != "FileBaseDataStore" {
 				return nil
@@ -145,46 +172,26 @@ func (self *Loader) WithRequiredUser() *Loader {
 			}
 
 			if user.Username != config_obj.Frontend.RunAsUser {
-				return errors.New(fmt.Sprintf(
+				return fmt.Errorf(
 					"Velociraptor should be running as the '%s' user but you are '%s'. "+
 						"Please change user with sudo first.",
-					config_obj.Frontend.RunAsUser, user.Username))
+					config_obj.Frontend.RunAsUser, user.Username)
 			}
 			return nil
-		})
-	return self
-}
-
-func (self *Loader) WithOverride(json_data string) *Loader {
-	self = self.Copy()
-	self.validators = append(self.validators,
-		func(self *Loader, config_obj *config_proto.Config) error {
-			if json_data == "" {
-				return nil
-			}
-
-			// Merge the json blob with the config
-			src := &config_proto.Config{}
-			err := protojson.Unmarshal([]byte(json_data), src)
-			if err != nil {
-				return err
-			}
-
-			proto.Merge(config_obj, src)
-			return nil
-		})
+		}})
 	return self
 }
 
 func (self *Loader) WithRequiredCA() *Loader {
 	self = self.Copy()
-	self.validators = append(self.validators,
-		func(self *Loader, config_obj *config_proto.Config) error {
+	self.validators = append(self.validators, validatorFunction{
+		name: "WithRequiredCA",
+		validator: func(self *Loader, config_obj *config_proto.Config) error {
 			if config_obj.CA == nil || config_obj.CA.PrivateKey == "" {
 				return errors.New("Config with valid CA is required")
 			}
 			return nil
-		})
+		}})
 	return self
 }
 
@@ -210,51 +217,82 @@ func (self *Loader) WithWriteback() *Loader {
 
 func (self *Loader) WithCustomLoader(loader func(self *Loader) (*config_proto.Config, error)) *Loader {
 	self = self.Copy()
-	self.loaders = append(self.loaders, loader)
+	self.loaders = append(self.loaders, loaderFunction{
+		name:        "WithCustomLoader",
+		loader_func: loader})
 	return self
 }
 
 func (self *Loader) WithConfigMutator(
-	mutator config_mutator_func) *Loader {
+	name string,
+	mutator func(self *config_proto.Config) error) *Loader {
 	self = self.Copy()
-	self.config_mutators = append(self.config_mutators, mutator)
+	self.config_mutators = append(self.config_mutators, configMutator{
+		name:                name,
+		config_mutator_func: mutator,
+	})
 	return self
 }
 
 func (self *Loader) WithCustomValidator(
+	name string,
 	validator func(config_obj *config_proto.Config) error) *Loader {
 	self = self.Copy()
-	self.validators = append(self.validators,
-		func(self *Loader, config_obj *config_proto.Config) error {
+	self.validators = append(self.validators, validatorFunction{
+		name: name,
+		validator: func(self *Loader, config_obj *config_proto.Config) error {
 			return validator(config_obj)
-		})
+		}})
 	return self
 }
 
 func (self *Loader) WithNullLoader() *Loader {
 	self = self.Copy()
-	self.loaders = append(self.loaders, func(self *Loader) (*config_proto.Config, error) {
-		self.Log("Setting empty config")
-		return &config_proto.Config{}, nil
-	})
+	self.loaders = append(self.loaders, loaderFunction{
+		name: "WithNullLoader",
+		loader_func: func(self *Loader) (*config_proto.Config, error) {
+			self.Log("Setting empty config")
+			return &config_proto.Config{}, nil
+		}})
 	return self
 }
 
 func (self *Loader) WithFileLoader(filename string) *Loader {
 	if filename != "" {
 		self = self.Copy()
-		self.loaders = append(self.loaders, func(self *Loader) (*config_proto.Config, error) {
-			self.Log("Loading config from file %v", filename)
-			result, err := read_config_from_file(filename)
-			if err != nil {
-				// If a filename is specified but it
-				// does not exist or invalid stop
-				// searching immediately.
-				return result, HardError{err}
-			}
-			return result, nil
+		self.loaders = append(self.loaders, loaderFunction{
+			name: "WithFileLoader",
+			loader_func: func(self *Loader) (*config_proto.Config, error) {
+				self.Log("Loading config from file %v", filename)
+				result, err := read_config_from_file(filename)
+				if err != nil {
+					// If a filename is specified but it
+					// does not exist or invalid stop
+					// searching immediately.
+					return result, HardError{err}
+				}
+				return result, nil
 
-		})
+			}})
+	}
+
+	return self
+}
+
+func (self *Loader) WithLiteralLoader(serialized []byte) *Loader {
+	if len(serialized) > 0 {
+		self = self.Copy()
+		self.loaders = append(self.loaders, loaderFunction{
+			name: "WithLiteralLoader",
+			loader_func: func(self *Loader) (*config_proto.Config, error) {
+				self.Log("Loading constant config")
+				result := &config_proto.Config{}
+				err := yaml.UnmarshalStrict(serialized, result)
+				if err != nil {
+					return nil, errors.Wrap(err, 0)
+				}
+				return result, nil
+			}})
 	}
 
 	return self
@@ -262,46 +300,92 @@ func (self *Loader) WithFileLoader(filename string) *Loader {
 
 func (self *Loader) WithEnvLoader(env_var string) *Loader {
 	self = self.Copy()
-	self.loaders = append(self.loaders, func(self *Loader) (*config_proto.Config, error) {
-		env_config := os.Getenv(env_var)
-		if env_config != "" {
-			self.Log("Loading config from env %v (%v)", env_var, env_config)
-			return read_config_from_file(env_config)
-		}
-		return nil, errors.New(fmt.Sprintf("Env var %v is not set", env_var))
-	})
+	self.loaders = append(self.loaders, loaderFunction{
+		name: "WithEnvLoader",
+		loader_func: func(self *Loader) (*config_proto.Config, error) {
+			env_config := os.Getenv(env_var)
+			if env_config != "" {
+				self.Log("Loading config from env %v (%v)", env_var, env_config)
+				return read_config_from_file(env_config)
+			}
+			return nil, fmt.Errorf("Env var %v is not set", env_var)
+		}})
 
 	return self
 }
 
 func (self *Loader) WithEnvLiteralLoader(env_var string) *Loader {
 	self = self.Copy()
-	self.loaders = append(self.loaders, func(self *Loader) (*config_proto.Config, error) {
-		env_config := os.Getenv(env_var)
-		if env_config != "" {
-			self.Log("Loading literal config from env %v", env_var)
-			result := &config_proto.Config{}
-			err := yaml.UnmarshalStrict([]byte(env_config), result)
-			if err != nil {
-				return nil, errors.WithStack(err)
+	self.loaders = append(self.loaders, loaderFunction{
+		name: "WithEnvLiteralLoader",
+		loader_func: func(self *Loader) (*config_proto.Config, error) {
+			env_config := os.Getenv(env_var)
+			if env_config != "" {
+				self.Log("Loading literal config from env %v", env_var)
+				result := &config_proto.Config{}
+				err := yaml.UnmarshalStrict([]byte(env_config), result)
+				if err != nil {
+					return nil, errors.Wrap(err, 0)
+				}
+				return result, nil
 			}
-			return result, nil
-		}
-		return nil, errors.New(fmt.Sprintf("Env var %v is not set", env_var))
-	})
+			return nil, fmt.Errorf("Env var %v is not set", env_var)
+		}})
 
 	return self
 }
 
-func (self *Loader) WithEmbedded() *Loader {
+func (self *Loader) WithEmbedded(embedded_file string) *Loader {
 	self = self.Copy()
-	self.loaders = append(self.loaders, func(self *Loader) (*config_proto.Config, error) {
-		result, err := read_embedded_config()
-		if err == nil {
-			self.Log("Loaded embedded config")
-		}
-		return result, err
-	})
+	self.loaders = append(self.loaders, loaderFunction{
+		name: "WithEmbedded",
+		loader_func: func(self *Loader) (*config_proto.Config, error) {
+			if embedded_file == "" {
+				result, err := read_embedded_config()
+				if err != nil {
+					return nil, err
+				}
+
+				self.Log("Loaded embedded config")
+
+				EmbeddedFile, err = os.Executable()
+				return result, err
+			}
+
+			// Ensure the "me" accessor uses this file for embedded zip.
+			full_path, err := filepath.Abs(embedded_file)
+			if err != nil {
+				return nil, err
+			}
+
+			EmbeddedFile = full_path
+
+			fd, err := os.Open(full_path)
+			if err != nil {
+				return nil, err
+			}
+
+			buf := make([]byte, len(FileConfigDefaultYaml)+1024)
+			n, err := fd.Read(buf)
+			if err != nil {
+				return nil, err
+			}
+
+			buf = buf[:n]
+
+			// Find the embedded marker in the buffer.
+			match := embedded_re.FindIndex(buf)
+			if match == nil {
+				return nil, noEmbeddedConfig
+			}
+
+			embedded_string := buf[match[0]:]
+			result, err := decode_embedded_config(embedded_string)
+			if err == nil {
+				self.Log("Loaded embedded config from %v", embedded_file)
+			}
+			return result, err
+		}})
 	return self
 }
 
@@ -311,26 +395,30 @@ func (self *Loader) WithApiLoader(filename string) *Loader {
 	}
 
 	self = self.Copy()
-	self.loaders = append(self.loaders, func(self *Loader) (*config_proto.Config, error) {
-		result, err := read_api_config_from_file(filename)
-		if err == nil {
-			self.Log("Loaded api config from %v", filename)
-		}
-		return result, err
-	})
+	self.loaders = append(self.loaders, loaderFunction{
+		name: "WithApiLoader",
+		loader_func: func(self *Loader) (*config_proto.Config, error) {
+			result, err := read_api_config_from_file(filename)
+			if err == nil {
+				self.Log("Loaded api config from %v", filename)
+			}
+			return result, err
+		}})
 	return self
 }
 
 func (self *Loader) WithEnvApiLoader(env_var string) *Loader {
 	self = self.Copy()
-	self.loaders = append(self.loaders, func(self *Loader) (*config_proto.Config, error) {
-		env_config := os.Getenv(env_var)
-		if env_config != "" {
-			self.Log("Loading config from env %v (%v)", env_var, env_config)
-			return read_api_config_from_file(env_config)
-		}
-		return nil, errors.New(fmt.Sprintf("Env var %v is not set", env_var))
-	})
+	self.loaders = append(self.loaders, loaderFunction{
+		name: "WithApiLoader",
+		loader_func: func(self *Loader) (*config_proto.Config, error) {
+			env_config := os.Getenv(env_var)
+			if env_config != "" {
+				self.Log("Loading config from env %v (%v)", env_var, env_config)
+				return read_api_config_from_file(env_config)
+			}
+			return nil, fmt.Errorf("Env var %v is not set", env_var)
+		}})
 	return self
 }
 
@@ -338,10 +426,9 @@ func (self *Loader) Copy() *Loader {
 	return &Loader{
 		verbose:         self.verbose,
 		logger:          self.logger,
-		write_back_path: self.write_back_path,
-		loaders:         append([]loader_func{}, self.loaders...),
-		validators:      append([]validator{}, self.validators...),
-		config_mutators: append([]config_mutator_func{}, self.config_mutators...),
+		loaders:         append([]loaderFunction{}, self.loaders...),
+		validators:      append([]validatorFunction{}, self.validators...),
+		config_mutators: append([]configMutator{}, self.config_mutators...),
 	}
 }
 
@@ -359,9 +446,13 @@ func (self *Loader) Validate(config_obj *config_proto.Config) error {
 	logging.Reset()
 	logging.SuppressLogging = !self.verbose
 
+	// Mark the config as verbose.
+	config_obj.Verbose = self.verbose
+
 	// Apply any configuration mutators
 	for _, mutator := range self.config_mutators {
-		err = mutator(config_obj)
+		debug("Trying mutator %v", mutator.name)
+		err = mutator.config_mutator_func(config_obj)
 		if err != nil {
 			return err
 		}
@@ -377,14 +468,15 @@ func (self *Loader) Validate(config_obj *config_proto.Config) error {
 	} else {
 		// Logging is not required so if it fails we dont
 		// care.
-		_ = logging.InitLogging(&config_proto.Config{})
+		_ = logging.InitLogging(config_obj)
 	}
 
 	// Set the logger for the rest of the loading process.
 	self.logger = logging.GetLogger(config_obj, &logging.ToolComponent)
 
 	for _, validator := range self.validators {
-		err = validator(self, config_obj)
+		debug("Trying validator %v", validator.name)
+		err = validator.validator(self, config_obj)
 		if err != nil {
 			self.Log("%v", err)
 			return err
@@ -413,11 +505,19 @@ func (self *Loader) Validate(config_obj *config_proto.Config) error {
 	}
 
 	if config_obj.Client != nil {
+		// We only use the writeback for certain cases where is it
+		// needed:
+		// - Running as a client, pool client , service etc
+		//
+		// Other cases do not use the writeback and will fail to write
+		// on it. This stops us randomly writing the writeback when
+		// e.g. run as a command line tool, offline collector etc.
+		//
+		// The main programs will set this via WithWriteback()
+		// directive when they prepare the config loader.
 		if self.use_writeback {
-			err := self.loadWriteback(config_obj)
-			if err != nil {
-				return err
-			}
+			writeback_service := writeback.GetWritebackService()
+			writeback_service.LoadWriteback(config_obj)
 		}
 		err := ValidateClientConfig(config_obj)
 		if err != nil {
@@ -428,45 +528,10 @@ func (self *Loader) Validate(config_obj *config_proto.Config) error {
 	return nil
 }
 
-func (self *Loader) loadWriteback(config_obj *config_proto.Config) error {
-	// Writeback already loaded - just reuse it.
-	if config_obj.Writeback != nil {
-		return nil
-	}
-
-	existing_writeback := &config_proto.Writeback{}
-
-	filename, err := WritebackLocation(config_obj)
-	if err != nil {
-		return err
-	}
-	if !filepath.IsAbs(filename) && self.write_back_path != "" {
-		filename = filepath.Join(self.write_back_path, filename)
-	}
-
-	self.Log("Loading writeback from %v", filename)
-	data, err := ioutil.ReadFile(filename)
-
-	// Failing to read the file is not an error - the file may not
-	// exist yet.
-	if err == nil {
-		err = yaml.Unmarshal(data, existing_writeback)
-		// writeback file is invalid... Log an error and reset
-		// it otherwise the client will fail to start and
-		// break.
-		if err != nil {
-			self.Log("Writeback file is corrupt - resetting: %v", err)
-		}
-	}
-
-	// Merge the writeback with the config.
-	config_obj.Writeback = existing_writeback
-	return nil
-}
-
 func (self *Loader) LoadAndValidate() (*config_proto.Config, error) {
 	for _, loader := range self.loaders {
-		result, err := loader(self)
+		debug("Trying loader %v", loader.name)
+		result, err := loader.loader_func(self)
 		if err == nil {
 			return result, self.Validate(result)
 		}
@@ -482,13 +547,29 @@ func (self *Loader) LoadAndValidate() (*config_proto.Config, error) {
 }
 
 func read_embedded_config() (*config_proto.Config, error) {
-	idx := bytes.IndexByte(FileConfigDefaultYaml, '\n')
-	if FileConfigDefaultYaml[idx+1] == '#' {
-		return nil, errors.New(
-			"No embedded config - you can pack one with the `config repack` command")
+	return decode_embedded_config(FileConfigDefaultYaml)
+}
+
+func decode_embedded_config(encoded_string []byte) (*config_proto.Config, error) {
+	// Get the first line which is never disturbed
+	idx := bytes.IndexByte(encoded_string, '\n')
+
+	if len(encoded_string) < idx+10 {
+		return nil, noEmbeddedConfig
 	}
 
-	r, err := zlib.NewReader(bytes.NewReader(FileConfigDefaultYaml[idx+1:]))
+	// If the following line still starts with # then the file is not
+	// repacked - the repacker will replace all further data with the
+	// compressed string.
+	if encoded_string[idx+1] == '#' {
+		return nil, noEmbeddedConfig
+	}
+
+	// Decompress the rest of the data - note that zlib will ignore
+	// any padding anyway because the zlib header already contains the
+	// length of the compressed data so it is safe to just feed it the
+	// whole string here.
+	r, err := zlib.NewReader(bytes.NewReader(encoded_string[idx+1:]))
 	if err != nil {
 		return nil, err
 	}
@@ -513,12 +594,12 @@ func read_config_from_file(filename string) (*config_proto.Config, error) {
 
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, errors.Wrap(err, 0)
 	}
 
 	err = yaml.UnmarshalStrict(data, result)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, errors.Wrap(err, 0)
 	}
 	return result, nil
 }
@@ -528,12 +609,18 @@ func read_api_config_from_file(filename string) (*config_proto.Config, error) {
 
 	data, err := ioutil.ReadFile(filename)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, errors.Wrap(err, 0)
 	}
 
 	err = yaml.UnmarshalStrict(data, result.ApiConfig)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, errors.Wrap(err, 0)
 	}
 	return result, nil
+}
+
+func debug(message string, args ...interface{}) {
+	return
+
+	logging.Prelog(message, args...)
 }

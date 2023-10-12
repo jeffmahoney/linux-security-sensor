@@ -19,6 +19,12 @@ func (self ClientPathManager) Path() api.DSPathSpec {
 	return self.root.SetTag("ClientInfo")
 }
 
+func (self ClientPathManager) FlowIndex() api.FSPathSpec {
+	return self.root.AddChild("flow_index").AsFilestorePath().
+		SetType(api.PATH_TYPE_FILESTORE_JSON).
+		SetTag("FlowIndex")
+}
+
 func NewClientPathManager(client_id string) *ClientPathManager {
 	return &ClientPathManager{
 		root:      CLIENTS_ROOT.AddChild(client_id),
@@ -71,7 +77,9 @@ func (self ClientPathManager) Flow(flow_id string) *FlowPathManager {
 // Where we store client VFS information - depends on client paths.
 func (self ClientPathManager) VFSPath(vfs_components []string) api.DSPathSpec {
 	return CLIENTS_ROOT.AddUnsafeChild(self.client_id, "vfs").
-		AddChild(vfs_components...)
+		AddChild(vfs_components...).
+		SetType(api.PATH_TYPE_DATASTORE_JSON).
+		SetTag("VFS")
 }
 
 // A PathSpec for reading the client's file store
@@ -85,14 +93,29 @@ func (self ClientPathManager) FSItem(components []string) api.FSPathSpec {
 func (self ClientPathManager) VFSDownloadInfoPath(
 	vfs_components []string) api.DSPathSpec {
 	return CLIENTS_ROOT.AddUnsafeChild(self.client_id, "vfs_files").
-		AddChild(vfs_components...)
+		AddChild(vfs_components...).
+		SetType(api.PATH_TYPE_DATASTORE_JSON).
+		SetTag("VFSFile")
+}
+
+// We now write all download mutations into the same result set in the
+// vfs_files directory. The server will scan all updates in order and
+// keep the last one to get the current status of each file within the
+// directory.
+func (self ClientPathManager) VFSDownloadInfoResultSet(
+	directory_vfs_components []string) api.FSPathSpec {
+	return CLIENTS_ROOT.AddUnsafeChild(self.client_id, "vfs_files").
+		AddChild(directory_vfs_components...).AsFilestorePath().
+		SetTag("VFSDownloadInfoResultSet")
 }
 
 func (self ClientPathManager) VFSDownloadInfoFromClientPath(
-	accessor, client_path string) api.DSPathSpec {
+	accessor string, components []string) api.DSPathSpec {
 	return CLIENTS_ROOT.AddUnsafeChild(self.client_id, "vfs_files").
 		AddChild(accessor).
-		AddChild(ExtractClientPathComponents(client_path)...)
+		AddChild(components...).
+		SetType(api.PATH_TYPE_DATASTORE_JSON).
+		SetTag("VFSFile")
 }
 
 // The uploads tab contains the full VFS path. This function parses

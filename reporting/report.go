@@ -1,6 +1,7 @@
 package reporting
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/uploads"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -151,12 +153,13 @@ func GenerateMonitoringDailyReport(template_engine TemplateEngine,
 }
 
 func GenerateArtifactDescriptionReport(
+	ctx context.Context,
 	template_engine TemplateEngine,
 	config_obj *config_proto.Config) (
 	string, error) {
 	artifact := template_engine.GetArtifact()
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return "", err
 	}
@@ -166,7 +169,7 @@ func GenerateArtifactDescriptionReport(
 		return "", err
 	}
 
-	template_artifact, pres := repository.Get(
+	template_artifact, pres := repository.Get(ctx,
 		config_obj, "Server.Internal.ArtifactDescription")
 	if pres {
 		template_engine.SetEnv("artifact", artifact)
@@ -318,14 +321,16 @@ func GenerateHuntReport(template_engine TemplateEngine,
 }
 
 func newBaseTemplateEngine(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	scope vfilter.Scope,
 	acl_manager vql_subsystem.ACLManager,
+	uploader uploads.Uploader,
 	repository services.Repository,
 	artifact_name string) (
 	*BaseTemplateEngine, error) {
 
-	artifact, pres := repository.Get(config_obj, artifact_name)
+	artifact, pres := repository.Get(ctx, config_obj, artifact_name)
 	if !pres {
 		return nil, fmt.Errorf(
 			"Artifact %v not known.", artifact_name)
@@ -336,7 +341,7 @@ func newBaseTemplateEngine(
 	// SetEnv() can update it later.
 	env := ordereddict.NewDict()
 	if scope == nil {
-		manager, err := services.GetRepositoryManager()
+		manager, err := services.GetRepositoryManager(config_obj)
 		if err != nil {
 			return nil, err
 		}
@@ -344,6 +349,7 @@ func newBaseTemplateEngine(
 		scope = manager.BuildScope(
 			services.ScopeBuilder{
 				Config:     config_obj,
+				Uploader:   uploader,
 				ACLManager: acl_manager,
 			})
 	}

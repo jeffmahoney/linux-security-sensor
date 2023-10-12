@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -21,24 +21,29 @@ import (
 	"context"
 	"io"
 	"os"
+	"strings"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/pkg/errors"
-	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/go-errors/errors"
+
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/psutils"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 type GlobPluginArgs struct {
-	Globs               []string `vfilter:"required,field=globs,doc=One or more glob patterns to apply to the filesystem."`
-	Root                string   `vfilter:"optional,field=root,doc=The root directory to glob from (default '')."`
-	Accessor            string   `vfilter:"optional,field=accessor,doc=An accessor to use."`
-	DoNotFollowSymlinks bool     `vfilter:"optional,field=nosymlink,doc=If set we do not follow symlinks."`
-	RecursionCallback   string   `vfilter:"optional,field=recursion_callback,doc=A VQL function that determines if a directory should be recursed (e.g. \"x=>NOT x.Name =~ 'proc'\")."`
-	OneFilesystem       bool     `vfilter:"optional,field=one_filesystem,doc=If set we do not follow links to other filesystems."`
+	Globs               []string          `vfilter:"required,field=globs,doc=One or more glob patterns to apply to the filesystem."`
+	Root                *accessors.OSPath `vfilter:"optional,field=root,doc=The root directory to glob from (default '')."`
+	Accessor            string            `vfilter:"optional,field=accessor,doc=An accessor to use."`
+	DoNotFollowSymlinks bool              `vfilter:"optional,field=nosymlink,doc=If set we do not follow symlinks."`
+	RecursionCallback   string            `vfilter:"optional,field=recursion_callback,doc=A VQL function that determines if a directory should be recursed (e.g. \"x=>NOT x.Name =~ 'proc'\")."`
+	OneFilesystem       bool              `vfilter:"optional,field=one_filesystem,doc=If set we do not follow links to other filesystems."`
 }
 
 type GlobPlugin struct{}
@@ -70,13 +75,33 @@ func (self GlobPlugin) Call(
 			return
 		}
 
-		accessor, err := glob.GetAccessor(arg.Accessor, scope)
+		accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 		if err != nil {
 			scope.Log("glob: %v", err)
 			return
 		}
 
+		// Expand glob braces over the entire expression - this allows
+		// the alternatives to cover entire paths.
+		globs := glob.ExpandBraces(arg.Globs)
+
+		// Get the root of the glob. If not provided we use the
+		// default root for the accessor.
 		root := arg.Root
+		accessor_root, err := accessor.ParsePath("")
+		if err != nil {
+			scope.Log("glob: %v", err)
+			return
+		}
+
+		// Ensure the root has the require pathspec type by copying
+		// the null manipulator.
+		if root == nil {
+			// Get the default top level path for this accessor.
+			root = accessor_root
+		} else {
+			root.Manipulator = accessor_root.Manipulator
+		}
 
 		options := glob.GlobOptions{
 			DoNotFollowSymlinks: arg.DoNotFollowSymlinks,
@@ -91,7 +116,7 @@ func (self GlobPlugin) Call(
 				return
 			}
 
-			options.RecursionCallback = func(file_info glob.FileInfo) bool {
+			options.RecursionCallback = func(file_info accessors.FileInfo) bool {
 				result := lambda.Reduce(ctx, scope, []vfilter.Any{file_info})
 				return scope.Bool(result)
 			}
@@ -101,34 +126,42 @@ func (self GlobPlugin) Call(
 
 		// If root is not specified we try to find a common
 		// root from the globs.
-		if root == "" {
-			for _, item := range arg.Globs {
-				item_root, item_path, _ := accessor.GetRoot(item)
-				if root != "" && root != item_root {
-					scope.Log("glob: %s: Must use the same root for "+
-						"all globs. Skipping.", item)
-					continue
-				}
-				root = item_root
-				err = globber.Add(item_path, accessor.PathSplit)
+		for _, item := range globs {
+
+			if strings.HasPrefix(item, "{") {
+				scope.Log("glob: Glob item appears to be a pathspec. This is deprecated, please use the root arg instead.")
+
+				// This code attempts to emulate the old behavior for
+				// backwards compatibility: The root is taken to be
+				// the base pathspec and the glob is the Path
+				// component.
+				root, err = root.Parse(item)
 				if err != nil {
 					scope.Log("glob: %v", err)
 					return
 				}
+
+				pathspec := root.PathSpec()
+				item = pathspec.Path
+				pathspec.Path = ""
+				root.SetPathSpec(pathspec)
 			}
 
-		} else {
-			for _, item := range arg.Globs {
-				err = globber.Add(item, accessor.PathSplit)
-				if err != nil {
-					scope.Log("glob: %v", err)
-					return
-				}
+			item_path, err := root.Parse(item)
+			if err != nil {
+				scope.Log("glob: %v", err)
+				return
+			}
+
+			err = globber.Add(item_path)
+			if err != nil {
+				scope.Log("glob: %v", err)
+				return
 			}
 		}
 
 		file_chan := globber.ExpandWithContext(
-			ctx, config_obj, root, accessor)
+			ctx, scope, config_obj, root, accessor)
 		for f := range file_chan {
 			select {
 			case <-ctx.Done():
@@ -144,18 +177,19 @@ func (self GlobPlugin) Call(
 
 func (self GlobPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "glob",
-		Doc:     "Retrieve files based on a list of glob expressions",
-		ArgType: type_map.AddType(scope, &GlobPluginArgs{}),
-		Version: 2,
+		Name:     "glob",
+		Doc:      "Retrieve files based on a list of glob expressions",
+		ArgType:  type_map.AddType(scope, &GlobPluginArgs{}),
+		Version:  3,
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
 type ReadFileArgs struct {
-	Chunk     int      `vfilter:"optional,field=chunk,doc=length of each chunk to read from the file."`
-	MaxLength int      `vfilter:"optional,field=max_length,doc=Max length of the file to read."`
-	Filenames []string `vfilter:"required,field=filenames,doc=One or more files to open."`
-	Accessor  string   `vfilter:"optional,field=accessor,doc=An accessor to use."`
+	Chunk     int                 `vfilter:"optional,field=chunk,doc=length of each chunk to read from the file."`
+	MaxLength int                 `vfilter:"optional,field=max_length,doc=Max length of the file to read."`
+	Filenames []*accessors.OSPath `vfilter:"required,field=filenames,doc=One or more files to open."`
+	Accessor  string              `vfilter:"optional,field=accessor,doc=An accessor to use."`
 }
 
 type ReadFileResponse struct {
@@ -170,12 +204,12 @@ func (self ReadFilePlugin) processFile(
 	ctx context.Context,
 	scope vfilter.Scope,
 	arg *ReadFileArgs,
-	accessor glob.FileSystemAccessor,
-	file string,
+	accessor accessors.FileSystemAccessor,
+	file *accessors.OSPath,
 	output_chan chan vfilter.Row) {
 	total_len := int64(0)
 
-	fd, err := accessor.Open(file)
+	fd, err := accessor.OpenWithOSPath(file)
 	if err != nil {
 		return
 	}
@@ -185,8 +219,8 @@ func (self ReadFilePlugin) processFile(
 	for {
 		n, err := io.ReadAtLeast(fd, buf, arg.Chunk)
 		if err != nil &&
-			errors.Cause(err) != io.ErrUnexpectedEOF &&
-			errors.Cause(err) != io.EOF {
+			!errors.Is(err, io.ErrUnexpectedEOF) &&
+			!errors.Is(err, io.EOF) {
 			scope.Log("read_file: %v", err)
 			return
 		}
@@ -197,7 +231,7 @@ func (self ReadFilePlugin) processFile(
 		response := &ReadFileResponse{
 			Data:     string(buf[:n]),
 			Offset:   total_len,
-			Filename: file,
+			Filename: file.String(),
 		}
 
 		select {
@@ -239,11 +273,11 @@ func (self ReadFilePlugin) Call(
 
 		err := vql_subsystem.CheckFilesystemAccess(scope, arg.Accessor)
 		if err != nil {
-			scope.Log("read_file: %s", err.Error())
+			scope.Log("read_file: %v", err)
 			return
 		}
 
-		accessor, err := glob.GetAccessor(arg.Accessor, scope)
+		accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 		if err != nil {
 			scope.Log("read_file: %v", err)
 			return
@@ -265,17 +299,18 @@ func (self ReadFilePlugin) Name() string {
 
 func (self ReadFilePlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "read_file",
-		Doc:     "Read files in chunks.",
-		ArgType: type_map.AddType(scope, &ReadFileArgs{}),
+		Name:     "read_file",
+		Doc:      "Read files in chunks.",
+		ArgType:  type_map.AddType(scope, &ReadFileArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
 type ReadFileFunctionArgs struct {
-	Length   int    `vfilter:"optional,field=length,doc=Max length of the file to read."`
-	Offset   int64  `vfilter:"optional,field=offset,doc=Where to read from the file."`
-	Filename string `vfilter:"required,field=filename,doc=One or more files to open."`
-	Accessor string `vfilter:"optional,field=accessor,doc=An accessor to use."`
+	Length   int               `vfilter:"optional,field=length,doc=Max length of the file to read."`
+	Offset   int64             `vfilter:"optional,field=offset,doc=Where to read from the file."`
+	Filename *accessors.OSPath `vfilter:"required,field=filename,doc=One or more files to open."`
+	Accessor string            `vfilter:"optional,field=accessor,doc=An accessor to use."`
 }
 
 type ReadFileFunction struct{}
@@ -300,7 +335,7 @@ func (self *ReadFileFunction) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
-	accessor, err := glob.GetAccessor(arg.Accessor, scope)
+	accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
 		scope.Log("read_file: %v", err)
 		return ""
@@ -308,18 +343,21 @@ func (self *ReadFileFunction) Call(ctx context.Context,
 
 	buf := make([]byte, arg.Length)
 
-	fd, err := accessor.Open(arg.Filename)
+	fd, err := accessor.OpenWithOSPath(arg.Filename)
 	if err != nil {
+		scope.Log("read_file: %v: %v", arg.Filename.String(), err)
 		return ""
 	}
 	defer fd.Close()
 
-	_, _ = fd.Seek(arg.Offset, os.SEEK_SET)
+	if arg.Offset > 0 {
+		_, _ = fd.Seek(arg.Offset, os.SEEK_SET)
+	}
 
 	n, err := io.ReadAtLeast(fd, buf, len(buf))
 	if err != nil &&
-		errors.Cause(err) != io.ErrUnexpectedEOF &&
-		errors.Cause(err) != io.EOF {
+		!errors.Is(err, io.ErrUnexpectedEOF) &&
+		!errors.Is(err, io.EOF) {
 		scope.Log("read_file: %v", err)
 		return ""
 	}
@@ -329,15 +367,16 @@ func (self *ReadFileFunction) Call(ctx context.Context,
 
 func (self ReadFileFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "read_file",
-		Doc:     "Read a file into a string.",
-		ArgType: type_map.AddType(scope, &ReadFileFunctionArgs{}),
+		Name:     "read_file",
+		Doc:      "Read a file into a string.",
+		ArgType:  type_map.AddType(scope, &ReadFileFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
 type StatArgs struct {
-	Filename []string `vfilter:"required,field=filename,doc=One or more files to open."`
-	Accessor string   `vfilter:"optional,field=accessor,doc=An accessor to use."`
+	Filename *accessors.OSPath `vfilter:"required,field=filename,doc=One or more files to open."`
+	Accessor string            `vfilter:"optional,field=accessor,doc=An accessor to use."`
 }
 
 type StatPlugin struct{}
@@ -364,20 +403,19 @@ func (self *StatPlugin) Call(
 			return
 		}
 
-		accessor, err := glob.GetAccessor(arg.Accessor, scope)
+		accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 		if err != nil {
 			scope.Log("stat: %s", err.Error())
 			return
 		}
-		for _, filename := range arg.Filename {
-			f, err := accessor.Lstat(filename)
-			if err == nil {
-				select {
-				case <-ctx.Done():
-					return
 
-				case output_chan <- f:
-				}
+		f, err := accessor.LstatWithOSPath(arg.Filename)
+		if err == nil {
+			select {
+			case <-ctx.Done():
+				return
+
+			case output_chan <- f:
 			}
 		}
 	}()
@@ -391,9 +429,11 @@ func (self StatPlugin) Name() string {
 
 func (self StatPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "stat",
-		Doc:     "Get file information. Unlike glob() this does not support wildcards.",
-		ArgType: type_map.AddType(scope, &StatArgs{}),
+		Name:     "stat",
+		Doc:      "Get file information. Unlike glob() this does not support wildcards.",
+		ArgType:  type_map.AddType(scope, &StatArgs{}),
+		Version:  2,
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
@@ -408,7 +448,7 @@ func init() {
 				scope vfilter.Scope,
 				args *ordereddict.Dict) []vfilter.Row {
 				var result []vfilter.Row
-				partitions, err := disk.Partitions(true)
+				partitions, err := psutils.PartitionsWithContext(ctx)
 				if err == nil {
 					for _, item := range partitions {
 						result = append(result, item)

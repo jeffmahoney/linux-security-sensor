@@ -15,16 +15,25 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/protobuf/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/grpc_client"
+	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/services/journal"
 	"www.velocidex.com/golang/velociraptor/utils"
+)
+
+var (
+	currentReplicationConnections = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "minion_replication_grpc_connections",
+		Help: "Current number of connections to the master.",
+	})
 )
 
 func PushMetrics(ctx context.Context, wg *sync.WaitGroup,
@@ -33,7 +42,10 @@ func PushMetrics(ctx context.Context, wg *sync.WaitGroup,
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		metrics := &FrontendMetrics{NodeName: node_name}
+
+		metrics := &FrontendMetrics{
+			NodeName: node_name,
+		}
 		rows := make([]*ordereddict.Dict, 1)
 
 		for {
@@ -48,7 +60,7 @@ func PushMetrics(ctx context.Context, wg *sync.WaitGroup,
 			// Journal may not be ready yet so it is not
 			// an error if its not there, just try again
 			// later.
-			journal, err := services.GetJournal()
+			journal, err := services.GetJournal(config_obj)
 			if err != nil {
 				continue
 			}
@@ -57,7 +69,7 @@ func PushMetrics(ctx context.Context, wg *sync.WaitGroup,
 				rows[0] = ordereddict.NewDict().
 					Set("Node", node_name).
 					Set("Metrics", metrics.ToDict())
-				err = journal.PushRowsToArtifact(config_obj,
+				err = journal.PushRowsToArtifact(ctx, config_obj,
 					rows, "Server.Internal.FrontendMetrics",
 					"server", "")
 			}
@@ -98,12 +110,6 @@ func calculateMetrics(metrics *FrontendMetrics) error {
 				metrics.ProcessCpuNanoSecondsTotal = total_time
 			}
 
-		case "client_comms_current_connections":
-			if metric.Metric[0].Gauge != nil {
-				metrics.ClientCommsCurrentConnections = (int64)(
-					*metric.Metric[0].Gauge.Value)
-			}
-
 		case "process_resident_memory_bytes":
 			if metric.Metric[0].Gauge != nil {
 				metrics.ProcessResidentMemoryBytes = (int64)(
@@ -113,6 +119,33 @@ func calculateMetrics(metrics *FrontendMetrics) error {
 	}
 
 	metrics.Timestamp = now
+
+	// Fill in org connections.
+	return calculateOrgConnectionClients(metrics)
+}
+
+func calculateOrgConnectionClients(metric *FrontendMetrics) error {
+	metric.ClientCommsCurrentConnections = make(map[string]uint64)
+
+	org_manager, err := services.GetOrgManager()
+	if err != nil {
+		return err
+	}
+	for _, org := range org_manager.ListOrgs() {
+		org_config_obj, err := org_manager.GetOrgConfig(org.Id)
+		if err != nil {
+			continue
+		}
+
+		// Get the notifier for each org.
+		notifier, err := services.GetNotifier(org_config_obj)
+		if err != nil {
+			continue
+		}
+
+		metric.ClientCommsCurrentConnections[org.Id] = notifier.CountConnectedClients()
+	}
+
 	return nil
 }
 
@@ -120,7 +153,7 @@ type FrontendMetrics struct {
 	Timestamp                     time.Time
 	ProcessCpuNanoSecondsTotal    int64
 	CpuLoadPercent                int64
-	ClientCommsCurrentConnections int64
+	ClientCommsCurrentConnections map[string]uint64
 	ProcessResidentMemoryBytes    int64
 	NodeName                      string
 }
@@ -153,23 +186,15 @@ func (self *MasterFrontendManager) processMetrics(ctx context.Context,
 		return nil
 	}
 
-	row, pres = row_metric.(*ordereddict.Dict)
-	if !pres {
-		return nil
+	serialized, err := json.Marshal(row_metric)
+	if err != nil {
+		return err
 	}
 
-	metric := &FrontendMetrics{
-		Timestamp: time.Now(),
-		ProcessCpuNanoSecondsTotal: utils.GetInt64(
-			row, "ProcessCpuNanoSecondsTotal"),
-		CpuLoadPercent: utils.GetInt64(
-			row, "CpuLoadPercent"),
-		ClientCommsCurrentConnections: utils.GetInt64(
-			row, "ClientCommsCurrentConnections"),
-		ProcessResidentMemoryBytes: utils.GetInt64(
-			row, "ProcessResidentMemoryBytes"),
-		NodeName: utils.GetString(
-			row, "NodeName"),
+	metric := &FrontendMetrics{}
+	err = json.Unmarshal(serialized, metric)
+	if err != nil {
+		return err
 	}
 
 	self.mu.Lock()
@@ -195,11 +220,55 @@ func (self *MasterFrontendManager) GetMinionCount() int {
 	return res
 }
 
+func (self *MasterFrontendManager) prepareOrgStats() (
+	map[string]*ordereddict.Dict, error) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	result := make(map[string]*ordereddict.Dict)
+	now := time.Now()
+
+	// Calculate totals across all frontends
+	total_CpuLoadPercent := int64(0)
+	total_ProcessResidentMemoryBytes := int64(0)
+	active_frontends := int64(0)
+	for _, v := range self.stats {
+		if now.Sub(v.Timestamp) < 60*time.Second {
+			total_CpuLoadPercent += v.CpuLoadPercent
+			total_ProcessResidentMemoryBytes += v.ProcessResidentMemoryBytes
+			active_frontends++
+		}
+	}
+
+	// Now build a stats object for each org.
+	org_manager, err := services.GetOrgManager()
+	if err != nil {
+		return nil, err
+	}
+
+	for _, org := range org_manager.ListOrgs() {
+		total := uint64(0)
+
+		for _, v := range self.stats {
+			if now.Sub(v.Timestamp) < 60*time.Second {
+				count, _ := v.ClientCommsCurrentConnections[org.Id]
+				total += count
+			}
+		}
+
+		result[org.Id] = ordereddict.NewDict().
+			Set("TotalFrontends", active_frontends).
+			Set("CPUPercent", total_CpuLoadPercent).
+			Set("MemoryUse", total_ProcessResidentMemoryBytes).
+			Set("client_comms_current_connections", total)
+	}
+
+	return result, nil
+}
+
 // Every 10 seconds read the cummulative stats and update the
 // Server.Monitor.Health artifact.
 func (self *MasterFrontendManager) UpdateStats(ctx context.Context) {
-	rows := make([]*ordereddict.Dict, 1)
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -207,79 +276,46 @@ func (self *MasterFrontendManager) UpdateStats(ctx context.Context) {
 		case <-time.After(10 * time.Second):
 		}
 
-		// Calculate the total stats from all our valid
-		// frontends.
-		now := time.Now()
-
-		// Take a snapshot
-		self.mu.Lock()
-		active_frontends := make(map[string]FrontendMetrics)
-		for k, v := range self.stats {
-			if now.Sub(v.Timestamp) < 60*time.Second {
-				// Make a copy
-				active_frontends[k] = *v
-			}
-		}
-		self.mu.Unlock()
-
-		// Calculate totals
-		total_ClientCommsCurrentConnections := int64(0)
-		total_CpuLoadPercent := int64(0)
-		total_ProcessResidentMemoryBytes := int64(0)
-		for _, v := range active_frontends {
-			total_ClientCommsCurrentConnections += v.ClientCommsCurrentConnections
-			total_CpuLoadPercent += v.CpuLoadPercent
-			total_ProcessResidentMemoryBytes += v.ProcessResidentMemoryBytes
+		all_stats, err := self.prepareOrgStats()
+		if err != nil {
+			logger := logging.GetLogger(self.config_obj,
+				&logging.FrontendComponent)
+			logger.Error("UpdateStats: %v", err)
+			continue
 		}
 
-		rows[0] = ordereddict.NewDict().
-			Set("TotalFrontends", len(active_frontends)).
-			Set("CPUPercent", total_CpuLoadPercent).
-			Set("MemoryUse", total_ProcessResidentMemoryBytes).
-			Set("client_comms_current_connections", total_ClientCommsCurrentConnections)
-
-		journal, err := services.GetJournal()
+		org_manager, err := services.GetOrgManager()
 		if err != nil {
 			continue
 		}
 
-		_ = journal.PushRowsToArtifact(self.config_obj,
-			rows, "Server.Monitor.Health/Prometheus", "server", "")
+		for k, v := range all_stats {
+			org_config_obj, err := org_manager.GetOrgConfig(k)
+
+			if err != nil {
+				continue
+			}
+
+			journal, err := services.GetJournal(org_config_obj)
+			if err != nil {
+				continue
+			}
+
+			_ = journal.PushRowsToArtifact(ctx, org_config_obj,
+				[]*ordereddict.Dict{v},
+				"Server.Monitor.Health/Prometheus", "server", "")
+		}
 	}
 }
 
 // The master does not replicate anywhere.
-func (self MasterFrontendManager) GetMasterAPIClient(ctx context.Context) (
+func (self *MasterFrontendManager) GetMasterAPIClient(ctx context.Context) (
 	api_proto.APIClient, func() error, error) {
 	return nil, nil, services.FrontendIsMaster
 }
 
-func (self MasterFrontendManager) Start(ctx context.Context, wg *sync.WaitGroup,
+func (self *MasterFrontendManager) Start(ctx context.Context, wg *sync.WaitGroup,
 	config_obj *config_proto.Config) error {
-
-	// If no service specification is set, we start all services
-	// on the master frontend.
-	if config_obj.Frontend.ServerServices == nil ||
-		!config_obj.Frontend.ServerServices.FrontendServer {
-		config_obj.Frontend.ServerServices = &config_proto.ServerServicesConfig{
-			HuntManager:       true,
-			HuntDispatcher:    true,
-			StatsCollector:    true,
-			ServerMonitoring:  true,
-			ServerArtifacts:   true,
-			DynDns:            true,
-			Interrogation:     true,
-			SanityChecker:     true,
-			VfsService:        true,
-			UserManager:       true,
-			ClientMonitoring:  true,
-			MonitoringService: true,
-			ApiServer:         true,
-			FrontendServer:    true,
-			GuiServer:         true,
-			IndexServer:       true,
-		}
-	}
 
 	logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
 	logger.Info("<green>Frontend:</> Server will be master.")
@@ -313,6 +349,7 @@ func (self MasterFrontendManager) Start(ctx context.Context, wg *sync.WaitGroup,
 	go utils.Retry(ctx, func() error {
 		return journal.WatchQueueWithCB(ctx, config_obj, wg,
 			"Server.Internal.FrontendMetrics",
+			"FrontendService",
 			self.processMetrics)
 	}, 10, time.Second)
 
@@ -335,7 +372,17 @@ func (self MinionFrontendManager) IsMaster() bool {
 // The minion frontend replicates to the master node.
 func (self MinionFrontendManager) GetMasterAPIClient(ctx context.Context) (
 	api_proto.APIClient, func() error, error) {
-	return grpc_client.Factory.GetAPIClient(ctx, self.config_obj)
+	client, closer, err := grpc_client.Factory.GetAPIClient(ctx, self.config_obj)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	currentReplicationConnections.Inc()
+
+	return client, func() error {
+		defer currentReplicationConnections.Dec()
+		return closer()
+	}, err
 }
 
 func (self *MinionFrontendManager) Start(ctx context.Context, wg *sync.WaitGroup,
@@ -343,15 +390,8 @@ func (self *MinionFrontendManager) Start(ctx context.Context, wg *sync.WaitGroup
 
 	// If no service specification is set, we start only some
 	// services on minion frontends.
-	if config_obj.Frontend.ServerServices == nil {
-		config_obj.Frontend.ServerServices = &config_proto.ServerServicesConfig{
-			HuntDispatcher:   true,
-			StatsCollector:   true,
-			ClientMonitoring: true,
-			SanityChecker:    true,
-			FrontendServer:   true,
-			DynDns:           true,
-		}
+	if config_obj.Services == nil {
+		config_obj.Services = services.MinionServicesSpec()
 	}
 
 	self.name = services.GetNodeName(config_obj.Frontend)
@@ -382,10 +422,24 @@ func (self *MinionFrontendManager) Start(ctx context.Context, wg *sync.WaitGroup
 // Install a frontend manager. This must be the first service created
 // in the frontend. The service will determine if we are running in
 // master or minion context.
-func StartFrontendService(ctx context.Context, wg *sync.WaitGroup,
-	config_obj *config_proto.Config) error {
+func NewFrontendService(ctx context.Context, wg *sync.WaitGroup,
+	config_obj *config_proto.Config) (services.FrontendManager, error) {
 	if config_obj.Frontend == nil {
-		return errors.New("Frontend not configured")
+		return nil, errors.New("Frontend not configured")
+	}
+
+	// Sub orgs just use the same frontend manager
+	if config_obj.OrgId != "" {
+		org_manager, err := services.GetOrgManager()
+		if err != nil {
+			return nil, err
+		}
+
+		root_org_config, err := org_manager.GetOrgConfig(services.ROOT_ORG_ID)
+		if err != nil {
+			return nil, err
+		}
+		return services.GetFrontendManager(root_org_config)
 	}
 
 	if services.IsMaster(config_obj) {
@@ -393,13 +447,11 @@ func StartFrontendService(ctx context.Context, wg *sync.WaitGroup,
 			config_obj: config_obj,
 			stats:      make(map[string]*FrontendMetrics),
 		}
-		services.RegisterFrontendManager(manager)
-		return manager.Start(ctx, wg, config_obj)
+		return manager, manager.Start(ctx, wg, config_obj)
 	}
 
 	manager := &MinionFrontendManager{config_obj: config_obj}
-	services.RegisterFrontendManager(manager)
-	return manager.Start(ctx, wg, config_obj)
+	return manager, manager.Start(ctx, wg, config_obj)
 }
 
 // Selects the node by name from the extra frontends configuration

@@ -12,7 +12,7 @@ import (
 	"text/template"
 
 	"github.com/Depado/bfchroma"
-	"github.com/Masterminds/sprig"
+	"github.com/Masterminds/sprig/v3"
 	"github.com/Velocidex/ordereddict"
 
 	chroma_html "github.com/alecthomas/chroma/formatters/html"
@@ -64,7 +64,7 @@ func renderObject(value interface{}) string {
 		return ""
 
 	case string:
-		return t
+		return html.EscapeString(t)
 
 	case int, int64, int32, int16, int8,
 		uint64, uint32, uint16, uint8,
@@ -98,7 +98,7 @@ func (self *HTMLTemplateEngine) Table(values ...interface{}) interface{} {
 				columns = item.Keys()
 				result += "  <tr>\n"
 				for _, name := range columns {
-					result += "    <th>" + name + "</th>\n"
+					result += "    <th>" + html.EscapeString(name) + "</th>\n"
 				}
 				result += "  </tr>\n"
 				result += "</thead>\n<tbody>\n"
@@ -123,7 +123,7 @@ func (self *HTMLTemplateEngine) Table(values ...interface{}) interface{} {
 				columns = item.Keys()
 				result += "  <tr>\n"
 				for _, name := range columns {
-					result += "    <th>" + name + "</th>\n"
+					result += "    <th>" + html.EscapeString(name) + "</th>\n"
 				}
 				result += "  </tr>\n"
 				result += "</thead>\n<tbody>\n"
@@ -218,7 +218,7 @@ func (self *HTMLTemplateEngine) getMultiLineQuery(query string) (string, error) 
 }
 
 func (self *HTMLTemplateEngine) Import(artifact, name string) interface{} {
-	definition, pres := self.BaseTemplateEngine.Repository.Get(
+	definition, pres := self.BaseTemplateEngine.Repository.Get(self.ctx,
 		self.config_obj, artifact)
 	if !pres {
 		self.Error("Unknown artifact %v", artifact)
@@ -332,8 +332,8 @@ func NewHTMLTemplateEngine(
 	sanitize_html bool) (
 	*HTMLTemplateEngine, error) {
 
-	base_engine, err := newBaseTemplateEngine(
-		config_obj, scope, acl_manager, repository,
+	base_engine, err := newBaseTemplateEngine(ctx,
+		config_obj, scope, acl_manager, nil, repository,
 		artifact_name)
 	if err != nil {
 		return nil, err

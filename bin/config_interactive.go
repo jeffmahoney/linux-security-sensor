@@ -11,12 +11,12 @@ import (
 	"regexp"
 	"runtime"
 
-	"github.com/Velocidex/survey"
+	"github.com/AlecAivazis/survey/v2"
 	"github.com/Velocidex/yaml/v2"
 	"www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	logging "www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/users"
+	"www.velocidex.com/golang/velociraptor/services/users"
 )
 
 const (
@@ -77,12 +77,12 @@ What OS will the server be deployed on?
 	}
 
 	output_question = &survey.Input{
-		Message: "Where should i write the server config file?",
+		Message: "Where should I write the server config file?",
 		Default: "server.config.yaml",
 	}
 
 	client_output_question = &survey.Input{
-		Message: "Where should i write the client config file?",
+		Message: "Where should I write the client config file?",
 		Default: "client.config.yaml",
 	}
 
@@ -114,6 +114,18 @@ What OS will the server be deployed on?
 
 	google_domains_password = &survey.Input{
 		Message: "Google Domains DynDNS Password",
+	}
+
+	add_allow_list_question = &survey.Confirm{
+		Message: `Do you want to restrict VQL functionality on the server?
+
+This is useful for a shared server where users are not fully trusted.
+It removes potentially dangerous plugins like execve(),filesystem access etc.
+`,
+	}
+
+	registry_writeback_question = &survey.Confirm{
+		Message: `Would you like to use the registry to store the writeback files? (Experimental)`,
 	}
 )
 
@@ -206,10 +218,26 @@ func configureDeploymentType(config_obj *config_proto.Config) error {
 			return err
 		}
 	}
+
+	return nil
+}
+
+func configureRegistryWriteback(config_obj *config_proto.Config) error {
+	use_registry := false
+	err := survey.AskOne(registry_writeback_question, &use_registry, nil)
+	if err != nil {
+		return err
+	}
+
+	if use_registry {
+		config_obj.Client.WritebackWindows = "HKLM\\SOFTWARE\\Velocidex\\Velociraptor"
+	}
 	return nil
 }
 
 func doGenerateConfigInteractive() error {
+	logging.DisableLogging()
+
 	config_obj := config.GetDefaultConfig()
 
 	// Figure out which type of server we have.
@@ -222,6 +250,7 @@ func doGenerateConfigInteractive() error {
 
 	configureDataStore(config_obj)
 	configureDeploymentType(config_obj)
+	configureRegistryWriteback(config_obj)
 
 	// The API's public DNS name allows external callers but by
 	// default we bind to loopback only.
@@ -261,6 +290,11 @@ func doGenerateConfigInteractive() error {
 	// you are trying to debug something.
 	config_obj.Logging.Debug = &config_proto.LoggingRetentionConfig{
 		Disabled: true,
+	}
+
+	err = addAllowList(config_obj)
+	if err != nil {
+		return err
 	}
 
 	storeServerConfig(config_obj)
@@ -443,10 +477,13 @@ func configSelfSigned(config_obj *config_proto.Config) error {
 			Prompt:   gui_port_question,
 		},
 	}, config_obj.GUI)
-
 	if err != nil {
 		return err
 	}
+
+	config_obj.GUI.PublicUrl = fmt.Sprintf(
+		"https://%s:%d/", config_obj.Frontend.Hostname,
+		config_obj.GUI.BindPort)
 
 	config_obj.Client.UseSelfSignedSsl = true
 	config_obj.Client.ServerUrls = append(
@@ -501,7 +538,7 @@ func addUser(config_obj *config_proto.Config) error {
 			return nil
 		}
 
-		user_record, err := users.NewUserRecord(username)
+		user_record, err := users.NewUserRecord(config_obj, username)
 		if err != nil {
 			fmt.Printf("%v", err)
 			continue
@@ -532,4 +569,22 @@ func addUser(config_obj *config_proto.Config) error {
 				PasswordSalt: hex.EncodeToString(user_record.PasswordSalt),
 			})
 	}
+}
+
+func addAllowList(config_obj *config_proto.Config) error {
+	add_allow_list := false
+	err := survey.AskOne(add_allow_list_question, &add_allow_list, nil)
+	if err != nil {
+		return err
+	}
+
+	if !add_allow_list {
+		return nil
+	}
+
+	config_obj.Defaults.AllowedPlugins = allowed_plugins
+	config_obj.Defaults.AllowedFunctions = allowed_functions
+	config_obj.Defaults.AllowedAccessors = allowed_accessors
+
+	return nil
 }

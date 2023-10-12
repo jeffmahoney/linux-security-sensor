@@ -11,7 +11,6 @@ import (
 	"sync"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/pkg/errors"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/datastore"
@@ -23,6 +22,8 @@ import (
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/paths/artifacts"
 	"www.velocidex.com/golang/velociraptor/result_sets"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/journal"
 	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
@@ -36,10 +37,24 @@ func (self *VFSService) Start(
 	wg *sync.WaitGroup) error {
 
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	logger.Info("<green>Starting</> VFS writing service.")
+	logger.Info("<green>Starting</> VFS writing service for %v.",
+		services.GetOrgName(config_obj))
 
+	// Monitor for legacy ListDirectory flows for clients that do not
+	// have specialized vfs_ls() plugins.
 	err := watchForFlowCompletion(
 		ctx, wg, config_obj, "System.VFS.ListDirectory",
+		"VFSService",
+		self.ProcessListDirectoryLegacy)
+	if err != nil {
+		return err
+	}
+
+	// Modern clients send stats directly and so do not need special
+	// processing - this is much more efficient!
+	err = watchForFlowCompletion(
+		ctx, wg, config_obj, "System.VFS.ListDirectory/Stats",
+		"VFSService",
 		self.ProcessListDirectory)
 	if err != nil {
 		return err
@@ -47,6 +62,7 @@ func (self *VFSService) Start(
 
 	err = watchForFlowCompletion(
 		ctx, wg, config_obj, "System.VFS.DownloadFile",
+		"VFSService",
 		self.ProcessDownloadFile)
 	if err != nil {
 		return err
@@ -71,12 +87,9 @@ func (self *VFSService) ProcessDownloadFile(
 	logger.Info("VFSService: Processing System.VFS.DownloadFile from %v", client_id)
 
 	flow_path_manager := paths.NewFlowPathManager(client_id, flow_id)
-	client_path_manager := paths.NewClientPathManager(client_id)
-
-	artifact_path_manager, err := artifacts.NewArtifactPathManager(config_obj,
+	artifact_path_manager, err := artifacts.NewArtifactPathManager(ctx, config_obj,
 		client_id, flow_id, "System.VFS.DownloadFile")
 	if err != nil {
-		utils.Debug(err)
 		logger.Error("Unable to read artifact: %v", err)
 		return
 	}
@@ -93,20 +106,30 @@ func (self *VFSService) ProcessDownloadFile(
 	for row := range reader.Rows(ctx) {
 		Accessor, _ := row.GetString("Accessor")
 		Path, _ := row.GetString("Path")
-
+		Components, _ := row.GetStrings("_Components")
 		MD5, _ := row.GetString("Md5")
 		SHA256, _ := row.GetString("Sha256")
+		Error, _ := row.GetString("Error")
 
 		// Figure out where the file was uploaded to.
 		uploaded_file_manager := flow_path_manager.GetUploadsFile(
-			Accessor, Path)
+			Accessor, Path, Components)
 
 		// Check to make sure the file actually exists.
 		file_store_factory := file_store.GetFileStore(config_obj)
 		_, err := file_store_factory.StatFile(uploaded_file_manager.Path())
 		if err != nil {
-			logger.Error(
-				"Unable to save flow %v: %v", Path, err)
+			if Error == "" {
+				Error = err.Error()
+			}
+			// Record an error in the download info.
+			self.WriteDownloadInfo(ctx, config_obj, client_id, Accessor,
+				Components, &flows_proto.VFSDownloadInfo{
+					Mtime:    uint64(ts) * 1000000,
+					FlowId:   flow_id,
+					InFlight: false,
+					Error:    Error,
+				})
 			continue
 		}
 
@@ -115,28 +138,19 @@ func (self *VFSService) ProcessDownloadFile(
 			uploaded_file_manager.IndexPath())
 		has_index_file := err == nil
 
-		// We store a place holder in the VFS pointing at the
-		// read vfs_path of the download.
-		db, err := datastore.GetDB(config_obj)
-		if err != nil {
-			return
-		}
-
-		err = db.SetSubject(config_obj,
-			client_path_manager.VFSDownloadInfoFromClientPath(
-				Accessor, Path),
-			&flows_proto.VFSDownloadInfo{
+		// Now record the file has completed upload.
+		self.WriteDownloadInfo(ctx, config_obj, client_id, Accessor,
+			Components, &flows_proto.VFSDownloadInfo{
 				Components: uploaded_file_manager.
 					Path().Components(),
-				Mtime:  uint64(ts) * 1000000,
-				Sparse: has_index_file, // If index file exists we have an index.
-				Size:   vql_subsystem.GetIntFromRow(scope, row, "Size"),
-				MD5:    MD5,
-				SHA256: SHA256,
+				Mtime:    uint64(ts) * 1000000,
+				Sparse:   has_index_file, // If index file exists we have an index.
+				Size:     vql_subsystem.GetIntFromRow(scope, row, "Size"),
+				MD5:      MD5,
+				SHA256:   SHA256,
+				FlowId:   flow_id,
+				InFlight: false,
 			})
-		if err != nil {
-			logger.Error("Unable to save flow %v: %v", Path, err)
-		}
 	}
 }
 
@@ -167,7 +181,7 @@ func (self *VFSService) handleEmptyListDirectory(
 
 	// Write an empty set to the VFS entry.
 	err := self.flush_state(config_obj, uint64(ts), client_id, flow_id,
-		vfs_components, []*ordereddict.Dict{})
+		vfs_components, 0, 0)
 	if err != nil {
 		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
 		logger.Error("Unable to save directory: %v", err)
@@ -175,11 +189,17 @@ func (self *VFSService) handleEmptyListDirectory(
 	}
 }
 
-func (self *VFSService) ProcessListDirectory(
+// Handle older clients that do not have the vfs_ls() plugin.
+func (self *VFSService) ProcessListDirectoryLegacy(
 	ctx context.Context,
 	config_obj *config_proto.Config,
 	scope vfilter.Scope, row *ordereddict.Dict,
-	flow *flows_proto.ArtifactCollectorContext) {
+	basic_flow *flows_proto.ArtifactCollectorContext) {
+
+	flow, err := journal.GetFlowFromQueue(ctx, config_obj, row)
+	if err != nil {
+		return
+	}
 
 	// An empty result set needs special handling.
 	if flow.TotalCollectedRows == 0 {
@@ -194,12 +214,9 @@ func (self *VFSService) ProcessListDirectory(
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
 	logger.Info("VFSService: Processing System.VFS.ListDirectory from %v", client_id)
 
-	path_manager, err := artifacts.NewArtifactPathManager(config_obj,
-		client_id, flow_id, "System.VFS.ListDirectory")
-	if err != nil {
-		logger.Error("Unable to read artifact: %v", err)
-		return
-	}
+	path_manager := artifacts.NewArtifactPathManagerWithMode(
+		config_obj, client_id, flow_id, "System.VFS.ListDirectory",
+		paths.MODE_CLIENT)
 
 	// Read the results from the flow and build a VFSListResponse
 	// for storing in the VFS.
@@ -212,10 +229,16 @@ func (self *VFSService) ProcessListDirectory(
 	}
 	defer reader.Close()
 
-	var rows []*ordereddict.Dict
 	var current_vfs_components []string = nil
 
+	// In the VFS we store the row range where we can find the files
+	// in this directory.
+	start_row := 0
+	count := 0
+
 	for row := range reader.Rows(ctx) {
+		count++
+
 		full_path, _ := row.GetString("_FullPath")
 		accessor, _ := row.GetString("_Accessor")
 		name, _ := row.GetString("Name")
@@ -224,6 +247,7 @@ func (self *VFSService) ProcessListDirectory(
 			continue
 		}
 
+		// Where would this file end up in the VFS?
 		file_vfs_path := path_specs.NewUnsafeFilestorePath(accessor).
 			AddChild(paths.ExtractClientPathComponents(full_path)...)
 
@@ -232,14 +256,9 @@ func (self *VFSService) ProcessListDirectory(
 			continue
 		}
 
-		// This row does not belong in the current
-		// collection - flush the collection and start
-		// a new one.
-		if !utils.StringSliceEq(dir_components, current_vfs_components) ||
-
-			// Do not let our memory footprint
-			// grow without bounds.
-			len(rows) > 100000 {
+		// This row does not belong in the current collection - flush
+		// the collection and start a new one.
+		if !utils.StringSliceEq(dir_components, current_vfs_components) {
 
 			// current_vfs_components == nil represents
 			// the first collection before the first row
@@ -247,23 +266,24 @@ func (self *VFSService) ProcessListDirectory(
 			if current_vfs_components != nil {
 				err := self.flush_state(
 					config_obj, uint64(ts), client_id,
-					flow_id, current_vfs_components, rows)
+					flow_id, current_vfs_components, start_row, count-1)
 				if err != nil {
 					return
 				}
-				rows = nil
+				start_row = count - 1
 			}
 			current_vfs_components = dir_components
 		}
-		rows = append(rows, row)
 	}
 
 	err = self.flush_state(config_obj, uint64(ts), client_id, flow_id,
-		current_vfs_components, rows)
+		current_vfs_components, start_row, count)
 	if err != nil {
 		logger.Error("Unable to save directory: %v", err)
 		return
 	}
+
+	start_row = count
 }
 
 func findParam(name string, flow *flows_proto.ArtifactCollectorContext) string {
@@ -286,41 +306,104 @@ func findParam(name string, flow *flows_proto.ArtifactCollectorContext) string {
 // Flush the current state into the database and clear it for the next directory.
 func (self *VFSService) flush_state(
 	config_obj *config_proto.Config, timestamp uint64, client_id, flow_id string,
-	vfs_components []string, rows []*ordereddict.Dict) error {
+	vfs_components []string, start_idx, end_idx int) error {
 
-	var columns []string
-	if len(rows) > 0 {
-		columns = rows[0].Keys()
+	record := &api_proto.VFSListResponse{
+		Timestamp: timestamp,
+		TotalRows: uint64(end_idx - start_idx),
+		ClientId:  client_id,
+		FlowId:    flow_id,
+		StartIdx:  uint64(start_idx),
+		EndIdx:    uint64(end_idx),
 	}
 
-	serialized, err := json.Marshal(rows)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-
+	client_path_manager := paths.NewClientPathManager(client_id)
 	db, err := datastore.GetDB(config_obj)
 	if err != nil {
 		return err
 	}
-	client_path_manager := paths.NewClientPathManager(client_id)
-	return db.SetSubject(config_obj,
+
+	return db.SetSubjectWithCompletion(config_obj,
 		client_path_manager.VFSPath(vfs_components),
-		&api_proto.VFSListResponse{
-			Columns:   columns,
-			Timestamp: timestamp,
-			Response:  string(serialized),
-			TotalRows: uint64(len(rows)),
-			ClientId:  client_id,
-			FlowId:    flow_id,
-		})
+		record, utils.SyncCompleter)
 }
 
-func StartVFSService(
+// Modern clients do the above work on the client removing load from
+// the server. This is much more scalable.
+func (self *VFSService) ProcessListDirectory(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	scope vfilter.Scope, row *ordereddict.Dict,
+	flow *flows_proto.ArtifactCollectorContext) {
+
+	client_id, _ := row.GetString("ClientId")
+	flow_id, _ := row.GetString("FlowId")
+	ts, _ := row.GetInt64("_ts")
+
+	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+	logger.Info("VFSService: Processing System.VFS.ListDirectory/Stats from %v", client_id)
+
+	path_manager := artifacts.NewArtifactPathManagerWithMode(
+		config_obj, client_id, flow_id, "System.VFS.ListDirectory/Stats",
+		paths.MODE_CLIENT)
+
+	// Read the results from the flow and build a VFSListResponse
+	// for storing in the VFS.
+	file_store_factory := file_store.GetFileStore(config_obj)
+	reader, err := result_sets.NewResultSetReader(
+		file_store_factory, path_manager.Path())
+	if err != nil {
+		logger.Error("Unable to read artifact: %v", err)
+		return
+	}
+	defer reader.Close()
+
+	json_chan, _ := reader.JSON(ctx)
+
+	for serialized := range json_chan {
+		row_obj := &services.VFSListRow{}
+		err = json.Unmarshal(serialized, row_obj)
+		if err != nil ||
+			row_obj.Stats == nil {
+			continue
+		}
+
+		accessor := row_obj.Accessor
+		if accessor == "" {
+			accessor = "auto"
+		}
+
+		components := append([]string{accessor}, row_obj.Components...)
+
+		// Write missing data from the stats record.
+		stats := &api_proto.VFSListResponse{
+			Timestamp: uint64(ts),
+			ClientId:  flow.ClientId,
+			FlowId:    flow.SessionId,
+			TotalRows: row_obj.Stats.EndIdx - row_obj.Stats.StartIdx,
+			Artifact:  "System.VFS.ListDirectory/Listing",
+			StartIdx:  row_obj.Stats.StartIdx,
+			EndIdx:    row_obj.Stats.EndIdx,
+		}
+
+		db, err := datastore.GetDB(config_obj)
+		if err != nil {
+			return
+		}
+
+		// Write the record in the background
+		client_path_manager := paths.NewClientPathManager(flow.ClientId)
+		_ = db.SetSubjectWithCompletion(config_obj,
+			client_path_manager.VFSPath(components), stats, utils.BackgroundWriter)
+	}
+}
+
+func NewVFSService(
 	ctx context.Context,
 	wg *sync.WaitGroup,
-	config_obj *config_proto.Config) error {
+	config_obj *config_proto.Config) (
+	services.VFSService, error) {
 
 	vfs_service := &VFSService{}
-
-	return vfs_service.Start(ctx, config_obj, wg)
+	return vfs_service, vfs_service.Start(ctx, config_obj, wg)
 }

@@ -1,8 +1,8 @@
 // +build windows
 
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -30,27 +30,33 @@ import (
 
 	"context"
 
-	errors "github.com/pkg/errors"
+	errors "github.com/go-errors/errors"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
 	"golang.org/x/sys/windows/svc/eventlog"
 	"golang.org/x/sys/windows/svc/mgr"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	crypto_client "www.velocidex.com/golang/velociraptor/crypto/client"
 	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
 	"www.velocidex.com/golang/velociraptor/executor"
 	"www.velocidex.com/golang/velociraptor/http_comms"
 	logging "www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
+	"www.velocidex.com/golang/velociraptor/startup"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql/tools"
 )
 
 var (
 	service_command = app.Command(
 		"service", "Manipulate the Velociraptor service.")
+
 	installl_command = service_command.Command(
 		"install", "Install Velociraptor as a Windows service.")
+
+	installl_command_argv = service_command.Flag(
+		"argv", "Service args (default 'service', 'run').").
+		Strings()
 
 	remove_command = service_command.Command(
 		"remove", "Remove the Velociraptor Windows service.")
@@ -72,6 +78,8 @@ var (
 )
 
 func doInstall(config_obj *config_proto.Config) (err error) {
+	logging.DisableLogging()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -91,7 +99,7 @@ func doInstall(config_obj *config_proto.Config) (err error) {
 	pres, err := checkServiceExists(service_name)
 	if err != nil {
 		logger.Info("checkServiceExists: %v", err)
-		return errors.WithStack(err)
+		return errors.Wrap(err, 0)
 	}
 	if pres {
 		// We have to stop the service first, or we can not overwrite the file.
@@ -106,20 +114,20 @@ func doInstall(config_obj *config_proto.Config) (err error) {
 
 	// Try to copy the executable to the target_path.
 	err = utils.CopyFile(ctx, executable, target_path, 0755)
-	if err != nil && os.IsNotExist(errors.Cause(err)) {
+	if err != nil && errors.Is(err, os.ErrNotExist) {
 		dirname := filepath.Dir(target_path)
 		logger.Info("Attempting to create intermediate directory %s.",
 			dirname)
 		err = os.MkdirAll(dirname, 0700)
 		if err != nil {
 			logger.Info("MkdirAll %s: %v", dirname, err)
-			return errors.Wrap(err, "Create intermediate directories")
+			return fmt.Errorf("Create intermediate directories: %w", err)
 		}
 		err = utils.CopyFile(ctx, executable, target_path, 0755)
 	}
 	if err != nil {
 		logger.Info("Cant copy binary to destination %s: %v", target_path, err)
-		return errors.Wrap(err, "Cant copy binary into destination dir.")
+		return fmt.Errorf("Cant copy binary into destination dir: %w", err)
 	}
 
 	logger.Info("Copied binary to %s", target_path)
@@ -146,18 +154,18 @@ func doInstall(config_obj *config_proto.Config) (err error) {
 	pres, err = checkServiceExists(service_name)
 	if err != nil {
 		logger.Info("checkServiceExists: %v", err)
-		return errors.WithStack(err)
+		return errors.Wrap(err, 0)
 	}
 	if pres {
 		err = removeService(service_name)
 		if err != nil {
-			errors.Wrap(err, "Remove old service")
+			fmt.Errorf("Remove old service: %w", err)
 		}
 	}
 
 	err = installService(config_obj, target_path, logger)
 	if err != nil {
-		return errors.Wrap(err, "Install service")
+		return fmt.Errorf("Install service: %w", err)
 	}
 
 	logger.Info("Installed service %s", service_name)
@@ -200,6 +208,14 @@ func installService(
 		return err
 	}
 	defer m.Disconnect()
+
+	argv := *installl_command_argv
+	if len(argv) == 0 {
+		argv = []string{"service", "run"}
+	}
+
+	logger.Info("Starting service with argv %v\n", argv)
+
 	s, err := m.CreateService(
 		config_obj.Client.WindowsInstaller.ServiceName,
 		executable,
@@ -210,11 +226,22 @@ func installService(
 		},
 
 		// Executable will be started with this command line args:
-		"service", "run")
+		argv...)
+
 	if err != nil {
 		return err
 	}
 	defer s.Close()
+
+	// Set the service to autostart
+	err = s.SetRecoveryActions([]mgr.RecoveryAction{
+		{Type: mgr.ServiceRestart, Delay: time.Second * 60},
+		{Type: mgr.ServiceRestart, Delay: time.Second * 60},
+		{Type: mgr.ServiceRestart, Delay: time.Second * 60},
+	}, 60)
+	if err != nil {
+		logger.Info("SetRecoveryActions() failed: %s", err)
+	}
 
 	// Try to create an event source but dont sweat it if it does
 	// not work.
@@ -281,7 +308,7 @@ func removeService(name string) error {
 	defer m.Disconnect()
 	s, err := m.OpenService(name)
 	if err != nil {
-		return errors.New(fmt.Sprintf("service %s is not installed", name))
+		return fmt.Errorf("service %s is not installed: %w", name, err)
 	}
 	defer s.Close()
 	err = s.Delete()
@@ -290,12 +317,14 @@ func removeService(name string) error {
 	}
 	err = eventlog.Remove(name)
 	if err != nil {
-		return errors.New(fmt.Sprintf("RemoveEventLogSource() failed: %s", err))
+		return fmt.Errorf("RemoveEventLogSource() failed: %w", err)
 	}
 	return nil
 }
 
 func doRemove() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
@@ -356,8 +385,7 @@ func loadClientConfig() (*config_proto.Config, error) {
 		// Config obj is not valid here, we can not actually
 		// log anything since we dont know where to send it so
 		// prelog instead.
-		logging.Prelog("Failed to load %v will try again soon.\n", *config_path)
-
+		Prelog("Failed to load %v: %v will try again soon.\n", err, *config_path)
 		return nil, err
 	}
 
@@ -366,6 +394,7 @@ func loadClientConfig() (*config_proto.Config, error) {
 	// Make sure the config is ok.
 	err = crypto_utils.VerifyConfig(config_obj)
 	if err != nil {
+		Prelog("VerifyConfig: %v.\n", err)
 		return nil, err
 	}
 
@@ -378,14 +407,18 @@ func doRun() error {
 	if err == nil {
 		name = config_obj.Client.WindowsInstaller.ServiceName
 	}
-	service, err := NewVelociraptorService(name)
+
+	ctx := context.Background()
+	service, err := NewVelociraptorService(ctx, name)
 	if err != nil {
+		Prelog("NewVelociraptorService: %v", err)
 		return err
 	}
 	defer service.Close()
 
 	isIntSess, err := svc.IsAnInteractiveSession()
 	if err != nil {
+		Prelog("IsAnInteractiveSession: %v", err)
 		return err
 	}
 
@@ -395,6 +428,7 @@ func doRun() error {
 		err = svc.Run(name, service)
 	}
 	if err != nil {
+		Prelog("svc.Run: %v", err)
 		return err
 	}
 
@@ -476,28 +510,32 @@ func (self *VelociraptorService) Close() {
 	}
 }
 
-func runOnce(result *VelociraptorService, elog debug.Log) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+func runOnce(ctx context.Context,
+	wg *sync.WaitGroup, result *VelociraptorService, elog debug.Log) {
+	defer wg.Done()
 
 	// Spin forever waiting for a config file to be
 	// dropped into place.
 	config_obj, err := loadClientConfig()
 	if err != nil {
-		time.Sleep(10 * time.Second)
+		select {
+		case <-ctx.Done():
+		case <-time.After(10 * time.Second):
+		}
 		return
 	}
 
-	manager, err := crypto_client.NewClientCryptoManager(
-		config_obj, []byte(config_obj.Writeback.PrivateKey))
+	writeback_service := writeback.GetWritebackService()
+	writeback, err := writeback_service.GetWriteback(config_obj)
 	if err != nil {
-		elog.Error(1, fmt.Sprintf(
-			"Can not create crypto: %v", err))
-		time.Sleep(10 * time.Second)
 		return
 	}
 
-	exe, err := executor.NewClientExecutor(ctx, config_obj)
+	sm, err := startup.StartClientServices(ctx, config_obj, on_error)
+	defer sm.Close()
+
+	exe, err := executor.NewClientExecutor(
+		ctx, writeback.ClientId, config_obj)
 	if err != nil {
 		elog.Error(1, fmt.Sprintf(
 			"Can not create client: %v", err))
@@ -505,37 +543,28 @@ func runOnce(result *VelociraptorService, elog debug.Log) {
 		return
 	}
 
-	comm, err := http_comms.NewHTTPCommunicator(
-		config_obj,
-		manager,
-		exe,
-		config_obj.Client.ServerUrls,
-		func() { on_error(config_obj) },
-		utils.RealClock{},
-	)
+	_, err = http_comms.StartHttpCommunicatorService(
+		ctx, sm.Wg, config_obj, exe, on_error)
 	if err != nil {
 		elog.Error(1, fmt.Sprintf(
-			"Can not create comms: %v", err))
+			"Can not create client: %v", err))
 		time.Sleep(10 * time.Second)
 		return
 	}
 
-	result.mu.Lock()
-	result.comms = comm
-	result.mu.Unlock()
-
-	// Wait for all services to properly start
-	// before we begin the comms.
-	sm := services.NewServiceManager(ctx, config_obj)
-	defer sm.Close()
-	err = executor.StartServices(sm, manager.ClientId, exe)
+	// Check for crashes etc
+	err = executor.RunStartupTasks(ctx, config_obj, sm.Wg, exe)
 	if err != nil {
-		return
+		// Not a fatal error, just move on
+		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
+		logger.Error("<red>Start up error:</> %v", err)
 	}
-	comm.Run(ctx)
+
+	<-ctx.Done()
 }
 
-func NewVelociraptorService(name string) (*VelociraptorService, error) {
+func NewVelociraptorService(
+	ctx context.Context, name string) (*VelociraptorService, error) {
 	elog, err := getLogger(name)
 	if err != nil {
 		return nil, err
@@ -545,8 +574,27 @@ func NewVelociraptorService(name string) (*VelociraptorService, error) {
 
 	go func() {
 		for {
-			runOnce(result, elog)
-			time.Sleep(10 * time.Second)
+			subctx, cancel := context.WithCancel(ctx)
+			lwg := &sync.WaitGroup{}
+			lwg.Add(1)
+			go func() {
+				defer cancel()
+				runOnce(subctx, lwg, result, elog)
+			}()
+
+			select {
+			case <-subctx.Done():
+				continue
+			case <-ctx.Done():
+				// Wait for the client to shutdown.
+				cancel()
+				lwg.Wait()
+				return
+
+			case <-tools.ClientRestart:
+				cancel()
+				lwg.Wait()
+			}
 		}
 	}()
 

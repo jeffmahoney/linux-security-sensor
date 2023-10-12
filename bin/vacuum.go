@@ -17,14 +17,9 @@ import (
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
-	"www.velocidex.com/golang/velociraptor/search"
 	"www.velocidex.com/golang/velociraptor/server"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/services/client_info"
-	"www.velocidex.com/golang/velociraptor/services/frontend"
-	"www.velocidex.com/golang/velociraptor/services/indexing"
-	"www.velocidex.com/golang/velociraptor/services/journal"
-	"www.velocidex.com/golang/velociraptor/services/labels"
+	"www.velocidex.com/golang/velociraptor/startup"
 	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 )
@@ -59,6 +54,8 @@ var (
 )
 
 func doVacuum() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredFrontend().
 		WithRequiredUser().
@@ -74,7 +71,13 @@ func doVacuum() error {
 	ctx, cancel := install_sig_handler()
 	defer cancel()
 
-	sm := services.NewServiceManager(ctx, config_obj)
+	config_obj.Services = services.GenericToolServices()
+	config_obj.Services.IndexServer = true
+
+	sm, err := startup.StartToolServices(ctx, config_obj)
+	if err != nil {
+		return fmt.Errorf("Starting services: %w", err)
+	}
 	defer sm.Close()
 
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
@@ -84,31 +87,6 @@ func doVacuum() error {
 	server.IncreaseLimits(config_obj)
 
 	err = sm.Start(datastore.StartMemcacheFileService)
-	if err != nil {
-		return err
-	}
-
-	err = sm.Start(journal.StartJournalService)
-	if err != nil {
-		return err
-	}
-
-	err = sm.Start(frontend.StartFrontendService)
-	if err != nil {
-		return err
-	}
-
-	err = sm.Start(labels.StartLabelService)
-	if err != nil {
-		return err
-	}
-
-	err = sm.Start(client_info.StartClientInfoService)
-	if err != nil {
-		return err
-	}
-
-	err = sm.Start(indexing.StartIndexingService)
 	if err != nil {
 		return err
 	}
@@ -123,16 +101,21 @@ func doVacuum() error {
 func generateTasks(
 	ctx context.Context, config_obj *config_proto.Config,
 	number int) error {
-	client_info_manager, err := services.GetClientInfoManager()
+	client_info_manager, err := services.GetClientInfoManager(config_obj)
 	if err != nil {
 		return err
 	}
 	_ = client_info_manager
 
+	indexer, err := services.GetIndexer(config_obj)
+	if err != nil {
+		return err
+	}
+
 	scope := vql_subsystem.MakeScope()
 
 	// Get all the clients from the index.
-	client_chan, err := search.SearchClientsChan(ctx, scope, config_obj, "C.", "")
+	client_chan, err := indexer.SearchClientsChan(ctx, scope, config_obj, "C.", "")
 	if err != nil {
 		return err
 	}
@@ -149,7 +132,7 @@ func generateTasks(
 		fmt.Printf("ClientInfo %v %v\n", client_info.ClientId,
 			client_info.OsInfo.Hostname)
 		err = client_info_manager.QueueMessagesForClient(
-			client_info.ClientId, tasks, false)
+			ctx, client_info.ClientId, tasks, false)
 		if err != nil {
 			fmt.Printf("Error: %v\n", err)
 		}
@@ -168,13 +151,18 @@ func deleteTasks(
 		return err
 	}
 
+	indexer, err := services.GetIndexer(config_obj)
+	if err != nil {
+		return err
+	}
+
 	scope := vql_subsystem.MakeScope()
 
 	sub_ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	// Get all the clients from the index.
-	client_chan, err := search.SearchClientsChan(
+	client_chan, err := indexer.SearchClientsChan(
 		sub_ctx, scope, config_obj, "all", "")
 	if err != nil {
 		return err
@@ -269,6 +257,7 @@ func processTask(task_chan <-chan api.DSPathSpec, wg *sync.WaitGroup,
 // On very slow filesystems we need to go low level to get any kind
 // of performance.
 func doVacuumHarder(config_obj *config_proto.Config) error {
+	logging.DisableLogging()
 
 	ctx, cancel := install_sig_handler()
 	defer cancel()

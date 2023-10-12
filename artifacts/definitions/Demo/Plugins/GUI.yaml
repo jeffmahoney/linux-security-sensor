@@ -19,9 +19,17 @@ parameters:
       - Second Choice
       - Third Choice
 
+  - name: Hashes
+    validating_regex: '^\s*([A-F0-9]+\s*)+$'
+    description: One or more hashes in hex separated by white space.
+
   - name: RegularExpression
     type: regex
     default: "."
+
+  - name: MultipleRegularExpression
+    type: regex_array
+    default: '[".+"]'
 
   - name: YaraRule
     type: yara
@@ -29,7 +37,7 @@ parameters:
   - name: Flag
     friendly_name: A Flag with a name
     type: bool
-    default: Y
+    default: True
 
   - name: Flag2
     type: bool
@@ -78,13 +86,23 @@ parameters:
     type: upload
     description: FileUpload1 can receive a file upload. The upload content will be available in this variable when executing on the client.
 
+  - name: ArtifactSelections
+    type: artifactset
+    description: A selection of artifact
+    artifact_type: CLIENT_EVENT
+    default: |
+      Artifact
+      Windows.Detection.PsexecService
+      Windows.Events.ProcessCreation
+      Windows.Events.ServiceCreation
+
 column_types:
-  - name: Hex
+  - name: Base64Hex
     type: base64hex
 
 sources:
   - query: |
-      SELECT base64encode(string="This should popup in a hex editor") AS Hex,
+      SELECT base64encode(string="This should popup in a hex editor") AS Base64Hex,
              ChoiceSelector, Flag, Flag2, Flag3,
              OffFlag, StartDate, StartDate2, StartDate3,
              CSVData, CSVData2, JSONData, JSONData2,
@@ -92,6 +110,16 @@ sources:
       FROM scope()
 
     notebook:
+      - type: vql_suggestion
+        name: Test Suggestion
+        template: |
+          /*
+          # This is a suggestion notebook cell.
+
+          It should be available from the suggestions list.
+          */
+          SELECT * FROM info()
+
       - type: md
         template: |
           # GUI Notebook tests
@@ -102,7 +130,7 @@ sources:
 
           **Each of the below cells should have a H2 heading**
 
-          ## Check that notebok environment variables are populated
+          ## Check that notebook environment variables are populated
           {{ $x := Query "SELECT * FROM items(\
              item=dict(NotebookId=NotebookId, ClientId=ClientId,\
                        FlowId=FlowId, ArtifactName=ArtifactName))" | Expand }}
@@ -156,7 +184,7 @@ sources:
 
                  FlowId, ClientId, URL, URL AS SafeURL, Base64Data,
 
-                 "Hello" AS Data
+                 format(format="%02x", args="Hello") AS Data
           FROM scope()
 
       - type: Markdown
@@ -238,7 +266,9 @@ sources:
           /*
           ## Adding timelines
 
-          Add a timeline from this time series data
+          Add a timeline from this time series data. (This only works
+          for root org because it relies on server health events).
+
           */
           SELECT timestamp(epoch=_ts) AS Timestamp, CPUPercent
           FROM monitoring(
@@ -282,7 +312,8 @@ sources:
 
           Check both expanded and contracted states of the cell
           */
-          LET Test = "Hellothereongline"
+          LET zalgo = "1̴̣̜̗̰͇͖͖̞̮͈͍̂͜.̸̢̧̨͙̻̜̰̼̔̿̓̄̀̅͌̈́͒͗̈́̒̕̚͜͠e̶̙̞̬̹̥͖̤̟͑͒̂̀̔͠x̵̛̱̠̳͍̦̘̤̙͚̙͈̬́̈́͂̎̽̇̀͝ę̵̯̦̫͖͖͍͈̟̠͉̥͒̑̐̏̕̚̕͜͠"
+          LET Test = "Hellothereongline" + zalgo
 
           SELECT Test AS Test1, Test AS Test2, Test AS Test3,
                  Test AS Test4, Test AS Test5,
@@ -300,9 +331,16 @@ sources:
           These apply to notebooks automatically without needing to
           define them again.
 
+          * Hash column should right click to VT
+          * upload preview should show the uploaded file.
+
           */
 
-          LET ColumnTypes = dict(`StartDate`='timestamp')
+          LET ColumnTypes = dict(`StartDate`='timestamp',
+                                 Hex='hex', Upload='preview_upload')
+          LET Hex = "B0 EC 48 5F 18 77"
 
-          SELECT Hex, StartDate
+          SELECT Hex, StartDate, hash(accessor="data", path="Hello") AS Hash,
+                 upload(accessor="data", file="Hello world",
+                        name="test.txt") AS Upload
           FROM source()

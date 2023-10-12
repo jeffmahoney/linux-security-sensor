@@ -1,23 +1,41 @@
 package utils
 
 import (
+	"fmt"
 	"io"
+	"sync"
 
-	errors "github.com/pkg/errors"
+	errors "github.com/go-errors/errors"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 )
 
 // Wrapper to provider io.ReaderAt
 type ReaderAtter struct {
+	mu     sync.Mutex
 	Reader io.ReadSeeker
 }
 
-func (self ReaderAtter) ReadAt(buf []byte, offset int64) (int, error) {
+func (self *ReaderAtter) DebugString() string {
+	return fmt.Sprintf("ReaderAtter of %v", DebugString(self.Reader))
+}
+
+func (self *ReaderAtter) ReadAt(buf []byte, offset int64) (int, error) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
 	_, err := self.Reader.Seek(offset, 0)
 	if err != nil {
 		return 0, err
 	}
 	return self.Reader.Read(buf)
+}
+
+func MakeReaderAtter(fd io.ReadSeeker) io.ReaderAt {
+	reader, ok := fd.(io.ReaderAt)
+	if ok {
+		return reader
+	}
+	return &ReaderAtter{Reader: fd}
 }
 
 type BufferReaderAt struct {
@@ -134,4 +152,51 @@ func (self *RangedReader) readFromARun(
 	}
 
 	return 0, errors.New("IO Error")
+}
+
+type ZeroReader struct{}
+
+func (self ZeroReader) Read(b []byte) (n int, err error) {
+	for i := 0; i < len(b); i++ {
+		b[i] = 0
+	}
+	return len(b), nil
+}
+
+type OffsetReader struct {
+	reader io.ReaderAt
+	offset int64
+	length int64
+}
+
+func (self OffsetReader) ReadAt(buff []byte, off int64) (int, error) {
+	to_read := int64(len(buff))
+	if off+to_read > self.length {
+		to_read = self.length - off
+	}
+
+	if to_read < 0 {
+		return 0, nil
+	}
+	return self.reader.ReadAt(buff, off+self.offset)
+}
+
+func NewOffsetReader(reader io.ReaderAt, offset, size int64) io.ReaderAt {
+	return &OffsetReader{
+		reader: reader,
+		offset: offset,
+		length: offset + size,
+	}
+}
+
+type nopSeekCloser struct {
+	io.ReadSeeker
+}
+
+func (self nopSeekCloser) Close() error {
+	return nil
+}
+
+func NopSeekCloser(reader io.ReadSeeker) nopSeekCloser {
+	return nopSeekCloser{reader}
 }

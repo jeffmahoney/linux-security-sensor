@@ -1,19 +1,19 @@
-package hunt_dispatcher
+package hunt_dispatcher_test
 
 import (
+	"context"
 	"fmt"
 	"sort"
 	"testing"
 	"time"
 
-	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/services/frontend"
+	"www.velocidex.com/golang/velociraptor/services/hunt_dispatcher"
 	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/velociraptor/vtesting"
 	"www.velocidex.com/golang/velociraptor/vtesting/assert"
@@ -26,24 +26,27 @@ type HuntDispatcherTestSuite struct {
 
 	hunt_id string
 
-	master_dispatcher *HuntDispatcher
-	minion_dispatcher *HuntDispatcher
+	master_dispatcher *hunt_dispatcher.HuntDispatcher
+	minion_dispatcher *hunt_dispatcher.HuntDispatcher
 }
 
 func (self *HuntDispatcherTestSuite) SetupTest() {
-	self.TestSuite.SetupTest()
-	self.LoadArtifacts([]string{`
+	self.ConfigObj = self.TestSuite.LoadConfig()
+	self.ConfigObj.Services.FrontendServer = true
+	self.ConfigObj.Services.HuntDispatcher = true
+
+	self.LoadArtifactsIntoConfig([]string{`
 name: Server.Internal.HuntUpdate
 type: INTERNAL
 `})
 
-	Clock = &utils.IncClock{}
+	hunt_dispatcher.Clock = &utils.IncClock{}
 
 	db, err := datastore.GetDB(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	for i := 0; i < 5; i++ {
-		now := Clock.Now().Unix()
+		now := hunt_dispatcher.Clock.Now().Unix()
 		hunt_obj := &api_proto.Hunt{
 			HuntId:    fmt.Sprintf("H.%d", i),
 			State:     api_proto.Hunt_RUNNING,
@@ -56,16 +59,21 @@ type: INTERNAL
 				hunt_path_manager.Path(), hunt_obj))
 	}
 
-	require.NoError(self.T(), self.Sm.Start(frontend.StartFrontendService))
+	self.TestSuite.SetupTest()
 
 	// Make a master and minion dispatchers.
-	require.NoError(self.T(), self.Sm.Start(StartHuntDispatcher))
-	self.master_dispatcher = services.GetHuntDispatcher().(*HuntDispatcher)
-	self.master_dispatcher.i_am_master = true
+	master_dispatcher, err := hunt_dispatcher.NewHuntDispatcher(
+		self.Ctx, self.Wg, self.ConfigObj)
+	assert.NoError(self.T(), err)
 
-	require.NoError(self.T(), self.Sm.Start(StartHuntDispatcher))
-	self.minion_dispatcher = services.GetHuntDispatcher().(*HuntDispatcher)
-	self.minion_dispatcher.i_am_master = false
+	self.master_dispatcher = master_dispatcher.(*hunt_dispatcher.HuntDispatcher)
+	self.master_dispatcher.I_am_master = true
+
+	minion_dispatcher, err := hunt_dispatcher.NewHuntDispatcher(
+		self.Ctx, self.Wg, self.ConfigObj)
+	assert.NoError(self.T(), err)
+	self.minion_dispatcher = minion_dispatcher.(*hunt_dispatcher.HuntDispatcher)
+	self.minion_dispatcher.I_am_master = false
 
 	// Wait until the hunt dispatchers are fully loaded.
 	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
@@ -93,7 +101,8 @@ func (self *HuntDispatcherTestSuite) TestModifyingHuntFlushToDatastore() {
 	assert.NoError(self.T(), err)
 
 	// Modify a hunt and flush to datastore immediately
-	modification := self.master_dispatcher.ModifyHunt("H.1",
+	ctx := context.Background()
+	modification := self.master_dispatcher.ModifyHuntObject(ctx, "H.1",
 		func(hunt *api_proto.Hunt) services.HuntModificationAction {
 			hunt.State = api_proto.Hunt_STOPPED
 			return services.HuntFlushToDatastore
@@ -123,22 +132,23 @@ func (self *HuntDispatcherTestSuite) TestModifyingHuntPropagateChanges() {
 	db, err := datastore.GetDB(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
+	// Check the hunt is running in the data store.
+	hunt_path_manager := paths.NewHuntPathManager("H.2")
+	hunt_obj := &api_proto.Hunt{}
+	err = db.GetSubject(self.ConfigObj, hunt_path_manager.Path(), hunt_obj)
+	assert.NoError(self.T(), err)
+	assert.Equal(self.T(), hunt_obj.State, api_proto.Hunt_RUNNING)
+
 	// Now modify a hunt with services.HuntPropagateChanges
-	modification := self.master_dispatcher.ModifyHunt("H.2",
+	ctx := self.Ctx
+	modification := self.master_dispatcher.ModifyHuntObject(ctx, "H.2",
 		func(hunt *api_proto.Hunt) services.HuntModificationAction {
 			hunt.State = api_proto.Hunt_STOPPED
 			return services.HuntPropagateChanges
 		})
 
-	// Changes are not visible in the data store immediately.
+	// Changes may not visible in the data store immediately.
 	assert.Equal(self.T(), modification, services.HuntPropagateChanges)
-	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
-		hunt_path_manager := paths.NewHuntPathManager("H.2")
-		hunt_obj := &api_proto.Hunt{}
-		err = db.GetSubject(self.ConfigObj, hunt_path_manager.Path(), hunt_obj)
-		assert.NoError(self.T(), err)
-		return hunt_obj.State == api_proto.Hunt_RUNNING
-	})
 
 	// But they should be visible in master
 	hunt_obj, pres := self.master_dispatcher.GetHunt("H.2")
@@ -149,6 +159,15 @@ func (self *HuntDispatcherTestSuite) TestModifyingHuntPropagateChanges() {
 	vtesting.WaitUntil(time.Second, self.T(), func() bool {
 		hunt_obj, pres = self.minion_dispatcher.GetHunt("H.2")
 		return pres && hunt_obj.State == api_proto.Hunt_STOPPED
+	})
+
+	// And eventually also be visible in the filestore
+	vtesting.WaitUntil(time.Second, self.T(), func() bool {
+		hunt_path_manager := paths.NewHuntPathManager("H.2")
+		hunt_obj := &api_proto.Hunt{}
+		err = db.GetSubject(self.ConfigObj, hunt_path_manager.Path(), hunt_obj)
+		assert.NoError(self.T(), err)
+		return hunt_obj.State == api_proto.Hunt_STOPPED
 	})
 }
 

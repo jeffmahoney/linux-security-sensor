@@ -30,7 +30,7 @@ func EvalQueryToTable(ctx context.Context,
 	table := tablewriter.NewWriter(out)
 
 	columns := []string{}
-	table.SetCaption(true, vql.ToString(scope))
+	table.SetCaption(true, vfilter.FormatToString(scope, vql))
 	table.SetAutoFormatHeaders(false)
 	table.SetAutoWrapText(false)
 
@@ -51,7 +51,6 @@ func EvalQueryToTable(ctx context.Context,
 		}
 
 		table.Append(string_row)
-		vfilter.ChargeOp(scope)
 	}
 
 	return table
@@ -65,6 +64,7 @@ type Expansions struct {
 
 // Support a number of expansions in description strings.
 func FormatDescription(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	description string,
 	rows []vfilter.Row) string {
@@ -93,8 +93,9 @@ func FormatDescription(
 	return buffer.String()
 }
 
-func (self *Expansions) DocFrom(artifact string) string {
-	manager, err := services.GetRepositoryManager()
+func (self *Expansions) DocFrom(
+	ctx context.Context, artifact string) string {
+	manager, err := services.GetRepositoryManager(self.config_obj)
 	if err != nil {
 		return ""
 	}
@@ -104,7 +105,7 @@ func (self *Expansions) DocFrom(artifact string) string {
 		return ""
 	}
 
-	artifact_definition, pres := repository.Get(self.config_obj, artifact)
+	artifact_definition, pres := repository.Get(ctx, self.config_obj, artifact)
 	if !pres {
 		return ""
 	}
@@ -120,7 +121,7 @@ func (self *Expansions) Query(queries ...string) string {
 
 	defer scope.Close()
 
-	scope.SetLogger(log.New(os.Stderr, " ", 0))
+	scope.SetLogger(log.New(os.Stderr, "", 0))
 
 	for _, query := range queries {
 		query_log := actions.QueryLog.AddQuery(query)

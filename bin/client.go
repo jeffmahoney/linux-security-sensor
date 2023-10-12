@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -20,33 +20,39 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
 
-	crypto_client "www.velocidex.com/golang/velociraptor/crypto/client"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
 	"www.velocidex.com/golang/velociraptor/executor"
 	"www.velocidex.com/golang/velociraptor/http_comms"
 	logging "www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
+	"www.velocidex.com/golang/velociraptor/startup"
+	"www.velocidex.com/golang/velociraptor/vql/tools"
 )
 
 var (
 	// Run the client.
-	client = app.Command("client", "Run the velociraptor client")
+	client            = app.Command("client", "Run the velociraptor client")
+	client_quiet_flag = client.Flag("quiet",
+		"Do not output anything to stdout/stderr").Bool()
+	client_admin_flag = client.Flag("require_admin", "Ensure the user is an admin").Bool()
 )
 
-func RunClient(
-	ctx context.Context,
-	wg *sync.WaitGroup,
-	config_path *string) error {
-
-	err := checkMutex()
-	if err != nil {
-		return err
+func doClient() error {
+	if *client_admin_flag {
+		err := checkAdmin()
+		if err != nil {
+			return err
+		}
 	}
 
-	// Include the writeback in the client's configuration.
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	// Include the writeback in the client's configuratio.
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredClient().
 		WithRequiredLogging().
@@ -56,6 +62,59 @@ func RunClient(
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
+	return RunClient(ctx, config_obj)
+}
+
+// Run the client - if the client exits restart it.
+func RunClient(
+	ctx context.Context,
+	config_obj *config_proto.Config) error {
+
+	err := checkMutex()
+	if err != nil {
+		return err
+	}
+
+	for {
+		subctx, cancel := context.WithCancel(ctx)
+		lwg := &sync.WaitGroup{}
+
+		lwg.Add(1)
+		go func() {
+			runClientOnce(subctx, lwg, config_obj)
+			cancel()
+		}()
+
+		select {
+		case <-subctx.Done():
+			// Wait for the client to shutdown before we exit.
+			cancel()
+			lwg.Wait()
+			return nil
+
+		case <-tools.ClientRestart:
+			cancel()
+			// Wait for the client to shutdown before we restart it.
+			lwg.Wait()
+		}
+	}
+}
+
+func runClientOnce(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	config_obj *config_proto.Config) (err error) {
+
+	defer wg.Done()
+
+	// Report any errors from this function.
+	defer func() {
+		if err != nil {
+			logger := logging.GetLogger(config_obj, &logging.ClientComponent)
+			logger.Error("<red>runClientOnce Error:</> %v", err)
+		}
+	}()
+
 	// Make sure the config crypto is ok.
 	err = crypto_utils.VerifyConfig(config_obj)
 	if err != nil {
@@ -64,71 +123,52 @@ func RunClient(
 
 	executor.SetTempfile(config_obj)
 
-	manager, err := crypto_client.NewClientCryptoManager(
-		config_obj, []byte(config_obj.Writeback.PrivateKey))
+	writeback_service := writeback.GetWritebackService()
+	writeback, err := writeback_service.GetWriteback(config_obj)
 	if err != nil {
 		return err
 	}
 
-	// Start all the services
-	sm := services.NewServiceManager(ctx, config_obj)
+	sm, err := startup.StartClientServices(ctx, config_obj, on_error)
 	defer sm.Close()
+	if err != nil {
+		return err
+	}
 
-	exe, err := executor.NewClientExecutor(ctx, config_obj)
+	exe, err := executor.NewClientExecutor(ctx, writeback.ClientId, config_obj)
 	if err != nil {
 		return fmt.Errorf("Can not create executor: %w", err)
 	}
 
-	err = executor.StartServices(sm, manager.ClientId, exe)
+	_, err = http_comms.StartHttpCommunicatorService(
+		ctx, sm.Wg, config_obj, exe, on_error)
 	if err != nil {
-		return fmt.Errorf("Starting services: %w", err)
+		return err
 	}
 
-	// Now start the communicator so we can talk with the server.
-	comm, err := http_comms.NewHTTPCommunicator(
-		config_obj,
-		manager,
-		exe,
-		config_obj.Client.ServerUrls,
-		func() { on_error(config_obj) },
-		utils.RealClock{},
-	)
+	// Check for crashes
+	err = executor.RunStartupTasks(ctx, config_obj, sm.Wg, exe)
 	if err != nil {
-		return fmt.Errorf("Can not create HTTPCommunicator: %w", err)
+		return err
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		comm.Run(ctx)
-	}()
-
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		<-ctx.Done()
-
-		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
-		logger.Info("<cyan>Interrupted!</> Shutting down\n")
-	}()
-
-	wg.Wait()
-
+	<-ctx.Done()
 	return nil
+}
+
+func maybeCloseOutput() {
+	if *client_quiet_flag {
+		os.Stdout.Close()
+		os.Stderr.Close()
+	}
 }
 
 func init() {
 	command_handlers = append(command_handlers, func(command string) bool {
 		if command == client.FullCommand() {
-			wg := &sync.WaitGroup{}
-			ctx, cancel := install_sig_handler()
-			defer cancel()
+			maybeCloseOutput()
 
-			FatalIfError(client, func() error {
-				return RunClient(ctx, wg, config_path)
-			})
-
+			FatalIfError(client, doClient)
 			return true
 		}
 		return false

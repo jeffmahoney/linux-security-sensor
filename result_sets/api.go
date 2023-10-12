@@ -17,7 +17,17 @@ const (
 )
 
 type ResultSetWriter interface {
+	// Write an already serialized batch of rows. This basically just
+	// appends the data to the output JSONL file so it is very cheap.
 	WriteJSONL(serialized []byte, total_rows uint64)
+
+	// Provide a hint as to the next row id we are writing. This is
+	// only useful for some implementations of result set writers.
+	SetStartRow(start_row int64)
+
+	// Result sets may be updated in place.
+	Update(index uint64, row *ordereddict.Dict) error
+
 	Write(row *ordereddict.Dict)
 	Flush()
 	Close()
@@ -28,6 +38,7 @@ type ResultSetWriter interface {
 }
 
 type TimedResultSetWriter interface {
+	WriteJSONL(serialized []byte, total_rows int)
 	Write(row *ordereddict.Dict)
 	Flush()
 	Close()
@@ -36,6 +47,10 @@ type TimedResultSetWriter interface {
 type ResultSetReader interface {
 	SeekToRow(start int64) error
 	Rows(ctx context.Context) <-chan *ordereddict.Dict
+
+	// An alternative method to get the raw json blobs. Avoids having
+	// to parse the data from storage.
+	JSON(ctx context.Context) (<-chan []byte, error)
 	Close()
 	TotalRows() int64
 }

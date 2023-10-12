@@ -8,9 +8,17 @@ package proto;
 option go_package = "www.velocidex.com/golang/velociraptor/actions/proto";
 
 message Range {
+    // Range offset in the underlying file.
     int64 file_offset = 1;
+
+    // Range offset in the underlying file
     int64 original_offset = 2;
+
+    // The length of data that exists in the underlying file. May be 0
+    // if the range is sparse and has no underlying storage.
     int64 file_length = 3;
+
+    // Length of this range.
     int64 length = 4;
 }
 
@@ -25,6 +33,8 @@ message PathSpec {
             description: "The path passed to the Filesystem accessor. "
             "This value is interpreted by the accessor in its own way.",
         }];
+
+    repeated string components = 4;
 
     string accessor = 3 [(sem_type) = {
             description: "The accessor used to retrieve the file.",
@@ -48,6 +58,13 @@ message FileBuffer {
     bool is_sparse = 9;
 
     bytes data = 3;
+
+    // For uploaders that do not transfer the bulk data inside the
+    // data field, we need a way to specify how much data was
+    // transferred in thie buffer. In the usual uploader this will be
+    // the len(data).
+    uint64 data_length = 16;
+
     string flow_id = 4;
     bool eof = 5;
 
@@ -58,6 +75,16 @@ message FileBuffer {
     int64 atime = 11;
     int64 ctime = 12;
     int64 btime = 13;
+
+    // Set when the actual file is stored somewhere else (e.g. S3)
+    string reference = 14;
+
+    // An incrementing number of uploads across the entire
+    // collection. Velociraptor file uploads are stored per collection
+    // and not per query so this number is unique across all the
+    // queries in the collection. It amounts to the row id on the
+    // collections uploads result set.
+    int64 upload_number = 15;
 }
 
 message ForemanCheckin {

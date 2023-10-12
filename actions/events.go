@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -19,7 +19,7 @@
 // Client Events are long lived VQL queries which stream their results
 // to the event handler on the server. Clients maintain a global event
 // table internally containing a set of event queries. The client's
-// table is kept in sync with the server by compaing the table's
+// table is kept in sync with the server by comparing the table's
 // version on each packet sent. If the server's event table is higher
 // than the client's the server will refresh the client's table using
 // the UpdateEventTable() action.
@@ -33,41 +33,42 @@ import (
 
 	"google.golang.org/protobuf/proto"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
-	config "www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
+	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/responder"
-)
-
-var (
-	GlobalEventTable = &EventTable{}
-	mu               sync.Mutex
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 )
 
 type EventTable struct {
-	Events  []*actions_proto.VQLCollectorArgs
+	mu sync.Mutex
+
+	// Context for cancelling all inflight queries in this event
+	// table.
+	Ctx    context.Context
+	cancel func()
+	wg     *sync.WaitGroup
+
+	// The event table currently running
+	Events []*actions_proto.VQLCollectorArgs
+
+	// The version of this event table - we only update from the
+	// server if the server's event table is newer.
 	version uint64
 
 	config_obj *config_proto.Config
 
-	// This will be closed to signal that we need to abort the
-	// current event queries.
-	Done chan bool
-	wg   sync.WaitGroup
-
-	// Keep track of inflight queries for shutdown. This wait
-	// group belongs to the client's service manager. As we issue
-	// queries we increment it and when queries are done we
-	// decrement it. The service manager will wait for this before
-	// exiting allowing the client to shut down in an orderly
-	// fashion.
-	service_wg *sync.WaitGroup
+	monitoring_manager *responder.MonitoringManager
 }
 
 // Determine if the current table is the same as the new set of
-// queries. Returns true if the queries are the same and not change is
-// needed.
-func (self *EventTable) equal(events []*actions_proto.VQLCollectorArgs) bool {
+// queries. Returns true if the queries are the same and no change is
+// needed. NOTE: Assumes the order of queries and Env variables is
+// deterministic and consistent.
+func (self *EventTable) Equal(events []*actions_proto.VQLCollectorArgs) bool {
 	if len(events) != len(self.Events) {
 		return false
 	}
@@ -101,145 +102,164 @@ func (self *EventTable) equal(events []*actions_proto.VQLCollectorArgs) bool {
 
 // Teardown all the current quries. Blocks until they all shut down.
 func (self *EventTable) Close() {
-	logger := logging.GetLogger(self.config_obj, &logging.ClientComponent)
-	logger.Info("Closing EventTable\n")
+	self.mu.Lock()
+	defer self.mu.Unlock()
 
-	close(self.Done)
+	self.close()
+}
+
+// Actually close the table without lock
+func (self *EventTable) close() {
+	if self.config_obj != nil {
+		logger := logging.GetLogger(self.config_obj, &logging.ClientComponent)
+		logger.Info("Closing EventTable\n")
+	}
+
+	self.cancel()
+
+	// Wait until the queries have completed.
 	self.wg.Wait()
+
+	// Clear the list of events we are tracking - we are an empty
+	// event table right now - so further updates will restart the
+	// queries again.
+	self.Events = nil
+	self.version = 0
 }
 
-func GlobalEventTableVersion() uint64 {
-	mu.Lock()
-	defer mu.Unlock()
+func (self *EventTable) Version() uint64 {
+	self.mu.Lock()
+	defer self.mu.Unlock()
 
-	return GlobalEventTable.version
+	return self.version
 }
 
-func update(
+func (self *EventTable) Update(
+	ctx context.Context,
+	wg *sync.WaitGroup,
 	config_obj *config_proto.Config,
-	responder *responder.Responder,
-	table *actions_proto.VQLEventTable) (*EventTable, error, bool) {
+	output_chan chan *crypto_proto.VeloMessage,
+	table *actions_proto.VQLEventTable) (error, bool) {
 
-	mu.Lock()
-	defer mu.Unlock()
+	self.mu.Lock()
+	defer self.mu.Unlock()
 
 	// Only update the event table if we need to.
-	if table.Version <= GlobalEventTable.version {
-		return GlobalEventTable, nil, false
+	if table.Version <= self.version {
+		return nil, false
 	}
 
 	// If the new update is identical to the old queries we wont
 	// restart. This can happen e.g. if the server changes label
 	// groups and recaculates the table version but the actual
 	// queries dont end up changing.
-	if GlobalEventTable.equal(table.Event) {
+	if self.Equal(table.Event) {
 		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
 		logger.Info("Client event query update %v did not "+
 			"change queries, skipping", table.Version)
 
 		// Update the version only but keep queries the same.
-		GlobalEventTable.version = table.Version
-		return GlobalEventTable, nil, false
+		self.version = table.Version
+		return nil, false
 	}
 
-	// Close the old table.
-	if GlobalEventTable.Done != nil {
-		GlobalEventTable.Close()
+	// Close the old table and wait for it to finish.
+	self.close()
+
+	// Reset the event table and start from scratch.
+	self.Events = nil
+
+	// Make a copy of the events so we can own them.
+	for _, e := range table.Event {
+		self.Events = append(self.Events,
+			proto.Clone(e).(*actions_proto.VQLCollectorArgs))
 	}
 
-	// Reset the table.
-	GlobalEventTable.Events = table.Event
-	GlobalEventTable.version = table.Version
-	GlobalEventTable.Done = make(chan bool)
-	GlobalEventTable.config_obj = config_obj
-	GlobalEventTable.service_wg = &sync.WaitGroup{}
+	self.version = table.Version
+	self.wg = &sync.WaitGroup{}
+	self.Ctx, self.cancel = context.WithCancel(ctx)
 
-	return GlobalEventTable, nil, true /* changed */
+	return nil, true /* changed */
 }
 
-func NewEventTable(
-	config_obj *config_proto.Config,
-	responder *responder.Responder,
-	table *actions_proto.VQLEventTable) *EventTable {
-	result := &EventTable{
-		Events:     table.Event,
-		version:    table.Version,
-		Done:       make(chan bool),
-		config_obj: config_obj,
-	}
-
-	return result
-}
-
-type UpdateEventTable struct{}
-
-func (self UpdateEventTable) Run(
-	config_obj *config_proto.Config,
+// Make a copy of the event table and appand any config enforced
+// additional event queries.
+func (self *EventTable) GetEventQueries(
 	ctx context.Context,
-	responder *responder.Responder,
-	arg *actions_proto.VQLEventTable) {
+	config_obj *config_proto.Config) ([]*actions_proto.VQLCollectorArgs, error) {
 
-	// Make a new table.
-	table, err, changed := update(config_obj, responder, arg)
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	result := make([]*actions_proto.VQLCollectorArgs, 0, len(self.Events))
+	result = append(result, self.Events...)
+
+	if config_obj.Client == nil ||
+		len(config_obj.Client.AdditionalEventArtifacts) == 0 {
+		return result, nil
+	}
+
+	launcher, err := services.GetLauncher(config_obj)
 	if err != nil {
-		responder.RaiseError(ctx, fmt.Sprintf(
-			"Error updating global event table: %v", err))
-		return
+		return result, err
 	}
 
-	// No change required, skip it.
-	if !changed {
-		// We still need to write the new version
-		err = update_writeback(config_obj, arg)
-		if err != nil {
-			responder.RaiseError(ctx, fmt.Sprintf(
-				"Unable to write events to writeback: %v", err))
-		} else {
-			responder.Return(ctx)
-		}
-		return
+	manager, err := services.GetRepositoryManager(config_obj)
+	if err != nil {
+		return result, err
 	}
+	repository, err := manager.GetGlobalRepository(config_obj)
+	if err != nil {
+		return result, err
+	}
+
+	// Compile the built in artifacts
+	queries, err := launcher.CompileCollectorArgs(ctx, config_obj,
+		acl_managers.NullACLManager{}, repository,
+		services.CompilerOptions{}, &flows_proto.ArtifactCollectorArgs{
+			Artifacts: config_obj.Client.AdditionalEventArtifacts,
+		})
+
+	if err != nil {
+		return result, err
+	}
+
+	result = append(result, queries...)
+	return result, nil
+}
+
+func (self *EventTable) StartQueries(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	output_chan chan *crypto_proto.VeloMessage) {
 
 	logger := logging.GetLogger(config_obj, &logging.ClientComponent)
 
-	// Make a context for the VQL query.
-	new_ctx, cancel := context.WithCancel(context.Background())
-
-	// Cancel the context when the cancel channel is closed.
-	go func() {
-		mu.Lock()
-		done := table.Done
-		mu.Unlock()
-
-		<-done
-		logger.Info("UpdateEventTable: Closing all contexts")
-		cancel()
-	}()
+	events, err := self.GetEventQueries(ctx, config_obj)
+	if err != nil {
+		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
+		logger.Error("While appending initial event artifacts: %v", err)
+	}
 
 	// Start a new query for each event.
 	action_obj := &VQLClientAction{}
-	table.wg.Add(len(table.Events))
-	table.service_wg.Add(len(table.Events))
+	for _, event := range events {
 
-	for _, event := range table.Events {
-		query_responder := responder.Copy()
+		// Name of the query we are running. There must be at least
+		// one query with a name.
+		artifact_name := GetQueryName(event.Query)
+		if artifact_name == "" {
+			continue
+		}
 
+		logger.Info("<green>Starting</> monitoring query %s", artifact_name)
+		query_responder := responder.NewMonitoringResponder(
+			ctx, config_obj, self.monitoring_manager,
+			output_chan, artifact_name)
+
+		self.wg.Add(1)
 		go func(event *actions_proto.VQLCollectorArgs) {
-			defer table.wg.Done()
-			defer table.service_wg.Done()
-
-			// Name of the query we are running.
-			name := ""
-			for _, q := range event.Query {
-				if q.Name != "" {
-					name = q.Name
-				}
-			}
-
-			if name != "" {
-				logger.Info("<green>Starting</> monitoring query %s", name)
-			}
-			query_responder.Artifact = name
+			defer self.wg.Done()
 
 			// Event tables never time out
 			if event.Timeout == 0 {
@@ -252,52 +272,98 @@ func (self UpdateEventTable) Run(
 				event.Heartbeat = 300 // 5 minutes
 			}
 
+			// Start the query - if it is an event query this will
+			// never complete until it is cancelled.
 			action_obj.StartQuery(
-				config_obj, new_ctx, query_responder, event)
-			if name != "" {
-				logger.Info("Finished monitoring query %s", name)
+				config_obj, self.Ctx, query_responder, event)
+			if artifact_name != "" {
+				logger.Info("Finished monitoring query %s", artifact_name)
 			}
 		}(proto.Clone(event).(*actions_proto.VQLCollectorArgs))
 	}
+}
 
-	err = update_writeback(config_obj, arg)
+func (self *EventTable) StartFromWriteback(
+	ctx context.Context, wg *sync.WaitGroup,
+	config_obj *config_proto.Config,
+	output_chan chan *crypto_proto.VeloMessage) {
+
+	// Get the event table from the writeback if possible.
+	event_table := &actions_proto.VQLEventTable{}
+
+	writeback_service := writeback.GetWritebackService()
+	writeback, err := writeback_service.GetWriteback(config_obj)
+	if err == nil && writeback.EventQueries != nil {
+		event_table = writeback.EventQueries
+		self.UpdateEventTable(ctx, wg, config_obj, output_chan, event_table)
+	}
+}
+
+func (self *EventTable) UpdateEventTable(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	config_obj *config_proto.Config,
+	output_chan chan *crypto_proto.VeloMessage,
+	update_table *actions_proto.VQLEventTable) {
+
+	// Make a new table if needed.
+	err, changed := self.Update(
+		ctx, wg, config_obj, output_chan, update_table)
 	if err != nil {
-		responder.RaiseError(ctx, fmt.Sprintf(
-			"Unable to write events to writeback: %v", err))
+		responder.MakeErrorResponse(
+			output_chan, "F.Monitoring", fmt.Sprintf(
+				"Error updating global event table: %v", err))
 		return
 	}
 
-	responder.Return(ctx)
-}
+	writeback_service := writeback.GetWritebackService()
 
-func update_writeback(
-	config_obj *config_proto.Config,
-	event_table *actions_proto.VQLEventTable) error {
-
-	// Store the event table in the Writeback file.
-	config_copy := proto.Clone(config_obj).(*config_proto.Config)
-	event_copy := proto.Clone(event_table).(*actions_proto.VQLEventTable)
-	config_copy.Writeback.EventQueries = event_copy
-
-	return config.UpdateWriteback(config_copy)
-}
-
-func InitializeEventTable(ctx context.Context, service_wg *sync.WaitGroup) {
-	mu.Lock()
-	GlobalEventTable = &EventTable{
-		service_wg: service_wg,
-	}
-	mu.Unlock()
-
-	// When the context is finished, tear down the event table.
-	go func() {
-		<-ctx.Done()
-
-		mu.Lock()
-		if GlobalEventTable.Done != nil {
-			close(GlobalEventTable.Done)
+	// No change required, skip it.
+	if !changed {
+		// We still need to write the new version
+		err = writeback_service.MutateWriteback(config_obj,
+			func(wb *config_proto.Writeback) error {
+				wb.EventQueries = update_table
+				return writeback.WritebackUpdateLevel2
+			})
+		if err != nil {
+			responder.MakeErrorResponse(output_chan, "F.Monitoring",
+				fmt.Sprintf("Unable to write events to writeback: %v", err))
 		}
-		mu.Unlock()
-	}()
+		return
+	}
 
+	// Kick off the queries
+	self.StartQueries(ctx, config_obj, output_chan)
+
+	// Update the writeback
+	err = writeback_service.MutateWriteback(config_obj,
+		func(wb *config_proto.Writeback) error {
+			wb.EventQueries = update_table
+			return writeback.WritebackUpdateLevel2
+		})
+	if err != nil {
+		responder.MakeErrorResponse(output_chan, "F.Monitoring",
+			fmt.Sprintf("Unable to write events to writeback: %v", err))
+		return
+	}
+}
+
+func NewEventTable(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	config_obj *config_proto.Config) *EventTable {
+
+	sub_ctx, cancel := context.WithCancel(ctx)
+	self := &EventTable{
+		Ctx:    sub_ctx,
+		cancel: cancel,
+
+		// Used to wait for close()
+		wg:                 &sync.WaitGroup{},
+		config_obj:         config_obj,
+		monitoring_manager: responder.NewMonitoringManager(ctx),
+	}
+
+	return self
 }

@@ -11,14 +11,14 @@
 }
 
 .fill-parent.no-margins {
-    left: 0;
+    left: 5px;
     right: 0;
     top: 0;
     bottom: 0;
 }
 
 .fill-parent.toolbar-margin {
-    top: 48px !important;
+    top: 50px !important;
 }
 
 
@@ -30,12 +30,13 @@
     margin-bottom: 5px;
 }
 
-table  tr.row_selected td,
-table  tr.row-selected {
-    background-color: var(--color-table-row-selected) !important;
+.table tbody tr.row_selected td,
+.table tbody tr.row-selected {
+    background-color: var(--color-table-row-selected);
+    color: var(--color-table-row-selected-text);
   }
 
-table  tr.highlighted td {
+.table tbody tr.highlighted td {
     background-color: var(--color-table-row-highlighted);
   }
 
@@ -44,7 +45,7 @@ table  tr.highlighted td {
     left: 23px; top: 5px; font-weight: bold;
     font-size: 18px;
     -webkit-text-stroke: 1px #000;
-    color: #fff;
+    color: var(--color-foreground);
 }
 
 
@@ -54,6 +55,9 @@ table  tr.highlighted td {
 
 .file-hints {
     position: absolute;
+    min-height: 24px;
+    min-width: 32px;
+    cursor: context-menu;
 }
 
 .file-hints .hint-icon {
@@ -62,9 +66,17 @@ table  tr.highlighted td {
 }
 
 td.download-column {
-    display: block;
+    display: table-cell;
     border-bottom: none;
     border-right: none;
     border-left: none;
     width: 45px;
+}
+
+.vfs-toolbar {
+    padding-right: 10px;
+}
+
+.min-width {
+    min-width: 10em;
 }

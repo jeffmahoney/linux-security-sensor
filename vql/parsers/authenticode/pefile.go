@@ -4,12 +4,39 @@ package authenticode
 
 import (
 	"fmt"
+	"runtime"
+	"sync"
 	"unsafe"
 
+	"www.velocidex.com/golang/velociraptor/constants"
+	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	windows "www.velocidex.com/golang/velociraptor/vql/windows"
+	"www.velocidex.com/golang/vfilter"
 )
 
-func VerifyFileSignature(normalized_path string) string {
+var (
+	mu sync.Mutex
+)
+
+func VerifyFileSignature(
+	scope vfilter.Scope,
+	normalized_path string) string {
+
+	if vql_subsystem.GetBoolFromRow(scope, scope,
+		constants.DISABLE_DANGEROUS_API_CALLS) {
+		return "Unknown"
+	}
+
+	// This API function can not run on multiple threads
+	// safely. Restrict to running on a single thread at the time. See
+	// #2574
+	mu.Lock()
+	defer mu.Unlock()
+
+	// Try to lock to OS thread to ensure safer API call
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
 	err := windows.HasWintrustDll()
 	if err != nil {
 		return fmt.Sprintf("untrusted (%v)", err)
@@ -41,15 +68,17 @@ func VerifyFileSignature(normalized_path string) string {
 		windows.INVALID_HANDLE_VALUE,
 		&WINTRUST_ACTION_GENERIC_VERIFY_V2,
 		trustData)
-	if err != nil {
-		return fmt.Sprintf("untrusted (%v)", err)
-	}
 
 	// Any hWVTStateData must be released by a call with close.
+	// Close the handle regardless of err above.
 	trustData.DwStateAction = windows.WTD_STATEACTION_CLOSE
 
 	windows.WinVerifyTrust(windows.INVALID_HANDLE_VALUE,
-		&DRIVER_ACTION_VERIFY, trustData)
+		&WINTRUST_ACTION_GENERIC_VERIFY_V2, trustData)
+
+	if err != nil {
+		return fmt.Sprintf("untrusted (%v)", err)
+	}
 
 	return WinVerifyTrustErrors(ret)
 }

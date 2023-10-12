@@ -6,6 +6,9 @@ parameters:
     default: /etc/crontab,/etc/cron.d/**,/var/at/tabs/**,/var/spool/cron/**,/var/spool/cron/crontabs/**
   - name: cronTabScripts
     default: /etc/cron.daily/*,/etc/cron.hourly/*,/etc/cron.monthly/*,/etc/cron.weekly/*
+  - name: Length
+    default: 10000
+    type: int
 
 precondition: SELECT OS From info() where OS = 'linux'
 
@@ -14,10 +17,10 @@ sources:
     query: |
       LET raw = SELECT * FROM foreach(
           row={
-            SELECT FullPath from glob(globs=split(string=cronTabGlob, sep=","))
+            SELECT OSPath from glob(globs=split(string=cronTabGlob, sep=","))
           },
           query={
-            SELECT FullPath, data, parse_string_with_regex(
+            SELECT OSPath, data, parse_string_with_regex(
               string=data,
               regex=[
                  /* Regex for event (Starts with @) */
@@ -34,7 +37,7 @@ sources:
 
             /* Read lines from the file and filter ones that start with "#" */
             FROM split_records(
-               filenames=FullPath,
+               filenames=OSPath,
                regex="\n", columns=["data"]) WHERE not data =~ "^\\s*#"
             }) WHERE Record.Command
 
@@ -46,10 +49,13 @@ sources:
                Record.Month AS Month,
                Record.DayOfWeek AS DayOfWeek,
                Record.Command AS Command,
-               FullPath AS Path
+               OSPath AS Path
       FROM raw
-
+  - name: CronScripts
+    query: |
+      SELECT Mtime, OSPath, read_file(filename=OSPath,length=Length) AS Content
+      FROM glob(globs=split(string=cronTabScripts, sep=","))
   - name: Uploaded
     query: |
-      SELECT FullPath, upload(filename=FullPath) AS Upload
+      SELECT OSPath, upload(file=OSPath) AS Upload
       FROM glob(globs=split(string=cronTabGlob + "," + cronTabScripts, sep=","))

@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -178,4 +178,19 @@ func SetGlobalDatastore(
 
 	g_impl, err = getImpl(config_obj, implementation)
 	return err
+}
+
+// Override the datastore implementation
+func OverrideDatastoreImplementation(impl DataStore) {
+	ds_mu.Lock()
+	defer ds_mu.Unlock()
+
+	g_impl = impl
+}
+
+func Reset() {
+	ds_mu.Lock()
+	defer ds_mu.Unlock()
+
+	g_impl = nil
 }

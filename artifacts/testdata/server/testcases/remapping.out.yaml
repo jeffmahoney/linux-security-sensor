@@ -1,0 +1,263 @@
+LET _ <= remap(config=format(format=RemappingTemplate, args=[ srcDir+'/artifacts/testdata/files/', srcDir+'/artifacts/testdata/files/test.ntfs.dd', srcDir+'/artifacts/testdata/files/test.ntfs.dd', srcDir+'/artifacts/testdata/files/test.ntfs.dd', srcDir+'/artifacts/testdata/files/UsrClass.dat' ]), clear=TRUE)[]SELECT Hostname, Fqdn, OS, expand(path="%SystemRoot%\\System32") FROM info()[
+ {
+  "Hostname": "Virtual Host",
+  "Fqdn": "Virtual Host",
+  "OS": "windows",
+  "expand(path=\"%SystemRoot%\\\\System32\")": "D:\\Windows\\System32"
+ }
+]SELECT OSPath FROM glob(globs="*", accessor='ntfs') ORDER BY OSPath[
+ {
+  "OSPath": "\\\\.\\C:"
+ }
+]SELECT OSPath FROM glob(globs="*", accessor='file') ORDER BY OSPath[
+ {
+  "OSPath": "D:"
+ },
+ {
+  "OSPath": "E:"
+ }
+]SELECT OSPath FROM glob(globs="C:/Folder *", accessor='ntfs') ORDER BY OSPath[
+ {
+  "OSPath": "\\\\.\\C:\\Folder A"
+ }
+]SELECT OSPath FROM glob(globs="D:/Folder *", accessor='file') ORDER BY OSPath[
+ {
+  "OSPath": "D:\\Folder A"
+ }
+]SELECT * FROM parse_mft(filename="C:/$MFT", accessor="ntfs") WHERE OSPath =~ 'Hello world' ORDER BY OSPath[
+ {
+  "EntryNumber": 46,
+  "OSPath": "Folder A\\Folder B\\Hello world text document.txt",
+  "SequenceNumber": 1,
+  "InUse": true,
+  "ParentEntryNumber": 45,
+  "ParentSequenceNumber": 1,
+  "FileName": "Hello world text document.txt",
+  "FileNames": [
+   "Hello world text document.txt"
+  ],
+  "Links": [
+   "Folder A\\Folder B\\Hello world text document.txt"
+  ],
+  "FileNameTypes": "POSIX",
+  "FileSize": 12,
+  "ReferenceCount": 1,
+  "IsDir": false,
+  "HasADS": true,
+  "SI_Lt_FN": false,
+  "uSecZeros": false,
+  "Copied": false,
+  "SIFlags": "2080 (ARCHIVE,COMPRESSED)",
+  "Created0x10": "2018-09-24T07:55:29.7664719Z",
+  "Created0x30": "2018-09-24T07:55:29.7664719Z",
+  "LastModified0x10": "2018-09-24T07:56:35.3135567Z",
+  "LastModified0x30": "2018-09-24T07:55:29.7664719Z",
+  "LastRecordChange0x10": "2018-09-24T07:56:35.3135567Z",
+  "LastRecordChange0x30": "2018-09-24T07:55:29.7664719Z",
+  "LastAccess0x10": "2018-09-24T07:56:35.3135567Z",
+  "LastAccess0x30": "2018-09-24T07:55:29.7664719Z",
+  "LogFileSeqNum": 1096672
+ },
+ {
+  "EntryNumber": 46,
+  "OSPath": "Folder A\\Folder B\\Hello world text document.txt:goodbye.txt",
+  "SequenceNumber": 1,
+  "InUse": true,
+  "ParentEntryNumber": 45,
+  "ParentSequenceNumber": 1,
+  "FileName": "Hello world text document.txt:goodbye.txt",
+  "FileNames": [
+   "Hello world text document.txt:goodbye.txt"
+  ],
+  "Links": [
+   "Folder A\\Folder B\\Hello world text document.txt"
+  ],
+  "FileNameTypes": "POSIX",
+  "FileSize": 64,
+  "ReferenceCount": 1,
+  "IsDir": false,
+  "HasADS": true,
+  "SI_Lt_FN": false,
+  "uSecZeros": false,
+  "Copied": false,
+  "SIFlags": "2080 (ARCHIVE,COMPRESSED)",
+  "Created0x10": "2018-09-24T07:55:29.7664719Z",
+  "Created0x30": "2018-09-24T07:55:29.7664719Z",
+  "LastModified0x10": "2018-09-24T07:56:35.3135567Z",
+  "LastModified0x30": "2018-09-24T07:55:29.7664719Z",
+  "LastRecordChange0x10": "2018-09-24T07:56:35.3135567Z",
+  "LastRecordChange0x30": "2018-09-24T07:55:29.7664719Z",
+  "LastAccess0x10": "2018-09-24T07:56:35.3135567Z",
+  "LastAccess0x30": "2018-09-24T07:55:29.7664719Z",
+  "LogFileSeqNum": 1096672
+ }
+]SELECT parse_ntfs(device="C:/$MFT", inode="46-128-0", accessor="ntfs") FROM scope()[
+ {
+  "parse_ntfs(device=\"C:/$MFT\", inode=\"46-128-0\", accessor=\"ntfs\")": {
+   "FullPath": "/Folder A/Folder B/Hello world text document.txt",
+   "MFTID": 46,
+   "SequenceNumber": 1,
+   "Size": 12,
+   "Allocated": true,
+   "IsDir": false,
+   "SI_Times": {
+    "CreateTime": "2018-09-24T07:55:29.7664719Z",
+    "FileModifiedTime": "2018-09-24T07:56:35.3135567Z",
+    "MFTModifiedTime": "2018-09-24T07:56:35.3135567Z",
+    "AccessedTime": "2018-09-24T07:56:35.3135567Z"
+   },
+   "Filenames": [
+    {
+     "Times": {
+      "CreateTime": "2018-09-24T07:55:29.7664719Z",
+      "FileModifiedTime": "2018-09-24T07:55:29.7664719Z",
+      "MFTModifiedTime": "2018-09-24T07:55:29.7664719Z",
+      "AccessedTime": "2018-09-24T07:55:29.7664719Z"
+     },
+     "Type": "POSIX",
+     "Name": "Hello world text document.txt",
+     "ParentEntryNumber": 45,
+     "ParentSequenceNumber": 1
+    }
+   ],
+   "Attributes": [
+    {
+     "Type": "$STANDARD_INFORMATION",
+     "TypeId": 16,
+     "Id": 0,
+     "Inode": "46-16-0",
+     "Size": 72,
+     "Name": ""
+    },
+    {
+     "Type": "$FILE_NAME",
+     "TypeId": 48,
+     "Id": 3,
+     "Inode": "46-48-3",
+     "Size": 124,
+     "Name": ""
+    },
+    {
+     "Type": "$OBJECT_ID",
+     "TypeId": 64,
+     "Id": 4,
+     "Inode": "46-64-4",
+     "Size": 16,
+     "Name": ""
+    },
+    {
+     "Type": "$DATA",
+     "TypeId": 128,
+     "Id": 1,
+     "Inode": "46-128-1",
+     "Size": 12,
+     "Name": ""
+    },
+    {
+     "Type": "$DATA",
+     "TypeId": 128,
+     "Id": 5,
+     "Inode": "46-128-5",
+     "Size": 20,
+     "Name": "goodbye.txt"
+    }
+   ],
+   "Hardlinks": [
+    "Folder A\\Folder B\\Hello world text document.txt"
+   ],
+   "Device": "\\\\.\\C:",
+   "OSPath": "\\\\.\\C:\\Folder A\\Folder B\\Hello world text document.txt"
+  }
+ }
+]SELECT * FROM parse_ntfs_i30( accessor='ntfs', device='c:/$MFT', inode="41-144-1")[
+ {
+  "MFTId": "45",
+  "SequenceNumber": 0,
+  "Mtime": "2018-09-24T07:55:44.4592119Z",
+  "Atime": "2022-03-18T04:09:07.2885951Z",
+  "Ctime": "2018-09-24T07:55:20.6489276Z",
+  "Btime": "2018-09-24T07:55:44.4592119Z",
+  "FNBtime": "0001-01-01T00:00:00Z",
+  "FNMtime": "0001-01-01T00:00:00Z",
+  "Name": "Folder B",
+  "NameType": "POSIX",
+  "ExtraNames": null,
+  "IsDir": false,
+  "Size": 0,
+  "AllocatedSize": 0,
+  "IsSlack": false,
+  "SlackOffset": 0
+ }
+]SELECT * FROM parse_ntfs_ranges(accessor='ntfs', device='c:/$MFT', inode="46-128-5")[
+ {
+  "Offset": 0,
+  "Length": 20,
+  "IsSparse": false
+ }
+]SELECT OSPath FROM glob(accessor='registry', globs="/HKLM/*/xbox*")[
+ {
+  "OSPath": "HKEY_LOCAL_MACHINE\\Classes\\xbox"
+ },
+ {
+  "OSPath": "HKEY_LOCAL_MACHINE\\Classes\\xbox-captures"
+ },
+ {
+  "OSPath": "HKEY_LOCAL_MACHINE\\Classes\\xbox-friendfinder"
+ },
+ {
+  "OSPath": "HKEY_LOCAL_MACHINE\\Classes\\xbox-gamehub"
+ },
+ {
+  "OSPath": "HKEY_LOCAL_MACHINE\\Classes\\xbox-lfg"
+ },
+ {
+  "OSPath": "HKEY_LOCAL_MACHINE\\Classes\\xbox-network"
+ },
+ {
+  "OSPath": "HKEY_LOCAL_MACHINE\\Classes\\xbox-profile"
+ },
+ {
+  "OSPath": "HKEY_LOCAL_MACHINE\\Classes\\xbox-settings"
+ },
+ {
+  "OSPath": "HKEY_LOCAL_MACHINE\\Classes\\xbox-store"
+ },
+ {
+  "OSPath": "HKEY_LOCAL_MACHINE\\Classes\\xbox-tcui"
+ },
+ {
+  "OSPath": "HKEY_LOCAL_MACHINE\\Classes\\xboxgames"
+ }
+]SELECT read_file(filename="hello world", accessor="data") FROM scope()[
+ {
+  "read_file(filename=\"hello world\", accessor=\"data\")": "hello world"
+ }
+]SELECT read_file(filename="C:/46", accessor="mft", length=10) FROM scope()[
+ {
+  "read_file(filename=\"C:/46\", accessor=\"mft\", length=10)": "Hello worl"
+ }
+]SELECT OSPath FROM glob(accessor="file", globs="E:/ntuser.dat")[
+ {
+  "OSPath": "E:\\ntuser.dat"
+ }
+]SELECT OSPath FROM glob(accessor="raw_reg", globs="/Environ*/*", root=pathspec( DelegateAccessor="file", DelegatePath="E:\\ntuser.dat"))[
+ {
+  "OSPath": "{\"DelegateAccessor\":\"file\",\"DelegatePath\":\"E:\\\\ntuser.dat\",\"Path\":\"\\\\Environment\\\\TEMP\"}"
+ },
+ {
+  "OSPath": "{\"DelegateAccessor\":\"file\",\"DelegatePath\":\"E:\\\\ntuser.dat\",\"Path\":\"\\\\Environment\\\\TMP\"}"
+ }
+]SELECT OSPath, read_file(filename=OSPath, accessor="zip", length=10) FROM glob(accessor="zip", globs="/*", root=pathspec( DelegateAccessor="file", DelegatePath="E:\\hello.zip")) LIMIT 2[
+ {
+  "OSPath": "{\"DelegateAccessor\":\"file\",\"DelegatePath\":\"E:\\\\hello.zip\",\"Path\":\"/hello.txt\"}",
+  "read_file(filename=OSPath, accessor=\"zip\", length=10)": "hello\n"
+ },
+ {
+  "OSPath": "{\"DelegateAccessor\":\"file\",\"DelegatePath\":\"E:\\\\hello.zip\",\"Path\":\"/hello1.txt\"}",
+  "read_file(filename=OSPath, accessor=\"zip\", length=10)": "hello1\n"
+ }
+]SELECT * FROM disabled_plugin()[]SELECT disabled_function() FROM scope()[
+ {
+  "disabled_function()": null
+ }
+]

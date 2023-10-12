@@ -8,6 +8,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/timelines"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/functions"
 	"www.velocidex.com/golang/vfilter"
@@ -83,7 +84,11 @@ func (self TimelinePlugin) Call(
 		}
 
 		for item := range reader.Read(ctx) {
-			output_chan <- item.Row.Set("_ts", item.Time)
+			select {
+			case <-ctx.Done():
+				return
+			case output_chan <- item.Row.Set("_ts", item.Time):
+			}
 		}
 	}()
 
@@ -92,9 +97,10 @@ func (self TimelinePlugin) Call(
 
 func (self TimelinePlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "timeline",
-		Doc:     "Read a timeline. You can create a timeline with the timeline_add() function",
-		ArgType: type_map.AddType(scope, &TimelinePluginArgs{}),
+		Name:     "timeline",
+		Doc:      "Read a timeline. You can create a timeline with the timeline_add() function",
+		ArgType:  type_map.AddType(scope, &TimelinePluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 

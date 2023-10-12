@@ -2,10 +2,10 @@ name: MacOS.Applications.MRU
 description: |
    Parse the MRU from MacOS users
 
-   ### references
-   * https://mac-alias.readthedocs.io/en/latest/bookmark_fmt.html
-   * https://github.com/al45tair/mac_alias
-   * https://www.mac4n6.com/blog/2016/7/10/new-script-macmru-most-recently-used-plist-parser
+reference:
+  - https://mac-alias.readthedocs.io/en/latest/bookmark_fmt.html
+  - https://github.com/al45tair/mac_alias
+  - https://www.mac4n6.com/blog/2016/7/10/new-script-macmru-most-recently-used-plist-parser
 
 type: CLIENT
 
@@ -149,14 +149,14 @@ sources:
   - query: |
         -- Parse the Plist file
         SELECT * FROM foreach(row={
-          SELECT FullPath FROM glob(globs=FinderPlistPath)
+          SELECT OSPath FROM glob(globs=FinderPlistPath)
         }, query={
           SELECT * FROM foreach(row={
-            SELECT FXRecentFolders FROM plist(file=FullPath)
+            SELECT FXRecentFolders FROM plist(file=OSPath)
           }, query={
             SELECT *
             FROM foreach(row=FXRecentFolders, query={
-               SELECT *, FullPath
+               SELECT *, OSPath
                FROM ParseBookmark(Bookmark=_value.`file-bookmark`)
             })
           })

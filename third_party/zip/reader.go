@@ -14,6 +14,8 @@ import (
 	"io"
 	"os"
 	"time"
+
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
@@ -40,6 +42,11 @@ type File struct {
 	zipr         io.ReaderAt
 	zipsize      int64
 	headerOffset int64
+}
+
+func (f *File) DebugString() string {
+	return fmt.Sprintf("ZipFile %v of reader %v", f.FileHeader.Name,
+		utils.DebugString(f.zipr))
 }
 
 func (f *File) hasDataDescriptor() bool {
@@ -102,6 +109,7 @@ func (z *Reader) init(r io.ReaderAt, size int64) error {
 	// the file count modulo 65536 is incorrect.
 	for {
 		f := &File{zip: z, zipr: r, zipsize: size}
+
 		err = readDirectoryHeader(f, buf, int64(startOfArchive))
 		if err == ErrFormat || err == io.ErrUnexpectedEOF {
 			break
@@ -163,12 +171,27 @@ func (f *File) Open() (io.ReadCloser, error) {
 		return nil, err
 	}
 	size := int64(f.CompressedSize64)
-	r := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, size)
+	var r io.Reader
+	er := io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset, size)
+	if f.IsEncrypted() {
+		if f.ae == 0 {
+			if r, err = ZipCryptoDecryptor(er, f.password()); err != nil {
+				return nil, err
+			}
+		} else if r, err = newDecryptionReader(er, f); err != nil {
+			return nil, err
+		}
+	} else {
+		r = er
+	}
 	dcomp := f.zip.decompressor(f.Method)
 	if dcomp == nil {
 		return nil, ErrAlgorithm
 	}
 	var rc io.ReadCloser = dcomp(r)
+	if f.isAE2() {
+		return rc, nil
+	}
 	var desr io.Reader
 	if f.hasDataDescriptor() {
 		desr = io.NewSectionReader(f.zipr, f.headerOffset+bodyOffset+size, dataDescriptorLen)
@@ -178,6 +201,7 @@ func (f *File) Open() (io.ReadCloser, error) {
 		hash: crc32.NewIEEE(),
 		f:    f,
 		desr: desr,
+		zipr: f.zipr,
 	}
 	return rc, nil
 }
@@ -189,6 +213,11 @@ type checksumReader struct {
 	f     *File
 	desr  io.Reader // if non-nil, where to read the data descriptor
 	err   error     // sticky error
+	zipr  io.ReaderAt
+}
+
+func (r *checksumReader) DebugString() string {
+	return fmt.Sprintf("checksumReader of %v", utils.DebugString(r.zipr))
 }
 
 func (r *checksumReader) Read(b []byte) (n int, err error) {
@@ -382,6 +411,14 @@ parseExtras:
 			}
 			ts := int64(fieldBuf.uint32()) // ModTime since Unix epoch
 			modified = time.Unix(ts, 0)
+		case winzipAesExtraID:
+			if len(fieldBuf) < 7 {
+				continue parseExtras
+			}
+			f.ae = fieldBuf.uint16()
+			_ = fieldBuf.uint16()
+			f.aesStrength = fieldBuf.uint8()
+			f.Method = fieldBuf.uint16()
 		}
 	}
 

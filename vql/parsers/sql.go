@@ -12,19 +12,26 @@ import (
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/lib/pq"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	utils "www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
+var (
+	notValidDatabase = errors.New("Not a valid database")
+)
+
 type SQLPluginArgs struct {
-	Driver     string      `vfilter:"required,field=driver, doc=sqlite, mysql,or postgres"`
-	ConnString string      `vfilter:"optional,field=connstring, doc=SQL Connection String"`
-	Filename   string      `vfilter:"optional,field=file, doc=Required if using sqlite driver"`
-	Accessor   string      `vfilter:"optional,field=accessor,doc=The accessor to use if using sqlite"`
-	Query      string      `vfilter:"required,field=query"`
-	Args       vfilter.Any `vfilter:"optional,field=args"`
+	Driver     string            `vfilter:"required,field=driver, doc=sqlite, mysql,or postgres"`
+	ConnString string            `vfilter:"optional,field=connstring, doc=SQL Connection String"`
+	Filename   *accessors.OSPath `vfilter:"optional,field=file, doc=Required if using sqlite driver"`
+	Accessor   string            `vfilter:"optional,field=accessor,doc=The accessor to use if using sqlite"`
+	Query      string            `vfilter:"required,field=query"`
+	Args       vfilter.Any       `vfilter:"optional,field=args"`
 }
 
 type SQLPlugin struct{}
@@ -113,6 +120,10 @@ func (self SQLPlugin) Call(
 			}
 
 			handle, err = GetHandleSqlite(ctx, arg, scope)
+			if err == notValidDatabase {
+				return
+			}
+
 			if err != nil {
 				scope.Log("sql: %s", err)
 				return
@@ -184,9 +195,10 @@ func (self SQLPlugin) Call(
 
 func (self SQLPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "sql",
-		Doc:     "Run queries against sqlite, mysql, and postgres databases",
-		ArgType: type_map.AddType(scope, &SQLPluginArgs{}),
+		Name:     "sql",
+		Doc:      "Run queries against sqlite, mysql, and postgres databases",
+		ArgType:  type_map.AddType(scope, &SQLPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

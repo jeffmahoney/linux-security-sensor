@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -22,11 +22,10 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
-
-	"github.com/pkg/errors"
 
 	grpcpool "github.com/Velocidex/grpc-go-pool"
 	"github.com/prometheus/client_golang/prometheus"
@@ -35,6 +34,7 @@ import (
 	"google.golang.org/grpc/credentials"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/constants"
 )
 
 var (
@@ -80,7 +80,7 @@ func getCreds(config_obj *config_proto.Config) (credentials.TransportCredentials
 			ca_certificate = config_obj.ApiConfig.CaCertificate
 			server_name = config_obj.ApiConfig.PinnedServerName
 			if server_name == "" {
-				server_name = "VelociraptorServer"
+				server_name = constants.PinnedServerName
 			}
 		}
 
@@ -231,7 +231,7 @@ func EnsureInit(
 	pool, err = grpcpool.NewWithContext(ctx,
 		factory, 1, max_size, time.Duration(max_wait)*time.Second)
 	if err != nil {
-		return errors.Errorf(
+		return fmt.Errorf(
 			"Unable to connect to gRPC server: %v: %v", address, err)
 	}
 	return nil

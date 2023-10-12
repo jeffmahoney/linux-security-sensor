@@ -15,11 +15,11 @@ import (
 	"github.com/sebdah/goldie"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
-	"www.velocidex.com/golang/velociraptor/acls"
 	acl_proto "www.velocidex.com/golang/velociraptor/acls/proto"
 	"www.velocidex.com/golang/velociraptor/actions"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
+	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/json"
@@ -27,30 +27,20 @@ import (
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/responder"
 	"www.velocidex.com/golang/velociraptor/services"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vtesting"
 	"www.velocidex.com/golang/vfilter"
 
 	// Load plugins (timestamp, parse_csv)
+	_ "www.velocidex.com/golang/velociraptor/accessors/data"
+	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	_ "www.velocidex.com/golang/velociraptor/vql/functions"
 	_ "www.velocidex.com/golang/velociraptor/vql/parsers/csv"
-
-	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
+	_ "www.velocidex.com/golang/velociraptor/vql/protocols"
 )
 
 type LauncherTestSuite struct {
 	test_utils.TestSuite
-}
-
-func (self *LauncherTestSuite) LoadArtifacts(artifact_definitions []string) services.Repository {
-	manager, _ := services.GetRepositoryManager()
-	repository := manager.NewRepository()
-
-	for _, definition := range artifact_definitions {
-		_, err := repository.LoadYaml(definition, true, true)
-		assert.NoError(self.T(), err)
-	}
-
-	return repository
 }
 
 // Tools allow Velociraptor to automatically manage external bundles
@@ -92,8 +82,8 @@ func (self *LauncherTestSuite) TestCompilingWithTools() {
 
 	// Update the tool to be downloaded from our test http instance.
 	tool_url := ts.URL + "/mytool.exe"
-	repository := self.LoadArtifacts([]string{
-		fmt.Sprintf(testArtifactWithTools, tool_url)})
+	repository := self.LoadArtifacts(
+		fmt.Sprintf(testArtifactWithTools, tool_url))
 
 	// The artifact compiler converts artifacts into a VQL request
 	// to be run by the clients.
@@ -105,14 +95,14 @@ func (self *LauncherTestSuite) TestCompilingWithTools() {
 		Timeout:      73,
 	}
 	ctx := context.Background()
-	acl_manager := vql_subsystem.NullACLManager{}
+	acl_manager := acl_managers.NullACLManager{}
 
 	// Simulate an error downloading the tool on demand - this
 	// prevents the VQL from being compiled, and therefore
 	// collection can not be scheduled. The server needs to
 	// download the file in order to calculate its hash - even
 	// though it is not serving it to clients.
-	launcher, err := services.GetLauncher()
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	compiled, err := launcher.CompileCollectorArgs(ctx, self.ConfigObj,
@@ -147,7 +137,10 @@ func (self *LauncherTestSuite) TestCompilingWithTools() {
 
 	// Now serve the tool from Velociraptor's public directory
 	// instead.
-	err = services.GetInventory().AddTool(
+	inventory_service, err := services.GetInventory(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	err = inventory_service.AddTool(ctx,
 		self.ConfigObj, &artifacts_proto.Tool{
 			Name: "Tool1",
 			// This will force Velociraptor to generate a stable
@@ -202,12 +195,12 @@ sources:
 }
 
 func (self *LauncherTestSuite) TestGetDependentArtifacts() {
-	repository := self.LoadArtifacts(DependentArtifacts)
+	repository := self.LoadArtifacts(DependentArtifacts...)
 
-	launcher, err := services.GetLauncher()
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	res, err := launcher.GetDependentArtifacts(self.ConfigObj,
+	res, err := launcher.GetDependentArtifacts(self.Ctx, self.ConfigObj,
 		repository, []string{"Test.Artifact.Deps2"})
 	assert.NoError(self.T(), err)
 
@@ -241,12 +234,12 @@ sources:
 `}
 
 func (self *LauncherTestSuite) TestGetDependentArtifactsWithImports() {
-	repository := self.LoadArtifacts(DependentArtifactsWithImports)
+	repository := self.LoadArtifacts(DependentArtifactsWithImports...)
 
-	launcher, err := services.GetLauncher()
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	res, err := launcher.GetDependentArtifacts(self.ConfigObj,
+	res, err := launcher.GetDependentArtifacts(self.Ctx, self.ConfigObj,
 		repository, []string{"Custom.CallArtifactWithImports"})
 	assert.NoError(self.T(), err)
 
@@ -261,7 +254,7 @@ func (self *LauncherTestSuite) TestGetDependentArtifactsWithImports() {
 		Artifacts: []string{"Custom.CallArtifactWithImports"},
 	}
 	ctx := context.Background()
-	acl_manager := vql_subsystem.NullACLManager{}
+	acl_manager := acl_managers.NullACLManager{}
 
 	// Compile the request.
 	compiled, err := launcher.CompileCollectorArgs(ctx, self.ConfigObj,
@@ -287,13 +280,13 @@ func (self *LauncherTestSuite) TestGetDependentArtifactsWithTool() {
 	defer ts.Close()
 
 	tool_url := ts.URL + "/mytool.exe"
-	repository := self.LoadArtifacts([]string{`
+	repository := self.LoadArtifacts(`
 name: Test.Artifact.DepsWithTool
 description: This is a test artifact dependency
 sources:
 - query: |
     SELECT * FROM Artifact.Test.Artifact.Tools()
-`, fmt.Sprintf(testArtifactWithTools, tool_url)})
+`, fmt.Sprintf(testArtifactWithTools, tool_url))
 
 	// The artifact compiler converts artifacts into a VQL request
 	// to be run by the clients.
@@ -305,10 +298,10 @@ sources:
 		Timeout:      73,
 	}
 	ctx := context.Background()
-	acl_manager := vql_subsystem.NullACLManager{}
+	acl_manager := acl_managers.NullACLManager{}
 
 	// Compile the request.
-	launcher, err := services.GetLauncher()
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	compiled, err := launcher.CompileCollectorArgs(ctx, self.ConfigObj,
@@ -352,7 +345,7 @@ func getParameterValue(params []*artifacts_proto.ArtifactParameter, key string) 
 }
 
 func (self *LauncherTestSuite) TestCompiling() {
-	repository := self.LoadArtifacts(DependentArtifacts)
+	repository := self.LoadArtifacts(DependentArtifacts...)
 
 	// The artifact compiler converts artifacts into a VQL request
 	// to be run by the clients.
@@ -374,9 +367,9 @@ func (self *LauncherTestSuite) TestCompiling() {
 		Timeout:      73,
 	}
 	ctx := context.Background()
-	acl_manager := vql_subsystem.NullACLManager{}
+	acl_manager := acl_managers.NullACLManager{}
 
-	launcher, err := services.GetLauncher()
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	compiled, err := launcher.CompileCollectorArgs(
@@ -426,7 +419,7 @@ sources:
 `}
 
 func (self *LauncherTestSuite) TestCompilingMultipleArtifacts() {
-	repository := self.LoadArtifacts(CompilingMultipleArtifacts)
+	repository := self.LoadArtifacts(CompilingMultipleArtifacts...)
 
 	// The artifact compiler converts artifacts into a VQL request
 	// to be run by the clients.
@@ -456,9 +449,9 @@ func (self *LauncherTestSuite) TestCompilingMultipleArtifacts() {
 		Timeout:      73,
 	}
 	ctx := context.Background()
-	acl_manager := vql_subsystem.NullACLManager{}
+	acl_manager := acl_managers.NullACLManager{}
 
-	launcher, err := services.GetLauncher()
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	compiled, err := launcher.CompileCollectorArgs(
@@ -497,7 +490,7 @@ sources:
      SELECT Bar FROM info()
 `}
 
-	repository := self.LoadArtifacts(definitions)
+	repository := self.LoadArtifacts(definitions...)
 
 	// The artifact compiler converts artifacts into a VQL request
 	// to be run by the clients.
@@ -516,9 +509,9 @@ sources:
 	}
 
 	ctx := context.Background()
-	acl_manager := vql_subsystem.NullACLManager{}
+	acl_manager := acl_managers.NullACLManager{}
 
-	launcher, err := services.GetLauncher()
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	compiled, err := launcher.CompileCollectorArgs(
@@ -535,7 +528,7 @@ sources:
 }
 
 func (self *LauncherTestSuite) TestCompilingObfuscation() {
-	repository := self.LoadArtifacts(CompilingMultipleArtifacts)
+	repository := self.LoadArtifacts(CompilingMultipleArtifacts...)
 	self.ConfigObj.Frontend.DoNotCompressArtifacts = true
 
 	// The artifact compiler converts artifacts into a VQL request
@@ -546,20 +539,22 @@ func (self *LauncherTestSuite) TestCompilingObfuscation() {
 		Artifacts: []string{"Test.Artifact"},
 	}
 	ctx := context.Background()
-	acl_manager := vql_subsystem.NullACLManager{}
+	acl_manager := acl_managers.NullACLManager{}
 
-	launcher, err := services.GetLauncher()
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	compiled, err := launcher.CompileCollectorArgs(
 		ctx, self.ConfigObj, acl_manager, repository,
-		services.CompilerOptions{}, request)
+		services.CompilerOptions{
+			ObfuscateNames: false,
+		}, request)
 	assert.NoError(self.T(), err)
-	assert.Equal(self.T(), compiled[0].Query[1].Description, "")
+	assert.Equal(self.T(), compiled[0].Query[1].Name, "Test.Artifact")
 }
 
 func (self *LauncherTestSuite) TestCompilingPermissions() {
-	repository := self.LoadArtifacts([]string{`
+	repository := self.LoadArtifacts(`
 name: Test.Artifact.Permissions
 required_permissions:
 - EXECVE
@@ -567,7 +562,7 @@ required_permissions:
 sources:
 - query:  |
     SELECT * FROM info()
-`})
+`)
 
 	// The artifact compiler converts artifacts into a VQL request
 	// to be run by the clients.
@@ -580,10 +575,10 @@ sources:
 	}
 	ctx := context.Background()
 
-	acl_manager := vql_subsystem.NewServerACLManager(self.ConfigObj, "UserX")
+	acl_manager := acl_managers.NewServerACLManager(self.ConfigObj, "UserX")
 
 	// Permission denied - the principal is not allowed to compile this artifact.
-	launcher, err := services.GetLauncher()
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	compiled, err := launcher.CompileCollectorArgs(
@@ -593,12 +588,12 @@ sources:
 	assert.Contains(self.T(), err.Error(), "EXECVE")
 
 	// Lets give the user some permissions.
-	err = acls.SetPolicy(self.ConfigObj, "UserX",
+	err = services.SetPolicy(self.ConfigObj, "UserX",
 		&acl_proto.ApiClientACL{Execve: true})
 	assert.NoError(self.T(), err)
 
 	// Should be fine now.
-	acl_manager = vql_subsystem.NewServerACLManager(self.ConfigObj, "UserX")
+	acl_manager = acl_managers.NewServerACLManager(self.ConfigObj, "UserX")
 	compiled, err = launcher.CompileCollectorArgs(
 		ctx, self.ConfigObj, acl_manager, repository,
 		services.CompilerOptions{}, request)
@@ -607,7 +602,7 @@ sources:
 }
 
 func (self *LauncherTestSuite) TestParameterTypes() {
-	repository := self.LoadArtifacts(testArtifactWithTypes)
+	repository := self.LoadArtifacts(testArtifactWithTypes...)
 
 	// The artifact compiler converts artifacts into a VQL request
 	// to be run by the clients.
@@ -640,22 +635,31 @@ func (self *LauncherTestSuite) TestParameterTypes() {
 	defer cancel()
 
 	// Compile the artifact request into VQL
-	acl_manager := vql_subsystem.NullACLManager{}
-	launcher, err := services.GetLauncher()
+	acl_manager := acl_managers.NullACLManager{}
+	launcher, err := services.GetLauncher(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
 	compiled, err := launcher.CompileCollectorArgs(
 		ctx, self.ConfigObj, acl_manager, repository,
 		services.CompilerOptions{}, request)
 	assert.NoError(self.T(), err)
 
 	// Now run the VQL and receive the rows back
-	test_responder := responder.TestResponder()
+	test_responder := responder.TestResponderWithFlowId(
+		self.ConfigObj, "F.TestParameterTypes")
 	for _, vql_request := range compiled {
 		actions.VQLClientAction{}.StartQuery(
 			self.ConfigObj, ctx, test_responder, vql_request)
 	}
 
-	results := getResponses(test_responder)
-	goldie.Assert(self.T(), "TestParameterTypes", json.MustMarshalIndent(results))
+	var messages []*crypto_proto.VeloMessage
+	vtesting.WaitUntil(time.Second, self.T(), func() bool {
+		messages = test_responder.Drain.Messages()
+		return len(messages) > 0
+	})
+
+	goldie.Assert(self.T(), "TestParameterTypes",
+		json.MustMarshalIndent(getResponses(messages)))
 }
 
 var (
@@ -750,7 +754,7 @@ sources:
 // Parsing of parameters only occurs at the launching artifact -
 // dependent artifacts receive proper typed objects.
 func (self *LauncherTestSuite) TestParameterTypesDeps() {
-	repository := self.LoadArtifacts(testArtifactWithTypes)
+	repository := self.LoadArtifacts(testArtifactWithTypes...)
 
 	// The artifact compiler converts artifacts into a VQL request
 	// to be run by the clients.
@@ -779,38 +783,48 @@ func (self *LauncherTestSuite) TestParameterTypesDeps() {
 	defer cancel()
 
 	// Compile the artifact request into VQL
-	acl_manager := vql_subsystem.NullACLManager{}
-	launcher, err := services.GetLauncher()
+	acl_manager := acl_managers.NullACLManager{}
+	launcher, err := services.GetLauncher(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
 	compiled, err := launcher.CompileCollectorArgs(
 		ctx, self.ConfigObj, acl_manager, repository,
 		services.CompilerOptions{}, request)
 	assert.NoError(self.T(), err)
 
 	// Now run the VQL and receive the rows back
-	test_responder := responder.TestResponder()
+	test_responder := responder.TestResponderWithFlowId(
+		self.ConfigObj, "F.TestParameterTypesDeps")
 	for _, vql_request := range compiled {
 		actions.VQLClientAction{}.StartQuery(
 			self.ConfigObj, ctx, test_responder, vql_request)
 	}
 
-	results := getResponses(test_responder)
-	goldie.Assert(self.T(), "TestParameterTypesDeps", json.MustMarshalIndent(results))
+	var messages []*ordereddict.Dict
+	vtesting.WaitUntil(time.Second, self.T(), func() bool {
+		messages = getResponses(test_responder.Drain.Messages())
+		return len(messages) > 0
+	})
+
+	goldie.Assert(self.T(), "TestParameterTypesDeps",
+		json.MustMarshalIndent(messages))
 }
 
 func (self *LauncherTestSuite) TestParameterTypesDepsQuery() {
-	repository := self.LoadArtifacts(testArtifactWithTypes)
+	repository := self.LoadArtifacts(testArtifactWithTypes...)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	builder := services.ScopeBuilder{
 		Config:     self.ConfigObj,
-		ACLManager: vql_subsystem.NullACLManager{},
+		ACLManager: acl_managers.NullACLManager{},
 		Repository: repository,
-		Logger:     logging.NewPlainLogger(self.ConfigObj, &logging.FrontendComponent),
-		Env:        ordereddict.NewDict(),
+		Logger: logging.NewPlainLogger(
+			self.ConfigObj, &logging.FrontendComponent),
+		Env: ordereddict.NewDict(),
 	}
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(self.ConfigObj)
 	assert.NoError(self.T(), err)
 	scope := manager.BuildScope(builder)
 	defer scope.Close()
@@ -847,7 +861,7 @@ func (self *LauncherTestSuite) TestParameterTypesDepsQuery() {
    request with multiple sources in the same request: Serial Mode
 */
 func (self *LauncherTestSuite) TestPreconditionTopLevel() {
-	repository := self.LoadArtifacts([]string{`
+	repository := self.LoadArtifacts(`
 name: Test.Artifact.Precondition
 precondition: |
    SELECT * FROM info() WHERE FALSE
@@ -858,7 +872,7 @@ sources:
 - name: Source2
   query: |
     SELECT 2 AS A FROM scope()
-`})
+`)
 	// The artifact compiler converts artifacts into a VQL request
 	// to be run by the clients.
 	request := &flows_proto.ArtifactCollectorArgs{
@@ -870,8 +884,8 @@ sources:
 	defer cancel()
 
 	// Compile the artifact request into VQL
-	acl_manager := vql_subsystem.NullACLManager{}
-	launcher, err := services.GetLauncher()
+	acl_manager := acl_managers.NullACLManager{}
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	compiled, err := launcher.CompileCollectorArgs(
@@ -898,7 +912,7 @@ sources:
    in parallel mode.
 */
 func (self *LauncherTestSuite) TestPreconditionSourceLevel() {
-	repository := self.LoadArtifacts([]string{`
+	repository := self.LoadArtifacts(`
 name: Test.Artifact.Precondition
 sources:
 - name: Source1
@@ -909,7 +923,7 @@ sources:
      SELECT * FROM info() WHERE FALSE
   query: |
     SELECT 2 AS A FROM scope()
-`})
+`)
 	// The artifact compiler converts artifacts into a VQL request
 	// to be run by the clients.
 	request := &flows_proto.ArtifactCollectorArgs{
@@ -919,8 +933,8 @@ sources:
 	defer cancel()
 
 	// Compile the artifact request into VQL
-	acl_manager := vql_subsystem.NullACLManager{}
-	launcher, err := services.GetLauncher()
+	acl_manager := acl_managers.NullACLManager{}
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	compiled, err := launcher.CompileCollectorArgs(
@@ -945,7 +959,7 @@ sources:
 
 // Preconditions called recursively
 func (self *LauncherTestSuite) TestPreconditionRecursive() {
-	repository := self.LoadArtifacts([]string{`
+	repository := self.LoadArtifacts(`
 name: Test.Artifact.Precondition
 sources:
 - query: |
@@ -962,7 +976,7 @@ sources:
      SELECT * FROM info() WHERE TRUE
   query: |
     SELECT "B" AS Col FROM scope()
-`})
+`)
 
 	// The artifact compiler converts artifacts into a VQL request
 	// to be run by the clients.
@@ -973,8 +987,8 @@ sources:
 	defer cancel()
 
 	// Compile the artifact request into VQL
-	acl_manager := vql_subsystem.NullACLManager{}
-	launcher, err := services.GetLauncher()
+	acl_manager := acl_managers.NullACLManager{}
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	compiled, err := launcher.CompileCollectorArgs(
@@ -1036,11 +1050,15 @@ sources:
     SELECT 1 FORM
 `}
 
-	manager, _ := services.GetRepositoryManager()
+	manager, _ := services.GetRepositoryManager(self.ConfigObj)
 	repository := manager.NewRepository()
 
 	for _, definition := range artifact_definitions {
-		_, err := repository.LoadYaml(definition, true /* validate */, true)
+		_, err := repository.LoadYaml(definition,
+			services.ArtifactOptions{
+				ValidateArtifact:  true,
+				ArtifactIsBuiltIn: true})
+
 		assert.Error(self.T(), err, "Failed to reject "+definition)
 	}
 
@@ -1064,11 +1082,15 @@ sources:
     SELECT * FROM scope()
 `}
 
-	manager, _ := services.GetRepositoryManager()
+	manager, _ := services.GetRepositoryManager(self.ConfigObj)
 	repository := manager.NewRepository()
 
 	for _, definition := range artifact_definitions {
-		_, err := repository.LoadYaml(definition, true /* validate */, true)
+		_, err := repository.LoadYaml(definition,
+			services.ArtifactOptions{
+				ValidateArtifact:  true,
+				ArtifactIsBuiltIn: true})
+
 		assert.NoError(self.T(), err)
 	}
 
@@ -1082,8 +1104,8 @@ sources:
 	defer cancel()
 
 	// Compile the artifact request into VQL
-	acl_manager := vql_subsystem.NullACLManager{}
-	launcher, err := services.GetLauncher()
+	acl_manager := acl_managers.NullACLManager{}
+	launcher, err := services.GetLauncher(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	// No timeout specified in the request causes the timeout to
@@ -1120,6 +1142,96 @@ sources:
 
 	// Specifying MaxRows in the request overrides the setting.
 	assert.Equal(self.T(), request.MaxRows, uint64(100))
+}
+
+func (self *LauncherTestSuite) TestMaxWait() {
+	artifact_definitions := []string{`
+name: Test.Artifact.MaxWait
+resources:
+  max_batch_wait: 22
+  max_batch_rows: 555
+
+type: CLIENT_EVENT
+
+sources:
+- query: |
+    SELECT * FROM scope()
+`, `
+name: Test.Artifact.Default
+type: CLIENT_EVENT
+sources:
+- query: |
+    SELECT * FROM scope()
+`}
+
+	manager, _ := services.GetRepositoryManager(self.ConfigObj)
+	repository := manager.NewRepository()
+
+	for _, definition := range artifact_definitions {
+		_, err := repository.LoadYaml(definition,
+			services.ArtifactOptions{
+				ValidateArtifact:  true,
+				ArtifactIsBuiltIn: true})
+
+		assert.NoError(self.T(), err)
+	}
+
+	request := &flows_proto.ArtifactCollectorArgs{
+		Artifacts: []string{
+			"Test.Artifact.MaxWait",
+			"Test.Artifact.Default",
+		},
+		Specs: []*flows_proto.ArtifactSpec{
+			{
+				Artifact: "Test.Artifact.MaxWait",
+			},
+			{
+				Artifact: "Test.Artifact.Default",
+			},
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Compile the artifact request into VQL
+	acl_manager := acl_managers.NullACLManager{}
+	launcher, err := services.GetLauncher(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	// No timeout specified in the request causes the timeout to
+	// be set according to the artifact defaults.
+	compiled, err := launcher.CompileCollectorArgs(
+		ctx, self.ConfigObj, acl_manager, repository,
+		services.CompilerOptions{}, request)
+	assert.NoError(self.T(), err)
+
+	// This artifact default is specified as MaxBatchRows = 555
+	assert.Equal(self.T(), getReqName(compiled[0]), "Test.Artifact.MaxWait")
+	assert.Equal(self.T(), compiled[0].MaxRow, uint64(555))
+	assert.Equal(self.T(), compiled[0].MaxWait, uint64(22))
+
+	// This artifact is not specified so MaxBatchRows is the default
+	// 1000
+	assert.Equal(self.T(), getReqName(compiled[1]), "Test.Artifact.Default")
+	assert.Equal(self.T(), compiled[1].MaxRow, uint64(1000))
+
+	// Specifying MaxBatchRows in the spec will override the default
+	request.Specs[0].MaxBatchRows = 12
+	request.Specs[0].MaxBatchWait = 66
+
+	compiled, err = launcher.CompileCollectorArgs(
+		ctx, self.ConfigObj, acl_manager, repository,
+		services.CompilerOptions{}, request)
+	assert.NoError(self.T(), err)
+
+	// The spec defines the Test.Artifact.MaxWait should have MaxRow = 12
+	assert.Equal(self.T(), getReqName(compiled[0]), "Test.Artifact.MaxWait")
+	assert.Equal(self.T(), compiled[0].MaxRow, uint64(12))
+	assert.Equal(self.T(), compiled[0].MaxWait, uint64(66))
+
+	// Does not affect the Test.Artifact.Default request.
+	assert.Equal(self.T(), getReqName(compiled[1]), "Test.Artifact.Default")
+	assert.Equal(self.T(), compiled[1].MaxRow, uint64(1000))
 }
 
 func getReqName(in *actions_proto.VQLCollectorArgs) string {

@@ -1,6 +1,7 @@
 package http_comms
 
 import (
+	"context"
 	"io/ioutil"
 	"os"
 	"testing"
@@ -8,10 +9,11 @@ import (
 	"github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"google.golang.org/protobuf/proto"
+	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	"www.velocidex.com/golang/velociraptor/config"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
-	"www.velocidex.com/golang/velociraptor/executor"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/responder"
 )
 
 var (
@@ -27,17 +29,42 @@ func getTempFile(t *testing.T) string {
 	return fd.Name()
 }
 
-func createRB(t *testing.T, filename string) *FileBasedRingBuffer {
+func createRB(t *testing.T, filename string) (*FileBasedRingBuffer, *responder.FlowManager) {
 	config_obj := config.GetDefaultConfig()
 	config_obj.Client.LocalBuffer.FilenameLinux = filename
 	config_obj.Client.LocalBuffer.FilenameWindows = filename
 	config_obj.Client.LocalBuffer.FilenameDarwin = filename
 
 	null_logger, new_hook := test.NewNullLogger()
-	logger := &logging.LogContext{null_logger}
+	logger := &logging.LogContext{Logger: null_logger}
 	hook = new_hook
 
-	ring_buffer, err := NewFileBasedRingBuffer(config_obj, logger)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	flow_manager := responder.NewFlowManager(ctx, config_obj)
+
+	ring_buffer, err := NewFileBasedRingBuffer(ctx, config_obj, flow_manager, logger)
+	assert.NoError(t, err)
+
+	return ring_buffer, flow_manager
+}
+
+func openRB(t *testing.T, filename string,
+	flow_manager *responder.FlowManager) *FileBasedRingBuffer {
+	config_obj := config.GetDefaultConfig()
+	config_obj.Client.LocalBuffer.FilenameLinux = filename
+	config_obj.Client.LocalBuffer.FilenameWindows = filename
+	config_obj.Client.LocalBuffer.FilenameDarwin = filename
+
+	null_logger, new_hook := test.NewNullLogger()
+	logger := &logging.LogContext{Logger: null_logger}
+	hook = new_hook
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ring_buffer, err := OpenFileBasedRingBuffer(ctx, config_obj, flow_manager, logger)
 	assert.NoError(t, err)
 
 	return ring_buffer
@@ -50,9 +77,8 @@ func TestRingBuffer(t *testing.T) {
 
 	defer os.Remove(filename)
 
-	ring_buffer := createRB(t, filename)
+	ring_buffer, flow_manager := createRB(t, filename)
 	ring_buffer.Enqueue([]byte(test_string))
-	ring_buffer.Close()
 
 	st, err := os.Stat(filename)
 	assert.NoError(t, err)
@@ -65,7 +91,7 @@ func TestRingBuffer(t *testing.T) {
 		st.Size())
 
 	// Open and enqueue another message
-	ring_buffer = createRB(t, filename)
+	ring_buffer = openRB(t, filename, flow_manager)
 
 	// First message available.
 	assert.Equal(t, ring_buffer.header.AvailableBytes,
@@ -73,7 +99,6 @@ func TestRingBuffer(t *testing.T) {
 
 	// Enqueue another message.
 	ring_buffer.Enqueue([]byte(test_string2))
-	ring_buffer.Close()
 
 	// The file contains two messages.
 	st, err = os.Stat(filename)
@@ -87,7 +112,7 @@ func TestRingBuffer(t *testing.T) {
 		st.Size())
 
 	// Lease one message from the buffer.
-	ring_buffer = createRB(t, filename)
+	ring_buffer = openRB(t, filename, flow_manager)
 
 	// Two messages available.
 	assert.Equal(t, ring_buffer.header.AvailableBytes,
@@ -106,11 +131,9 @@ func TestRingBuffer(t *testing.T) {
 	assert.Equal(t, ring_buffer.header.LeasedBytes,
 		int64(len(test_string)))
 
-	ring_buffer.Close()
-
 	// Since we did not commit the last message - opening again
 	// will replay that same one.
-	ring_buffer = createRB(t, filename)
+	ring_buffer = openRB(t, filename, flow_manager)
 
 	// Two messages available.
 	assert.Equal(t, ring_buffer.header.AvailableBytes,
@@ -122,15 +145,12 @@ func TestRingBuffer(t *testing.T) {
 
 	// Commit the message this time and close the file.
 	ring_buffer.Commit()
-	ring_buffer.Close()
 
-	ring_buffer = createRB(t, filename)
+	ring_buffer = openRB(t, filename, flow_manager)
 
 	// Now only the second message is available.
 	assert.Equal(t, ring_buffer.header.AvailableBytes,
 		int64(len(test_string2)))
-
-	ring_buffer.Close()
 
 	// But the file contains both messages still.
 	st, err = os.Stat(filename)
@@ -143,7 +163,7 @@ func TestRingBuffer(t *testing.T) {
 			int64(len(test_string2)),
 		st.Size())
 
-	ring_buffer = createRB(t, filename)
+	ring_buffer = openRB(t, filename, flow_manager)
 
 	// Leasing the second message now
 	lease = ring_buffer.Lease(1)
@@ -177,8 +197,6 @@ func TestRingBuffer(t *testing.T) {
 	assert.Equal(t, ring_buffer.header.AvailableBytes, int64(0))
 	assert.Equal(t, ring_buffer.header.LeasedBytes, int64(0))
 
-	ring_buffer.Close()
-
 	st, err = os.Stat(filename)
 	assert.NoError(t, err)
 	assert.Equal(t, int64(FirstRecordOffset), st.Size())
@@ -194,9 +212,8 @@ func TestRingBufferCorruption(t *testing.T) {
 
 	defer os.Remove(filename)
 
-	ring_buffer := createRB(t, filename)
+	ring_buffer, flow_manager := createRB(t, filename)
 	ring_buffer.Enqueue([]byte(test_string))
-	ring_buffer.Close()
 
 	// Corrupt the file.
 	fd, err := os.OpenFile(filename, os.O_RDWR, 0700)
@@ -208,7 +225,7 @@ func TestRingBufferCorruption(t *testing.T) {
 	assert.Equal(t, n, 8)
 	fd.Close()
 
-	ring_buffer = createRB(t, filename)
+	ring_buffer = openRB(t, filename, flow_manager)
 
 	// Possible corruption detected - expected item of length 20 received 5.
 	lease := ring_buffer.Lease(1)
@@ -217,8 +234,6 @@ func TestRingBufferCorruption(t *testing.T) {
 	assert.Equal(t, checkLogMessage(hook,
 		"Possible corruption detected - expected item of length 20 received 5."), true)
 
-	ring_buffer.Close()
-
 	st, err := os.Stat(filename)
 	assert.NoError(t, err)
 	assert.Equal(t, int64(FirstRecordOffset), st.Size())
@@ -226,23 +241,22 @@ func TestRingBufferCorruption(t *testing.T) {
 	// Create a very short file.
 	os.Remove(filename)
 
-	fd, err = os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0700)
+	fd, err = os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0700)
 	assert.NoError(t, err)
 	n, err = fd.Write([]byte{20, 0, 0, 0, 0, 0, 0, 0})
 	assert.NoError(t, err)
 	assert.Equal(t, n, 8)
 	fd.Close()
 
-	ring_buffer = createRB(t, filename)
+	ring_buffer = openRB(t, filename, flow_manager)
 
-	assert.Equal(t, checkLogMessage(hook,
-		"Possible corruption detected: file too short."), true)
+	assert.Equal(t, true, checkLogMessage(hook,
+		"Possible corruption detected: file too short."))
 
 	assert.Equal(t, int64(FirstRecordOffset), ring_buffer.header.WritePointer)
-	ring_buffer.Close()
 
 	// Invalid header.
-	fd, err = os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0700)
+	fd, err = os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0700)
 	assert.NoError(t, err)
 	fd.Seek(0, 0)
 	n, err = fd.Write([]byte{20, 0, 0, 0, 0, 0, 0, 0})
@@ -250,14 +264,13 @@ func TestRingBufferCorruption(t *testing.T) {
 	assert.Equal(t, n, 8)
 	fd.Close()
 
-	ring_buffer = createRB(t, filename)
+	ring_buffer = openRB(t, filename, flow_manager)
 
 	assert.Equal(t, checkLogMessage(hook,
 		"Possible corruption detected: Invalid header length."), true)
 
 	assert.Equal(t, int64(FirstRecordOffset), ring_buffer.header.WritePointer)
 	ring_buffer.Enqueue([]byte(test_string))
-	ring_buffer.Close()
 
 	// Create a very large items length.
 	fd, err = os.OpenFile(filename, os.O_RDWR, 0700)
@@ -268,7 +281,7 @@ func TestRingBufferCorruption(t *testing.T) {
 	assert.Equal(t, n, 8)
 	fd.Close()
 
-	ring_buffer = createRB(t, filename)
+	ring_buffer = openRB(t, filename, flow_manager)
 
 	// Leasing the second message now
 	lease = ring_buffer.Lease(1)
@@ -278,7 +291,6 @@ func TestRingBufferCorruption(t *testing.T) {
 		"Possible corruption detected - item length is too large."), true)
 
 	assert.Equal(t, int64(FirstRecordOffset), ring_buffer.header.WritePointer)
-	ring_buffer.Close()
 }
 
 func checkLogMessage(hook *test.Hook, msg string) bool {
@@ -297,39 +309,85 @@ func TestRingBufferCancellation(t *testing.T) {
 	filename := getTempFile(t)
 	defer os.Remove(filename)
 
+	// Make SessionId unique for each test run
 	message_list := &crypto_proto.MessageList{
-		Job: []*crypto_proto.VeloMessage{{
-			SessionId: "F.1234",
-		}},
+		// Add some messages. We filter out large messages for
+		// cancelled flows to preserve bandwidth to the server, but
+		// FlowStats messgaes should still be allowed.
+		Job: []*crypto_proto.VeloMessage{
+			{
+				SessionId: "F.1234" + filename,
+				FileBuffer: &actions_proto.FileBuffer{
+					Data: []byte("FileBuffer"),
+				},
+			},
+			{
+				SessionId: "F.1234" + filename,
+				VQLResponse: &actions_proto.VQLResponse{
+					JSONLResponse: "VQLResponse",
+				},
+			},
+			{
+				SessionId: "F.1234" + filename,
+				FlowStats: &crypto_proto.FlowStats{
+					QueryStatus: []*crypto_proto.VeloStatus{{
+						Status:            crypto_proto.VeloStatus_GENERIC_ERROR,
+						NamesWithResponse: []string{"FlowStats"},
+					}},
+				},
+			},
+		},
 	}
 
 	serialized_message_list, err := proto.Marshal(message_list)
 	assert.NoError(t, err)
 
 	// Queue the message
-	ring_buffer := createRB(t, filename)
+	ring_buffer, flow_manager := createRB(t, filename)
 	ring_buffer.Enqueue([]byte(serialized_message_list))
-	ring_buffer.Close()
 
 	// Try to lease the message.
-	ring_buffer = createRB(t, filename)
+	ring_buffer = openRB(t, filename, flow_manager)
 	lease := ring_buffer.Lease(1)
 	assert.NotNil(t, lease)
+	ring_buffer.Commit()
 
-	assert.Equal(t, lease, serialized_message_list)
+	// Make sure all messages are delivered
+	assert.Equal(t, serialized_message_list, lease)
 
 	// Queue the message
 	ring_buffer.Enqueue([]byte(serialized_message_list))
-	ring_buffer.Close()
 
 	// Now cancel this flow ID.
-	executor.Canceller.Cancel(message_list.Job[0].SessionId)
+	ctx := context.Background()
+	flow_manager.Cancel(ctx, message_list.Job[0].SessionId)
 
 	// Try to lease the message.
-	ring_buffer = createRB(t, filename)
-	lease = ring_buffer.Lease(1)
+	ring_buffer = openRB(t, filename, flow_manager)
+	lease = ring_buffer.Lease(10)
 	assert.NotNil(t, lease)
+	ring_buffer.Commit()
 
-	// Should not lease the message any more since it is cancelled.
-	assert.Equal(t, lease, []byte{})
+	// Should deliver only the FlowStats messages
+	assert.Contains(t, string(lease), "FlowStats")
+	assert.NotContains(t, string(lease), "FileBuffer")
+	assert.NotContains(t, string(lease), "VQLResponse")
+
+	// Queue more messages for a different flow
+	for _, m := range message_list.Job {
+		m.SessionId += "X"
+	}
+	serialized_message_list, err = proto.Marshal(message_list)
+	assert.NoError(t, err)
+
+	// Queue more messages
+	ring_buffer.Enqueue([]byte(serialized_message_list))
+
+	// Read the new messages back out
+	lease = ring_buffer.Lease(10)
+	assert.NotNil(t, lease)
+	ring_buffer.Commit()
+
+	// Make sure all messages are delivered
+	assert.Equal(t, serialized_message_list, lease)
 }

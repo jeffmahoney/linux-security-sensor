@@ -20,7 +20,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/velociraptor/vql/server/flows"
 	"www.velocidex.com/golang/velociraptor/vtesting"
 )
@@ -84,13 +84,14 @@ func (self *FilestoreTestSuite) TestEnumerateFlow() {
 
 	// Write some filestore files
 	fd, _ := file_store_factory.WriteFile(flow_pm.GetUploadsFile(
-		"ntfs", `\\.\C:\Windows\notepad.exe`).Path())
+		"ntfs", `\\.\C:\Windows\notepad.exe`,
+		[]string{`\\.\C:`, "Windows", "notepad.exe"}).Path())
 	fd.Close()
 
-	manager, _ := services.GetRepositoryManager()
+	manager, _ := services.GetRepositoryManager(self.ConfigObj)
 	builder := services.ScopeBuilder{
 		Config:     self.ConfigObj,
-		ACLManager: vql_subsystem.NullACLManager{},
+		ACLManager: acl_managers.NullACLManager{},
 		Logger: logging.NewPlainLogger(self.ConfigObj,
 			&logging.FrontendComponent),
 		Env: ordereddict.NewDict(),

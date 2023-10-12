@@ -2,13 +2,17 @@ package directory
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/Velocidex/ordereddict"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
@@ -39,7 +43,8 @@ type Listener struct {
 
 	id uint64
 
-	name string
+	name    string
+	options api.QueueOptions
 
 	// The consumer interested in these events. The consumer may
 	// block arbitrarily.
@@ -190,6 +195,10 @@ func (self *Listener) Close() {
 	}
 }
 
+func (self *Listener) FileBufferSize() int64 {
+	return self.file_buffer.PendingSize()
+}
+
 func (self *Listener) Debug() *ordereddict.Dict {
 	self.mu.Lock()
 	defer self.mu.Unlock()
@@ -209,23 +218,34 @@ func (self *Listener) Debug() *ordereddict.Dict {
 func NewListener(
 	config_obj *config_proto.Config,
 	ctx context.Context, name string,
-	options QueueOptions) (*Listener, error) {
+	options api.QueueOptions) (*Listener, error) {
 
 	subctx, cancel := context.WithCancel(ctx)
 
 	self := &Listener{
-		id:     utils.GetId(),
-		name:   name,
-		output: make(chan *ordereddict.Dict),
-		ctx:    subctx,
-		cancel: cancel,
+		id:      utils.GetId(),
+		name:    name,
+		output:  make(chan *ordereddict.Dict),
+		ctx:     subctx,
+		cancel:  cancel,
+		options: options,
 	}
 
 	if options.DisableFileBuffering {
 		self.disable_file_buffering = 1
 
 	} else {
-		tmpfile, err := ioutil.TempFile("", "journal")
+		node_name := services.GetNodeName(config_obj.Frontend)
+		if services.IsMaster(config_obj) {
+			node_name = "master"
+		}
+		if options.OwnerName != "" {
+			node_name = options.OwnerName
+		}
+
+		base_name := fmt.Sprintf("journal_%s_%s_", name, node_name)
+		base_name = strings.Replace(base_name, "/", "...", -1)
+		tmpfile, err := ioutil.TempFile("", base_name)
 		if err != nil {
 			return nil, err
 		}
@@ -252,8 +272,13 @@ func NewListener(
 				// messages were enqueued.
 			case <-self._file_buffer_ready():
 				// Get some messages from the buffer file.
+				lease_size := self.options.FileBufferLeaseSize
+				if lease_size == 0 {
+					lease_size = 100
+				}
+
 				self.mu.Lock()
-				items := self.file_buffer.Lease(100)
+				items := self.file_buffer.Lease(lease_size)
 				if len(items) == 0 {
 					// Buffer file is empty - reset the trigger and
 					// signal to the Send() function that direct

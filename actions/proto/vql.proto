@@ -9,27 +9,29 @@ package proto;
 option go_package = "www.velocidex.com/golang/velociraptor/actions/proto";
 
 message VQLRequest {
-    // DEPRECATED: Will be populated for compatibility with older clients.
-    string Name = 2 [(sem_type) = {
-            description: "The name of this query. This should be descriptive to indicate what type of informaiton the query retrieves.",
-        }];
-    // DEPRECATED: Not used any more.
-    string Description = 3 [(sem_type) = {
-            description: "What this query is supposed to do.",
-        }];
-    string VQL = 1 [(sem_type) = {
-            description: "The VQL query to execute on the client.",
-        }];
+    // The obfuscated name of the artifact this query came from.
+    string Name = 2;
+
+    // The compiled VQL query to evaluate on the endpoint.
+    string VQL = 1;
 }
 
 message VQLEnv {
     string key = 1;
     string value = 2;
+    string comment = 3;
 }
 
 // This is the most common type of message - it specifies a query to
 // run on the endpoint.
 message VQLCollectorArgs {
+    // Number of this request compared to the entire collection.
+    int64 query_id = 32;
+    int64 total_queries = 33;
+
+    // If set we ignore any requests older than this.
+    uint64 expiry = 34;
+
     // If this is specified we run this query first and if it returns
     // any rows we continue with the real query.
     string precondition = 29;
@@ -54,15 +56,27 @@ message VQLCollectorArgs {
             default: "1000",
         }];
 
+    // If the row buffer size gets above this size we send the payload
+    // anyway. This is a fairer measure than max_rows of how large the
+    // payload is likely to be before compression because rows come in
+    // all different sizes. Default value is 5mb to match the typical
+    // max_upload_bytes
+    uint64 max_row_buffer_size = 37;
+
     uint64 max_wait = 6 [(sem_type) = {
             friendly_name: "Batch requests that take this long.",
             description: "For long queries we return partial results after this long. This is required for event listeners which never really complete.",
             default: "10",
         }];
 
-   float ops_per_second = 24 [(sem_type) = {
+    // This is deprecated in favor of the below limits.
+    float ops_per_second = 24 [(sem_type) = {
       description: "An Op is defined as some arbitrary unit of work. This allows work to be limited. Typically VQL plugins will count ops towards the query as appropriate."
     }];
+
+    float cpu_limit = 30;
+    float iops_limit = 31;
+    float progress_timeout = 36;
 
     repeated Artifact artifacts = 5 [(sem_type) = {
             description: "Artifacts sent from the server to help with this query."
@@ -78,6 +92,9 @@ message VQLCollectorArgs {
     repeated string tools = 26 [(sem_type)={
             description: "A list of tools we will need to run this VQL.",
         }];
+
+    // Used only for API based calls
+    string org_id = 35;
 }
 
 message VQLTypeMap {
@@ -112,6 +129,7 @@ message VQLResponse {
             description: "Large VQL responses are split across many parts. "
             "This carries the part of this response.",
         }];
+
     VQLRequest Query = 3 [(sem_type) = {
             description: "The query that was executed.",
         }];
@@ -125,7 +143,13 @@ message VQLResponse {
             description: "Total number of rows in this response part."
         }];
 
+    // Row count where query started.
+    uint64 query_start_row = 11;
+
     string log = 9;
+
+    // Used only for server-server comms
+    string org_id = 12;
 }
 
 
@@ -163,8 +187,17 @@ message ClientInfo {
     string client_version = 12;
     string client_name = 13;
     uint64 first_seen_at = 20;
+    string build_time = 24;
+    string build_url = 25;
+    uint64 install_time = 26;
 
     repeated string labels = 15;
+    repeated string mac_addresses = 22;
+
+    // A hint if tasks are available. This does not have to be
+    // accurate - checking the task queue will yield the correct
+    // tasks.
+    bool has_tasks = 27;
 
     string last_interrogate_flow_id = 16;
 
@@ -174,4 +207,5 @@ message ClientInfo {
 
     uint64 last_hunt_timestamp = 17;
     uint64 last_event_table_version = 18;
+    uint64 labels_timestamp = 23;
 }

@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -25,26 +25,28 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/oleparse"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/constants"
-	"www.velocidex.com/golang/velociraptor/glob"
 	"www.velocidex.com/golang/velociraptor/third_party/zip"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 type _OLEVBAArgs struct {
-	Filenames []string `vfilter:"required,field=file,doc=A list of filenames to open as OLE files."`
-	Accessor  string   `vfilter:"optional,field=accessor,doc=The accessor to use."`
-	MaxSize   int64    `vfilter:"optional,field=max_size,doc=Maximum size of file we load into memory."`
+	Filenames []*accessors.OSPath `vfilter:"required,field=file,doc=A list of filenames to open as OLE files."`
+	Accessor  string              `vfilter:"optional,field=accessor,doc=The accessor to use."`
+	MaxSize   int64               `vfilter:"optional,field=max_size,doc=Maximum size of file we load into memory."`
 }
 
 type _OLEVBAPlugin struct{}
 
 func _OLEVBAPlugin_ParseFile(
 	ctx context.Context,
-	filename string,
+	filename *accessors.OSPath,
 	scope vfilter.Scope,
 	arg *_OLEVBAArgs) ([]*oleparse.VBAModule, error) {
 
@@ -56,18 +58,18 @@ func _OLEVBAPlugin_ParseFile(
 		return nil, err
 	}
 
-	accessor, err := glob.GetAccessor(arg.Accessor, scope)
+	accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
 		return nil, err
 	}
 
-	fd, err := accessor.Open(filename)
+	fd, err := accessor.OpenWithOSPath(filename)
 	if err != nil {
 		return nil, err
 	}
 	defer fd.Close()
 
-	stat, err := fd.Stat()
+	stat, err := accessor.LstatWithOSPath(filename)
 	if err != nil {
 		return nil, err
 	}
@@ -90,7 +92,7 @@ func _OLEVBAPlugin_ParseFile(
 		if err != nil {
 			fd.Close()
 
-			fd, err = accessor.Open(filename)
+			fd, err = accessor.OpenWithOSPath(filename)
 			if err != nil {
 				return nil, err
 			}
@@ -112,6 +114,7 @@ func _OLEVBAPlugin_ParseFile(
 
 	zfd, err := zip.NewReader(reader, stat.Size())
 	if err == nil {
+		results := []*oleparse.VBAModule{}
 		for _, f := range zfd.File {
 			if oleparse.BINFILE_NAME.MatchString(f.Name) {
 				rc, err := f.Open()
@@ -123,12 +126,14 @@ func _OLEVBAPlugin_ParseFile(
 				if err != nil {
 					return nil, err
 				}
-				return oleparse.ParseBuffer(data)
+				modules, err := oleparse.ParseBuffer(data)
+				if err == nil {
+					results = append(results, modules...)
+				}
 			}
 		}
-
+		return results, nil
 	}
-
 	return nil, errors.New("Not an OLE file.")
 }
 
@@ -173,9 +178,10 @@ func (self _OLEVBAPlugin) Call(
 func (self _OLEVBAPlugin) Info(scope vfilter.Scope,
 	type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "olevba",
-		Doc:     "Extracts VBA Macros from Office documents.",
-		ArgType: type_map.AddType(scope, &_OLEVBAArgs{}),
+		Name:     "olevba",
+		Doc:      "Extracts VBA Macros from Office documents.",
+		ArgType:  type_map.AddType(scope, &_OLEVBAArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

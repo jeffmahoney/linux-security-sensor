@@ -4,14 +4,11 @@ package clients
 
 import (
 	"context"
-	"errors"
-	"os"
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
-	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	"www.velocidex.com/golang/velociraptor/datastore"
-	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -21,7 +18,9 @@ type ClientMetadataFunctionArgs struct {
 	ClientId string `vfilter:"required,field=client_id"`
 }
 
-type ClientMetadataFunction struct{}
+type ClientMetadataFunction struct {
+	name string
+}
 
 func (self *ClientMetadataFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
@@ -30,7 +29,7 @@ func (self *ClientMetadataFunction) Call(ctx context.Context,
 	arg := &ClientMetadataFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
-		scope.Log("client_metadata: %s", err.Error())
+		scope.Log(self.name+": %s", err.Error())
 		return vfilter.Null{}
 	}
 
@@ -40,34 +39,26 @@ func (self *ClientMetadataFunction) Call(ctx context.Context,
 	}
 	err = vql_subsystem.CheckAccess(scope, permission)
 	if err != nil {
-		scope.Log("client_metadata: %s", err)
+		scope.Log(self.name+": %s", err)
 		return vfilter.Null{}
 	}
 
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log(self.name + ": Command can only run on the server")
 		return vfilter.Null{}
 	}
 
-	client_path_manager := paths.NewClientPathManager(arg.ClientId)
-	db, err := datastore.GetDB(config_obj)
+	client_info_manager, err := services.GetClientInfoManager(config_obj)
 	if err != nil {
-		scope.Log("client_metadata: %s", err.Error())
+		scope.Log(self.name+": %v", err)
 		return vfilter.Null{}
 	}
 
-	result := &api_proto.ClientMetadata{}
-	err = db.GetSubject(config_obj,
-		client_path_manager.Metadata(), result)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		scope.Log("client_metadata: %s", err.Error())
+	result_dict, err := client_info_manager.GetMetadata(ctx, arg.ClientId)
+	if err != nil {
+		scope.Log(self.name+": %s", err)
 		return vfilter.Null{}
-	}
-
-	result_dict := ordereddict.NewDict()
-	for _, item := range result.Items {
-		result_dict.Set(item.Key, item.Value)
 	}
 
 	return result_dict
@@ -76,9 +67,10 @@ func (self *ClientMetadataFunction) Call(ctx context.Context,
 func (self ClientMetadataFunction) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "client_metadata",
-		Doc:     "Returns client metadata from the datastore. Client metadata is a set of free form key/value data",
-		ArgType: type_map.AddType(scope, &ClientMetadataFunctionArgs{}),
+		Name:     "client_metadata",
+		Doc:      "Returns client metadata from the datastore. Client metadata is a set of free form key/value data",
+		ArgType:  type_map.AddType(scope, &ClientMetadataFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS, acls.SERVER_ADMIN).Build(),
 	}
 }
 
@@ -87,7 +79,9 @@ type ClientSetMetadataFunctionArgs struct {
 	Metadata *ordereddict.Dict `vfilter:"optional,field=metadata,doc=A dict containing metadata. If not specified we use kwargs."`
 }
 
-type ClientSetMetadataFunction struct{}
+type ClientSetMetadataFunction struct {
+	name string
+}
 
 func (self *ClientSetMetadataFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
@@ -97,7 +91,7 @@ func (self *ClientSetMetadataFunction) Call(ctx context.Context,
 	expanded_args := vfilter.RowToDict(ctx, scope, args)
 	client_id, pres := expanded_args.GetString("client_id")
 	if !pres {
-		scope.Log("client_set_metadata: client_id must be specified")
+		scope.Log(self.name + ": client_id must be specified")
 		return vfilter.Null{}
 	}
 
@@ -110,53 +104,34 @@ func (self *ClientSetMetadataFunction) Call(ctx context.Context,
 		}
 	}
 
-	permission := acls.READ_RESULTS
+	// User needs high permissions to modify the client's metadata.
+	permission := acls.COLLECT_CLIENT
 	if client_id == "server" {
 		permission = acls.SERVER_ADMIN
 	}
 
 	err := vql_subsystem.CheckAccess(scope, permission)
 	if err != nil {
-		scope.Log("client_set_metadata: %s", err)
+		scope.Log(self.name+": %s", err)
 		return vfilter.Null{}
 	}
 
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log(self.name + ": Command can only run on the server")
 		return vfilter.Null{}
 	}
 
-	client_path_manager := paths.NewClientPathManager(client_id)
-	db, err := datastore.GetDB(config_obj)
+	client_info_manager, err := services.GetClientInfoManager(config_obj)
 	if err != nil {
-		scope.Log("client_set_metadata: %s", err.Error())
+		scope.Log(self.name+": %s", err)
 		return vfilter.Null{}
 	}
 
-	result := &api_proto.ClientMetadata{ClientId: client_id}
-
-	for _, key := range expanded_args.Keys() {
-		if key == "client_id" || key == "metadata" {
-			continue
-		}
-
-		value, pres := expanded_args.GetString(key)
-		if !pres {
-			value_any, _ := expanded_args.Get(key)
-			scope.Log("client_set_metadata: metadata key %v should be a string (not type %T)",
-				key, value_any)
-			continue
-		}
-
-		result.Items = append(result.Items, &api_proto.ClientMetadataItem{
-			Key: key, Value: value})
-	}
-
-	err = db.SetSubject(config_obj,
-		client_path_manager.Metadata(), result)
+	principal := vql_subsystem.GetPrincipal(scope)
+	err = client_info_manager.SetMetadata(ctx, client_id, expanded_args, principal)
 	if err != nil {
-		scope.Log("client_set_metadata: %s", err.Error())
+		scope.Log(self.name+": %s", err)
 		return vfilter.Null{}
 	}
 
@@ -166,9 +141,10 @@ func (self *ClientSetMetadataFunction) Call(ctx context.Context,
 func (self ClientSetMetadataFunction) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "client_set_metadata",
-		Doc:     "Sets client metadata. Client metadata is a set of free form key/value data",
-		ArgType: type_map.AddType(scope, &ClientMetadataFunctionArgs{}),
+		Name:     "client_set_metadata",
+		Doc:      "Sets client metadata. Client metadata is a set of free form key/value data",
+		ArgType:  type_map.AddType(scope, &ClientSetMetadataFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_CLIENT, acls.SERVER_ADMIN).Build(),
 	}
 }
 
@@ -181,15 +157,18 @@ func (self *ServerMetadataFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 	args.Set("client_id", "server")
-	return (&ClientMetadataFunction{}).Call(ctx, scope, args)
+	return (&ClientMetadataFunction{
+		name: "server_metadata",
+	}).Call(ctx, scope, args)
 }
 
 func (self ServerMetadataFunction) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "server_metadata",
-		Doc:     "Returns server metadata from the datastore. Server metadata is a set of free form key/value data",
-		ArgType: type_map.AddType(scope, &ClientMetadataFunctionArgs{}),
+		Name:     "server_metadata",
+		Doc:      "Returns server metadata from the datastore. Server metadata is a set of free form key/value data",
+		ArgType:  type_map.AddType(scope, &ClientMetadataFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.SERVER_ADMIN).Build(),
 	}
 }
 
@@ -203,7 +182,9 @@ func (self *ServerSetMetadataFunction) Call(ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 	args.Set("client_id", "server")
-	return (&ClientSetMetadataFunction{}).Call(ctx, scope, args)
+	return (&ClientSetMetadataFunction{
+		name: "server_set_metadata",
+	}).Call(ctx, scope, args)
 }
 
 func (self ServerSetMetadataFunction) Info(
@@ -216,8 +197,12 @@ func (self ServerSetMetadataFunction) Info(
 }
 
 func init() {
-	vql_subsystem.RegisterFunction(&ClientMetadataFunction{})
-	vql_subsystem.RegisterFunction(&ClientSetMetadataFunction{})
+	vql_subsystem.RegisterFunction(&ClientMetadataFunction{
+		name: "client_metadata",
+	})
+	vql_subsystem.RegisterFunction(&ClientSetMetadataFunction{
+		name: "client_set_metadata",
+	})
 	vql_subsystem.RegisterFunction(&ServerMetadataFunction{})
 	vql_subsystem.RegisterFunction(&ServerSetMetadataFunction{})
 }

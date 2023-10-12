@@ -23,6 +23,13 @@ var (
 	Test_memory_file_store *MemoryFileStore
 )
 
+func ResetMemoryFileStore() {
+	mu.Lock()
+	defer mu.Unlock()
+
+	Test_memory_file_store = nil
+}
+
 func NewMemoryFileStore(config_obj *config_proto.Config) *MemoryFileStore {
 	mu.Lock()
 	defer mu.Unlock()
@@ -36,7 +43,8 @@ func NewMemoryFileStore(config_obj *config_proto.Config) *MemoryFileStore {
 	}
 
 	// Sanitize the FilestoreDirectory
-	if config_obj.Datastore.FilestoreDirectory != "" {
+	if config_obj.Datastore.FilestoreDirectory != "" &&
+		strings.HasSuffix(config_obj.Datastore.FilestoreDirectory, "/") {
 		config_obj.Datastore.FilestoreDirectory = strings.TrimSuffix(
 			config_obj.Datastore.FilestoreDirectory, "/")
 	}
@@ -78,8 +86,17 @@ func (self *MemoryReader) Read(buf []byte) (int, error) {
 }
 
 func (self *MemoryReader) Seek(offset int64, whence int) (int64, error) {
-	if whence == 0 {
+	switch whence {
+	case os.SEEK_SET:
 		self.offset = int(offset)
+	case os.SEEK_CUR:
+		offset += int64(self.offset)
+	case os.SEEK_END:
+		buff, ok := self.memory_file_store.Get(self.filename)
+		if !ok {
+			return 0, io.EOF
+		}
+		offset += int64(len(buff))
 	}
 	return offset, nil
 }
@@ -120,6 +137,41 @@ func (self *MemoryWriter) Size() (int64, error) {
 	return int64(len(self.buf)), nil
 }
 
+func (self *MemoryWriter) Update(data []byte, offset int64) error {
+	defer api.InstrumentWithDelay("update", "MemoryReader", nil)()
+
+	err := self._Flush()
+	if err != nil {
+		return err
+	}
+
+	buff, ok := self.memory_file_store.Get(self.filename)
+	if !ok {
+		return os.ErrNotExist
+	}
+
+	if offset >= int64(len(buff)) {
+		return os.ErrNotExist
+	}
+
+	// Write the bytes into buffer offset
+	for i := 0; i < len(data); i++ {
+		if offset >= int64(len(buff)) {
+			buff = append(buff, data[i])
+		} else {
+			buff[offset] = data[i]
+		}
+		offset++
+	}
+
+	self.memory_file_store.mu.Lock()
+	defer self.memory_file_store.mu.Unlock()
+
+	self.memory_file_store.Data.Set(self.filename, buff)
+	self.buf = buff
+	return nil
+}
+
 func (self *MemoryWriter) Write(data []byte) (int, error) {
 	defer api.InstrumentWithDelay("write", "MemoryReader", nil)()
 
@@ -127,7 +179,19 @@ func (self *MemoryWriter) Write(data []byte) (int, error) {
 	return len(data), nil
 }
 
-func (self *MemoryWriter) Flush() error { return nil }
+func (self *MemoryWriter) Flush() error {
+	self.memory_file_store.mu.Lock()
+	defer self.memory_file_store.mu.Unlock()
+
+	return self._Flush()
+}
+
+func (self *MemoryWriter) _Flush() error {
+	self.memory_file_store.Data.Set(self.filename, self.buf)
+	self.buf = nil
+
+	return nil
+}
 
 func (self *MemoryWriter) Close() error {
 	if self.closed {
@@ -393,6 +457,9 @@ func (self *MemoryFileStore) Clear() {
 
 	self.Data = ordereddict.NewDict()
 	self.Paths = ordereddict.NewDict()
+
+	// Next filestore will be pristine.
+	ResetMemoryFileStore()
 }
 
 func (self *MemoryFileStore) Close() error {

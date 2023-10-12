@@ -4,7 +4,7 @@ import (
 	"context"
 
 	"github.com/Velocidex/ordereddict"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
@@ -17,6 +17,8 @@ type PathSpecArgs struct {
 	DelegatePath     string      `vfilter:"optional,field=DelegatePath,doc=A delegate to pass to the accessor."`
 	Path             vfilter.Any `vfilter:"optional,field=Path,doc=A path to open."`
 	Parse            string      `vfilter:"optional,field=parse,doc=Alternatively parse the pathspec from this string."`
+	Type             string      `vfilter:"optional,field=path_type,doc=Type of path this is (windows,linux,registry,ntfs)."`
+	Accessor         string      `vfilter:"optional,field=accessor,doc=The accessor to use to parse the path with"`
 }
 
 type PathSpecFunction struct{}
@@ -27,17 +29,18 @@ func (self *PathSpecFunction) Call(ctx context.Context,
 	arg := &PathSpecArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
-		scope.Log("pathspec: %s", err.Error())
+		scope.Log("pathspec: %v", err)
 		return false
 	}
 
 	if arg.Parse != "" {
-		result, err := glob.PathSpecFromString(arg.Parse)
+		os_path, err := accessors.ParsePath(arg.Parse, arg.Type)
 		if err != nil {
 			scope.Log("pathspec: %v", err)
-			return vfilter.Null{}
+			return false
 		}
-		return result
+
+		return os_path
 	}
 
 	// The path can be a more complex type
@@ -72,16 +75,52 @@ func (self *PathSpecFunction) Call(ctx context.Context,
 			}
 
 			path_str = string(serialized)
+			p := &accessors.PathSpec{
+				DelegateAccessor: arg.DelegateAccessor,
+				DelegatePath:     arg.DelegatePath,
+				Path:             path_str,
+			}
+
+			result := accessors.MustNewPathspecOSPath(p.String())
+			return result
 		}
 	}
 
-	result := &glob.PathSpec{
-		DelegateAccessor: arg.DelegateAccessor,
-		DelegatePath:     arg.DelegatePath,
-		Path:             path_str,
+	if arg.Accessor != "" {
+		accessor, err := accessors.GetAccessor(arg.Accessor, scope)
+		if err != nil {
+			scope.Log("pathspec: %v", err)
+			return false
+		}
+		result, err := accessor.ParsePath(path_str)
+		if err == nil {
+			return result
+		}
 	}
 
+	result, err := accessors.ParsePath(path_str, arg.Type)
+	if err != nil {
+		scope.Log("pathspec: %v", err)
+		return vfilter.Null{}
+	}
+
+	result.SetPathSpec(
+		&accessors.PathSpec{
+			DelegateAccessor: arg.DelegateAccessor,
+			DelegatePath:     arg.DelegatePath,
+			Path:             path_str,
+		})
+
 	return result
+}
+
+func parseOSPath(path *accessors.OSPath) *ordereddict.Dict {
+	pathspec := path.PathSpec()
+	return ordereddict.NewDict().
+		Set("DelegateAccessor", pathspec.DelegateAccessor).
+		Set("DelegatePath", pathspec.DelegatePath).
+		Set("Path", pathspec.Path).
+		Set("Components", path.Components)
 }
 
 func (self *PathSpecFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
@@ -89,6 +128,7 @@ func (self *PathSpecFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMa
 		Name:    "pathspec",
 		Doc:     "Create a structured path spec to pass to certain accessors.",
 		ArgType: type_map.AddType(scope, &PathSpecArgs{}),
+		Version: 1,
 	}
 }
 

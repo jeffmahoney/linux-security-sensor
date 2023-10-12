@@ -7,10 +7,13 @@ import (
 	"path/filepath"
 
 	"github.com/Velocidex/ordereddict"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/reporting"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/startup"
 	"www.velocidex.com/golang/velociraptor/uploads"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -34,16 +37,27 @@ var (
 )
 
 func doUnzip() error {
-	config_obj, err := makeDefaultConfigLoader().WithNullLoader().LoadAndValidate()
+	logging.DisableLogging()
+
+	server_config_obj, err := makeDefaultConfigLoader().
+		WithNullLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return fmt.Errorf("Starting services: %w", err)
-	}
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	config_obj := &config_proto.Config{}
+	config_obj.Frontend = server_config_obj.Frontend
+
+	config_obj.Services = services.GenericToolServices()
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
+
+	if err != nil {
+		return err
+	}
 
 	filename, err := filepath.Abs(*unzip_cmd_file)
 	if err != nil {
@@ -55,10 +69,11 @@ func doUnzip() error {
 		return err
 	}
 
+	logger := &LogWriter{config_obj: sm.Config}
 	builder := services.ScopeBuilder{
-		Config:     config_obj,
-		ACLManager: vql_subsystem.NewRoleACLManager("administrator"),
-		Logger:     log.New(&LogWriter{config_obj}, "Velociraptor: ", 0),
+		Config:     sm.Config,
+		ACLManager: acl_managers.NewRoleACLManager(sm.Config, "administrator"),
+		Logger:     log.New(logger, "", 0),
 		Env: ordereddict.NewDict().
 			Set("ZipPath", filename).
 			Set("DumpDir", *unzip_path).
@@ -66,22 +81,26 @@ func doUnzip() error {
 	}
 
 	if *unzip_cmd_list {
-		return runUnzipList(builder)
+		err = runUnzipList(builder)
 	} else if *unzip_cmd_print {
-		return runUnzipPrint(builder)
+		err = runUnzipPrint(builder)
 	} else {
-		return runUnzipFiles(builder)
+		err = runUnzipFiles(builder)
 	}
+	if err != nil {
+		return err
+	}
+
+	return logger.Error
 }
 
 func runUnzipList(builder services.ScopeBuilder) error {
 	query := `
-       SELECT url(parse=FullPath).Fragment AS Filename,
+       SELECT OSPath.Path AS Filename,
               Size
-       FROM glob(globs=url(scheme='file',
-                           path=ZipPath,
-                           fragment=MemberGlob).String,
-                 accessor='zip')
+       FROM glob(globs=MemberGlob,
+                 root=pathspec(DelegatePath=ZipPath),
+                 accessor='collector')
        WHERE NOT IsDir`
 
 	if *unzip_cmd_filter != "" {
@@ -98,12 +117,11 @@ func runUnzipFiles(builder services.ScopeBuilder) error {
 
 	query := `
        SELECT upload(
-               file=FullPath, accessor='zip',
-               name=url(parse=FullPath).Fragment) AS Extracted
-       FROM glob(globs=url(scheme='file',
-                           path=ZipPath,
-                           fragment=MemberGlob).String,
-                 accessor='zip')
+               file=OSPath, accessor='collector',
+               name=OSPath.Path) AS Extracted
+       FROM glob(globs=MemberGlob,
+                 root=pathspec(DelegatePath=ZipPath),
+                 accessor='collector')
        WHERE NOT IsDir`
 
 	if *unzip_cmd_filter != "" {
@@ -117,23 +135,23 @@ func runUnzipPrint(builder services.ScopeBuilder) error {
 	query := `
        SELECT * FROM foreach(
        row={
-          SELECT FullPath
-          FROM glob(globs=url(scheme='file',
-                              path=ZipPath,
-                              fragment=MemberGlob).String,
-                    accessor='zip')
+          SELECT OSPath
+          FROM glob(globs=MemberGlob,
+                    root=pathspec(DelegatePath=ZipPath),
+                    accessor='collector')
           WHERE NOT IsDir AND FullPath =~ '.json$'
        }, query={
           SELECT *
-          FROM parse_jsonl(filename=FullPath, accessor='zip')
+          FROM parse_jsonl(filename=OSPath, accessor='collector')
        })
     `
 	return runQueryWithEnv(query, builder)
 }
 
-func getAllStats(query string, builder services.ScopeBuilder) (
+func getAllStats(
+	query string, builder services.ScopeBuilder) (
 	[]*ordereddict.Dict, error) {
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(builder.Config)
 	if err != nil {
 		return nil, err
 	}
@@ -146,7 +164,8 @@ func getAllStats(query string, builder services.ScopeBuilder) (
 		return nil, fmt.Errorf("Unable to parse VQL Query: %w", err)
 	}
 
-	ctx := InstallSignalHandler(scope)
+	ctx, cancel := InstallSignalHandler(nil, scope)
+	defer cancel()
 
 	result := []*ordereddict.Dict{}
 	for row := range vql.Eval(ctx, scope) {
@@ -158,8 +177,9 @@ func getAllStats(query string, builder services.ScopeBuilder) (
 	return result, nil
 }
 
-func runQueryWithEnv(query string, builder services.ScopeBuilder) error {
-	manager, err := services.GetRepositoryManager()
+func runQueryWithEnv(
+	query string, builder services.ScopeBuilder) error {
+	manager, err := services.GetRepositoryManager(builder.Config)
 	if err != nil {
 		return err
 	}
@@ -172,7 +192,8 @@ func runQueryWithEnv(query string, builder services.ScopeBuilder) error {
 		return fmt.Errorf("Unable to parse VQL Query: %w", err)
 	}
 
-	ctx := InstallSignalHandler(scope)
+	ctx, cancel := InstallSignalHandler(nil, scope)
+	defer cancel()
 
 	for _, vql := range vqls {
 		scope.Log("Running query %v", query)
@@ -194,7 +215,7 @@ func runQueryWithEnv(query string, builder services.ScopeBuilder) error {
 			}
 
 		case "csv":
-			err = outputCSV(ctx, scope, vql, os.Stdout)
+			err = outputCSV(ctx, builder.Config, scope, vql, os.Stdout)
 			if err != nil {
 				return err
 			}

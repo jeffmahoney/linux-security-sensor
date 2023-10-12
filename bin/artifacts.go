@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -18,20 +18,24 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
 	"github.com/Velocidex/yaml/v2"
 	"www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/executor"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/startup"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 )
 
 var (
@@ -63,6 +67,18 @@ var (
 			"store all output in it.").
 		Default("").String()
 
+	artifact_command_collect_timeout = artifact_command_collect.Flag(
+		"timeout", "Time collection out after this many seconds.").
+		Default("0").Float64()
+
+	artifact_command_collect_progress_timeout = artifact_command_collect.Flag(
+		"progress_timeout", "If specified we terminate the colleciton if no progress is made in this many seconds.").
+		Default("0").Float64()
+
+	artifact_command_collect_cpu_limit = artifact_command_collect.Flag(
+		"cpu_limit", "A number between 0 to 100 representing maximum CPU utilization.").
+		Default("0").Int64()
+
 	artifact_command_collect_output_compression = artifact_command_collect.Flag(
 		"output_level", "Compression level for zip output.").
 		Default("5").Int64()
@@ -92,22 +108,31 @@ var (
 
 	artifact_command_collect_args = artifact_command_collect.Flag(
 		"args", "Artifact args.").Strings()
+
+	artifact_command_collect_hardmemory = artifact_command_collect.Flag(
+		"hard_memory_limit", "If we reach this memory limit in bytes we exit.").Uint64()
 )
 
 func listArtifactsHint() []string {
 	config_obj := config.GetDefaultConfig()
+	ctx := context.Background()
 	result := []string{}
 
 	repository, err := getRepository(config_obj)
 	if err != nil {
 		return result
 	}
-	result = append(result, repository.List()...)
+	names, err := repository.List(ctx, config_obj)
+	if err != nil {
+		return result
+	}
+
+	result = append(result, names...)
 	return result
 }
 
 func getRepository(config_obj *config_proto.Config) (services.Repository, error) {
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return nil, err
 	}
@@ -117,25 +142,17 @@ func getRepository(config_obj *config_proto.Config) (services.Repository, error)
 		return nil, err
 	}
 
-	if *artifact_definitions_dir != "" {
-		logging.GetLogger(config_obj, &logging.ToolComponent).
-			Info("Loading artifacts from %s",
-				*artifact_definitions_dir)
-		_, err := repository.LoadDirectory(config_obj, *artifact_definitions_dir)
-		if err != nil {
-			logging.GetLogger(config_obj, &logging.ToolComponent).
-				Error("Artifact LoadDirectory: %v ", err)
-			return nil, err
-		}
-	}
-
 	return repository, nil
 }
 
 func doArtifactCollect() error {
-	err := checkAdmin()
-	if err != nil {
-		return err
+	logging.DisableLogging()
+
+	if *artificat_command_collect_admin_flag {
+		err := checkAdmin()
+		if err != nil {
+			return err
+		}
 	}
 
 	config_obj, err := makeDefaultConfigLoader().
@@ -144,11 +161,15 @@ func doArtifactCollect() error {
 		return fmt.Errorf("Unable to create config: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return fmt.Errorf("Can't load service: %w", err)
-	}
+	ctx, top_cancel := install_sig_handler()
+	defer top_cancel()
+
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
+
+	if err != nil {
+		return err
+	}
 
 	spec := ordereddict.NewDict()
 	for _, name := range *artifact_command_collect_names {
@@ -178,15 +199,16 @@ func doArtifactCollect() error {
 		spec.Set(name, collect_args)
 	}
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return err
 	}
 
+	logger := &LogWriter{config_obj: config_obj}
 	scope := manager.BuildScope(services.ScopeBuilder{
 		Config:     config_obj,
-		ACLManager: vql_subsystem.NullACLManager{},
-		Logger:     log.New(&LogWriter{config_obj}, " ", 0),
+		ACLManager: acl_managers.NullACLManager{},
+		Logger:     log.New(&LogWriter{config_obj: config_obj}, "", 0),
 		Env: ordereddict.NewDict().
 			Set("Artifacts", *artifact_command_collect_names).
 			Set("Output", *artifact_command_collect_output).
@@ -195,13 +217,33 @@ func doArtifactCollect() error {
 			Set("Report", *artifact_command_collect_report).
 			Set("Template", *artifact_command_collect_report_template).
 			Set("Args", spec).
-			Set("Format", *artifact_command_collect_format),
+			Set("Format", *artifact_command_collect_format).
+			Set("Timeout", *artifact_command_collect_timeout).
+			Set("ProgressTimeout", *artifact_command_collect_progress_timeout).
+			Set("CpuLimit", *artifact_command_collect_cpu_limit),
 	})
 	defer scope.Close()
 
-	_, err = getRepository(config_obj)
-	if err != nil {
-		return err
+	// Stick around until the query completes so it gets a chance to
+	// close the collection zip.
+	sm.Wg.Add(1)
+	scope.AddDestructor(func() {
+		sm.Wg.Done()
+	})
+
+	if *artifact_command_collect_hardmemory > 0 {
+		scope.Log("Installing hard memory limit of %v bytes",
+			*artifact_command_collect_hardmemory)
+		Nanny := &executor.NannyService{
+			MaxMemoryHardLimit: *artifact_command_collect_hardmemory,
+			Logger: logging.GetLogger(
+				config_obj, &logging.ToolComponent),
+			OnExit: sm.Close,
+		}
+
+		// Keep the nanny running after the query is done so it can
+		// hard kill the process if cancellation is not enough.
+		Nanny.Start(ctx, &sync.WaitGroup{})
 	}
 
 	now := time.Now()
@@ -220,9 +262,17 @@ func doArtifactCollect() error {
 	query := `
   SELECT * FROM collect(artifacts=Artifacts, output=Output, report=Report,
                         level=Level, template=Template,
+                        timeout=Timeout, progress_timeout=ProgressTimeout,
+                        cpu_limit=CpuLimit,
                         password=Password, args=Args, format=Format)`
-	return eval_local_query(config_obj, *artifact_command_collect_format,
-		query, scope)
+	err = eval_local_query(
+		sm.Ctx, config_obj,
+		*artifact_command_collect_format, query, scope)
+	if err != nil {
+		return err
+	}
+
+	return logger.Error
 }
 
 func getFilterRegEx(pattern string) (*regexp.Regexp, error) {
@@ -232,24 +282,35 @@ func getFilterRegEx(pattern string) (*regexp.Regexp, error) {
 }
 
 func doArtifactShow() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithNullLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to create config: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return fmt.Errorf("Can't load service: %w", err)
-	}
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
 
-	repository, err := getRepository(config_obj)
 	if err != nil {
-		return fmt.Errorf("Loading extra artifacts: %w", err)
+		return err
 	}
 
-	artifact, pres := repository.Get(config_obj, *artifact_command_show_name)
+	manager, err := services.GetRepositoryManager(config_obj)
+	if err != nil {
+		return err
+	}
+
+	repository, err := manager.GetGlobalRepository(config_obj)
+	if err != nil {
+		return err
+	}
+
+	artifact, pres := repository.Get(ctx, config_obj, *artifact_command_show_name)
 	if !pres {
 		return fmt.Errorf("Artifact %s not found",
 			*artifact_command_show_name)
@@ -260,22 +321,20 @@ func doArtifactShow() error {
 }
 
 func doArtifactList() error {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().
 		WithNullLoader().LoadAndValidate()
 	if err != nil {
 		return fmt.Errorf("Unable to load config file: %w", err)
 	}
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return fmt.Errorf("Starting services: %w", err)
-	}
-	defer sm.Close()
-
 	ctx, cancel := install_sig_handler()
 	defer cancel()
 
-	repository, err := getRepository(config_obj)
+	sm, err := startup.StartToolServices(ctx, config_obj)
+	defer sm.Close()
+
 	if err != nil {
 		return err
 	}
@@ -290,7 +349,22 @@ func doArtifactList() error {
 		name_regex = re
 	}
 
-	for _, name := range repository.List() {
+	manager, err := services.GetRepositoryManager(config_obj)
+	if err != nil {
+		return err
+	}
+
+	repository, err := manager.GetGlobalRepository(config_obj)
+	if err != nil {
+		return err
+	}
+
+	names, err := repository.List(sm.Ctx, config_obj)
+	if err != nil {
+		return err
+	}
+
+	for _, name := range names {
 		// Skip artifacts that do not match.
 		if name_regex != nil && name_regex.FindString(name) == "" {
 			continue
@@ -301,7 +375,7 @@ func doArtifactList() error {
 			continue
 		}
 
-		artifact, pres := repository.Get(config_obj, name)
+		artifact, pres := repository.Get(ctx, config_obj, name)
 		if !pres {
 			return fmt.Errorf("Artifact %s not found", name)
 		}
@@ -312,13 +386,13 @@ func doArtifactList() error {
 			continue
 		}
 
-		launcher, err := services.GetLauncher()
+		launcher, err := services.GetLauncher(config_obj)
 		if err != nil {
 			return err
 		}
 
 		request, err := launcher.CompileCollectorArgs(
-			ctx, config_obj, vql_subsystem.NullACLManager{}, repository,
+			sm.Ctx, config_obj, acl_managers.NullACLManager{}, repository,
 			services.CompilerOptions{
 				DisablePrecondition: true,
 			},
@@ -340,29 +414,15 @@ func doArtifactList() error {
 	return nil
 }
 
-// Load any artifacts defined inside the config file.
-func load_config_artifacts(config_obj *config_proto.Config) error {
-	if config_obj.Autoexec == nil {
-		return nil
-	}
-
-	repository, err := getRepository(config_obj)
-	if err != nil {
-		return err
-	}
-
-	for _, definition := range config_obj.Autoexec.ArtifactDefinitions {
-		serialized, err := yaml.Marshal(definition)
-		if err != nil {
-			return err
+func maybeAddDefinitionsDirectory(config_obj *config_proto.Config) error {
+	if *artifact_definitions_dir != "" {
+		if config_obj.Defaults == nil {
+			config_obj.Defaults = &config_proto.Defaults{}
 		}
 
-		// Config artifacts are considered built in.
-		_, err = repository.LoadYaml(
-			string(serialized), true /* validate */, true /* built_in */)
-		if err != nil {
-			return err
-		}
+		config_obj.Defaults.ArtifactDefinitionsDirectories = append(
+			config_obj.Defaults.ArtifactDefinitionsDirectories,
+			*artifact_definitions_dir)
 	}
 	return nil
 }

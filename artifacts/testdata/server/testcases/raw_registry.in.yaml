@@ -9,7 +9,7 @@ Queries:
        amCacheGlob=srcDir+"/artifacts/testdata/files/Amcache.hve") LIMIT 5
 
   # Test the shell bags artifact
-  - SELECT ModTime, KeyPath, Description, Path, _Parsed
+  - SELECT ModTime, basename(path=Hive), KeyPath, Description, Path, _Parsed
     FROM Artifact.Windows.Forensics.Shellbags(SearchSpecs=[
       dict(
          HiveGlob=srcDir+"/artifacts/testdata/files/UsrClass.dat",
@@ -18,4 +18,23 @@ Queries:
 
   # Test the SAM parsers
   - SELECT ParsedF, ParsedV FROM Artifact.Windows.Forensics.SAM(
-       SAMPath=srcDir+"/artifacts/testdata/files/SAM")
+       SAMPath=srcDir+"/artifacts/testdata/files/SAM", source="Parsed")
+
+  - SELECT * FROM Artifact.Windows.Forensics.SAM(
+       SAMPath=srcDir+"/artifacts/testdata/files/SAM", source="CreateTimes")
+
+  # Check raw reg can read values as files - REG_SZ.
+  - SELECT utf16(string=read_file(filename=pathspec(
+        Path="\\Root\\DeviceCensus\\Processor\\ProcessorIdentifier",
+        DelegatePath=srcDir+"/artifacts/testdata/files/Amcache.hve",
+        DelegateAccessor='file'),
+      accessor="raw_reg"))
+    FROM scope()
+
+  # Check raw reg can read values as files - REG_DWORD
+  - SELECT utf16(string=read_file(filename=pathspec(
+        Path="\\Root\\DeviceCensus\\WritePermissionsCheck",
+        DelegatePath=srcDir+"/artifacts/testdata/files/Amcache.hve",
+        DelegateAccessor='file'),
+      accessor="raw_reg"))
+    FROM scope()

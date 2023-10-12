@@ -1,5 +1,3 @@
-// +build server_vql
-
 package flows
 
 import (
@@ -10,9 +8,8 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/file_store"
-	"www.velocidex.com/golang/velociraptor/paths"
-	"www.velocidex.com/golang/velociraptor/result_sets"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -93,7 +90,7 @@ func (self ParallelPlugin) Call(
 			workers = int64(runtime.NumCPU())
 		}
 
-		job_chan, err := breakIntoScopes(ctx, config_obj, arg)
+		job_chan, err := breakIntoScopes(ctx, config_obj, scope, arg)
 		if err != nil {
 			scope.Log("parallel: %v", err)
 			return
@@ -109,7 +106,11 @@ func (self ParallelPlugin) Call(
 					subscope.AppendVars(job)
 
 					for row := range arg.Query.Eval(ctx, subscope) {
-						output_chan <- row
+						select {
+						case <-ctx.Done():
+							return
+						case output_chan <- row:
+						}
 					}
 				}
 			}()
@@ -124,9 +125,10 @@ func (self ParallelPlugin) Call(
 func (self ParallelPlugin) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "parallelize",
-		Doc:     "Runs query on result batches in parallel.",
-		ArgType: type_map.AddType(scope, &ParallelPluginArgs{}),
+		Name:     "parallelize",
+		Doc:      "Runs query on result batches in parallel.",
+		ArgType:  type_map.AddType(scope, &ParallelPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 
@@ -135,11 +137,12 @@ func (self ParallelPlugin) Info(
 func breakIntoScopes(
 	ctx context.Context,
 	config_obj *config_proto.Config,
+	scope vfilter.Scope,
 	arg *ParallelPluginArgs) (<-chan *ordereddict.Dict, error) {
 
 	// Handle hunts especially.
 	if arg.HuntId != "" {
-		return breakHuntIntoScopes(ctx, config_obj, arg)
+		return breakHuntIntoScopes(ctx, config_obj, scope, arg)
 	}
 
 	// Other sources are strored in a single reader.  Depending on
@@ -179,7 +182,11 @@ func breakIntoScopes(
 		}
 
 		for i := int64(0); i < total_rows; i += step_size {
-			output_chan <- ordereddict.NewDict().
+			select {
+			case <-ctx.Done():
+				return
+
+			case output_chan <- ordereddict.NewDict().
 				Set("ClientId", arg.ClientId).
 				Set("FlowId", arg.FlowId).
 
@@ -195,7 +202,8 @@ func breakIntoScopes(
 				Set("NotebookCellId", arg.NotebookCellId).
 				Set("NotebookCellTable", arg.NotebookCellTable).
 				Set("StartRow", i).
-				Set("Limit", step_size)
+				Set("Limit", step_size):
+			}
 		}
 
 	}()
@@ -206,35 +214,36 @@ func breakIntoScopes(
 func breakHuntIntoScopes(
 	ctx context.Context,
 	config_obj *config_proto.Config,
+	scope vfilter.Scope,
 	arg *ParallelPluginArgs) (<-chan *ordereddict.Dict, error) {
-	file_store_factory := file_store.GetFileStore(config_obj)
-
-	hunt_path_manager := paths.NewHuntPathManager(arg.HuntId).Clients()
-	hunt_rs_reader, err := result_sets.NewResultSetReader(
-		file_store_factory, hunt_path_manager)
-	if err != nil {
-		return nil, err
-	}
 
 	output_chan := make(chan *ordereddict.Dict)
 	go func() {
 		defer close(output_chan)
 
-		for row := range hunt_rs_reader.Rows(ctx) {
-			client_id, _ := row.GetString("ClientId")
-			flow_id, _ := row.GetString("FlowId")
+		hunt_dispatcher, err := services.GetHuntDispatcher(config_obj)
+		if err != nil {
+			return
+		}
 
-			flow_job, err := breakIntoScopes(ctx, config_obj,
+		for flow_details := range hunt_dispatcher.GetFlows(
+			ctx, config_obj, scope, arg.HuntId, 0) {
+
+			flow_job, err := breakIntoScopes(ctx, config_obj, scope,
 				&ParallelPluginArgs{
 					Artifact:  arg.Artifact,
-					ClientId:  client_id,
-					FlowId:    flow_id,
+					ClientId:  flow_details.Context.ClientId,
+					FlowId:    flow_details.Context.SessionId,
 					Workers:   arg.Workers,
 					BatchSize: arg.BatchSize,
 				})
 			if err == nil {
 				for job := range flow_job {
-					output_chan <- job
+					select {
+					case <-ctx.Done():
+						return
+					case output_chan <- job:
+					}
 				}
 			}
 		}

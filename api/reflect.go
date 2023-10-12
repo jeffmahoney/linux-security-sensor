@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -61,20 +61,38 @@ func IntrospectDescription() []*api_proto.Completion {
 	info := scope.Describe(type_map)
 
 	for _, item := range info.Functions {
+		var metadata map[string]string
+		if item.Metadata != nil {
+			metadata = make(map[string]string)
+			for _, k := range item.Metadata.Keys() {
+				v, _ := item.Metadata.GetString(k)
+				metadata[k] = v
+			}
+		}
 		result = append(result, &api_proto.Completion{
 			Name:        item.Name,
 			Description: item.Doc,
 			Type:        "Function",
 			Args:        getArgDescriptors(item.ArgType, type_map, scope),
+			Metadata:    metadata,
 		})
 	}
 
 	for _, item := range info.Plugins {
+		var metadata map[string]string
+		if item.Metadata != nil {
+			metadata = make(map[string]string)
+			for _, k := range item.Metadata.Keys() {
+				v, _ := item.Metadata.GetString(k)
+				metadata[k] = v
+			}
+		}
 		result = append(result, &api_proto.Completion{
 			Name:        item.Name,
 			Description: item.Doc,
 			Type:        "Plugin",
 			Args:        getArgDescriptors(item.ArgType, type_map, scope),
+			Metadata:    metadata,
 		})
 	}
 
@@ -85,8 +103,15 @@ func (self *ApiServer) GetKeywordCompletions(
 	ctx context.Context,
 	in *emptypb.Empty) (*api_proto.KeywordCompletions, error) {
 
+	users := services.GetUserManager()
+	_, org_config_obj, err := users.GetUserFromContext(ctx)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
 	result := &api_proto.KeywordCompletions{
 		Items: []*api_proto.Completion{
+			{Name: "EXPLAIN", Type: "Keyword"},
 			{Name: "SELECT", Type: "Keyword"},
 			{Name: "FROM", Type: "Keyword"},
 			{Name: "LET", Type: "Keyword"},
@@ -103,24 +128,28 @@ func (self *ApiServer) GetKeywordCompletions(
 	}
 	result.Items = append(result.Items, descriptions...)
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(org_config_obj)
 	if err != nil {
-		return nil, err
+		return nil, Status(self.verbose, err)
 	}
-	repository, err := manager.GetGlobalRepository(self.config)
+	repository, err := manager.GetGlobalRepository(org_config_obj)
 	if err != nil {
-		return nil, err
+		return nil, Status(self.verbose, err)
 	}
-	for _, name := range repository.List() {
-		artifact, pres := repository.Get(self.config, name)
+	names, err := repository.List(ctx, org_config_obj)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	for _, name := range names {
+		artifact, pres := repository.Get(ctx, org_config_obj, name)
 		if !pres {
 			continue
 		}
 		result.Items = append(result.Items, &api_proto.Completion{
-			Name:        "Artifact." + name,
-			Type:        "Artifact",
-			Description: artifact.Description,
-			Args:        getArtifactParamDescriptors(artifact),
+			Name: "Artifact." + name,
+			Type: "Artifact",
+			Args: getArtifactParamDescriptors(artifact),
 		})
 	}
 

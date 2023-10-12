@@ -48,6 +48,12 @@ parameters:
   - name: Accessor
     default: auto
     description: The accessor to use
+    type: choices
+    choices:
+      - auto
+      - registry
+      - file
+      - ntfs
 
   - name: YaraRule
     type: yara
@@ -73,13 +79,14 @@ parameters:
 
 sources:
   - query: |
-      LET file_search = SELECT FullPath,
-               get(item=Sys, field="mft") as Inode,
+      LET file_search = SELECT OSPath,
+               get(item=Data, field="mft") as Inode,
                Mode.String AS Mode, Size,
                Mtime AS MTime,
                Atime AS ATime,
                Btime AS BTime,
-               Ctime AS CTime, "" AS Keywords, IsDir
+               Ctime AS CTime, "" AS Keywords,
+               IsDir, Data
         FROM glob(globs=SearchFilesGlobTable.Glob + SearchFilesGlob,
                   accessor=Accessor)
 
@@ -107,23 +114,24 @@ sources:
                WHERE NOT IsDir
             },
             query={
-               SELECT FullPath, Inode, Mode,
+               SELECT OSPath, Inode, Mode,
                       Size, MTime, ATime, CTime, BTime,
-                      str(str=String.Data) As Keywords, IsDir
+                      str(str=String.Data) As Keywords, IsDir, Data
 
-               FROM yara(files=FullPath,
+               FROM yara(files=OSPath,
                          key="A",
                          rules=YaraRule,
                          accessor=Accessor)
             })
         }, else=modified_before)
 
-      SELECT FullPath, Inode, Mode, Size, MTime, ATime,
+      SELECT OSPath, Inode, Mode, Size, MTime, ATime,
              CTime, BTime, Keywords, IsDir,
                if(condition=Upload_File and NOT IsDir,
-                  then=upload(file=FullPath, accessor=Accessor)) AS Upload,
+                  then=upload(file=OSPath, accessor=Accessor)) AS Upload,
                if(condition=Calculate_Hash and NOT IsDir,
-                  then=hash(path=FullPath, accessor=Accessor)) AS Hash
+                  then=hash(path=OSPath, accessor=Accessor)) AS Hash,
+            Data
       FROM keyword_search
 
 column_types:
@@ -135,3 +143,5 @@ column_types:
     type: timestamp
   - name: CTime
     type: timestamp
+  - name: Upload
+    type: preview_upload

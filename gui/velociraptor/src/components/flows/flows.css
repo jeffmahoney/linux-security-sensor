@@ -9,3 +9,24 @@
     margin-right: 20px;
     margin-left: 20px;
 }
+
+.wrapped-text {
+    overflow-wrap: break-word;
+}
+
+div .flow-status-icon {
+    text-align: center;
+}
+
+.flow-log-filter {
+    margin-right: 4px;
+}
+
+.table tr.flow-urgent {
+    font-weight: bold;
+}
+
+.flow-file-download-button {
+    width: 100%;
+    text-align: left;
+}

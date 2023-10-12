@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -37,19 +37,19 @@ func enroll(
 		return nil
 	}
 
-	client_id, err := server.manager.AddCertificateRequest(csr.Pem)
+	client_id, err := server.manager.AddCertificateRequest(config_obj, csr.Pem)
 	if err != nil {
-		logger := logging.GetLogger(server.config, &logging.FrontendComponent)
+		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
 		logger.Error("While enrolling %v: %v", client_id, err)
 		return err
 	}
 
-	journal, err := services.GetJournal()
+	journal, err := services.GetJournal(config_obj)
 	if err != nil {
 		return err
 	}
 
-	return journal.PushRowsToArtifact(config_obj,
+	return journal.PushRowsToArtifact(ctx, config_obj,
 		[]*ordereddict.Dict{
 			ordereddict.NewDict().
 				Set("ClientId", client_id)},

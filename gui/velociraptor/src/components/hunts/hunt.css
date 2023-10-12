@@ -8,3 +8,11 @@
     margin-right: 20px;
     margin-left: 20px;
 }
+
+div .hunt-status-icon {
+    text-align: center;
+}
+
+.org-selector {
+    flex: 1 1 auto;
+}

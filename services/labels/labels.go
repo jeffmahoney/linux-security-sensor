@@ -2,6 +2,7 @@ package labels
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 
@@ -11,10 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/paths"
-	"www.velocidex.com/golang/velociraptor/search"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
@@ -31,30 +29,35 @@ var (
 type Dummy struct{}
 
 func (self Dummy) LastLabelTimestamp(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	client_id string) uint64 {
 	return 0
 }
 
 func (self Dummy) IsLabelSet(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	client_id string, label string) bool {
 	return false
 }
 
 func (self Dummy) SetClientLabel(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	client_id, label string) error {
 	return nil
 }
 
 func (self Dummy) RemoveClientLabel(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	client_id, label string) error {
 	return nil
 }
 
 func (self Dummy) GetClientLabels(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	client_id string) []string {
 	return nil
@@ -86,55 +89,47 @@ func (self *Labeler) SetClock(c utils.Clock) {
 
 // Assumption: We hold the lock entering this function.
 func (self *Labeler) getRecord(
+	ctx context.Context,
 	config_obj *config_proto.Config, client_id string) (*CachedLabels, error) {
 	cached_any, err := self.lru.Get(client_id)
 	if err == nil {
 		return cached_any.(*CachedLabels), nil
 	}
 
-	// We did not hit the lru - fetch from the datastore but we dont
-	// need to hold the lock for that.
-	self.mu.Unlock()
-
-	db, err := datastore.GetDB(config_obj)
+	client_info_manager, err := services.GetClientInfoManager(config_obj)
 	if err != nil {
 		return nil, err
 	}
 
-	cached := &CachedLabels{record: &api_proto.ClientLabels{}}
-	client_path_manager := paths.NewClientPathManager(client_id)
-	err = db.GetSubject(config_obj,
-		client_path_manager.Labels(), cached.record)
+	client_info, err := client_info_manager.Get(ctx, client_id)
+	if err != nil {
+		return nil, err
+	}
 
-	// In ancient versions we used to store labels in the client index
-	// instead of a dedicated record. This used to be migration code
-	// that populated labels from the index, but this is not necessary
-	// since the labels client record is the authoritative source.
-	preCalculatedLowCase(cached)
+	cached := &CachedLabels{record: &api_proto.ClientLabels{
+		Timestamp: client_info.LabelsTimestamp,
+		Label:     client_info.Labels,
+	}}
 
-	// Now set back to the lru with lock
-	self.mu.Lock()
-	self.lru.Set(client_id, cached)
-
-	return cached, nil
-}
-
-// Reset internal lower cased labels from the full labels. (Lower
-// cased labels are used for quick label comparisons).
-func preCalculatedLowCase(cached *CachedLabels) {
 	cached.lower_labels = nil
 	for _, label := range cached.record.Label {
 		cached.lower_labels = append(cached.lower_labels,
 			strings.ToLower(label))
 	}
+
+	// Now set back to the lru with lock
+	self.lru.Set(client_id, cached)
+
+	return cached, nil
 }
 
 func (self *Labeler) LastLabelTimestamp(
+	ctx context.Context,
 	config_obj *config_proto.Config, client_id string) uint64 {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	cached, err := self.getRecord(config_obj, client_id)
+	cached, err := self.getRecord(ctx, config_obj, client_id)
 	if err != nil {
 		return 0
 	}
@@ -143,6 +138,7 @@ func (self *Labeler) LastLabelTimestamp(
 }
 
 func (self *Labeler) IsLabelSet(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	client_id string, checked_label string) bool {
 	self.mu.Lock()
@@ -156,7 +152,7 @@ func (self *Labeler) IsLabelSet(
 		return true
 	}
 
-	cached, err := self.getRecord(config_obj, client_id)
+	cached, err := self.getRecord(ctx, config_obj, client_id)
 	if err != nil {
 		return false
 	}
@@ -171,15 +167,15 @@ func (self *Labeler) IsLabelSet(
 }
 
 func (self *Labeler) notifyClient(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	client_id, new_label, operation string) error {
 	// Notify other frontends about this change.
-	journal, err := services.GetJournal()
+	journal, err := services.GetJournal(config_obj)
 	if err != nil {
 		return err
 	}
 
-	journal.PushRowsToArtifactAsync(config_obj,
+	journal.PushRowsToArtifactAsync(ctx, config_obj,
 		ordereddict.NewDict().
 			Set("client_id", client_id).
 			Set("Operation", operation).
@@ -189,106 +185,130 @@ func (self *Labeler) notifyClient(
 }
 
 func (self *Labeler) SetClientLabel(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	client_id, new_label string) error {
-	self.mu.Lock()
-	defer self.mu.Unlock()
 
+	new_label = strings.TrimSpace(new_label)
 	checked_label := strings.ToLower(new_label)
-	cached, err := self.getRecord(config_obj, client_id)
+
+	client_info_manager, err := services.GetClientInfoManager(config_obj)
 	if err != nil {
 		return err
 	}
 
-	// Store the label in the datastore.
-	db, err := datastore.GetDB(config_obj)
+	err = client_info_manager.Modify(ctx, client_id,
+		func(client_info *services.ClientInfo) (*services.ClientInfo, error) {
+			if client_info == nil {
+				return nil, errors.New("ClientId not known")
+			}
+
+			// Label is already set. O(n) but n should be small.
+			for _, l := range client_info.Labels {
+				if checked_label == strings.ToLower(l) {
+					// No change is needed the label is already in
+					// there.
+					return nil, nil
+				}
+			}
+
+			client_info.Labels = append(client_info.Labels, new_label)
+			client_info.LabelsTimestamp = uint64(
+				self.Clock.Now().UnixNano())
+
+			return client_info, nil
+		})
 	if err != nil {
 		return err
 	}
 
-	cached.record.Timestamp = uint64(self.Clock.Now().UnixNano())
+	// Remove the record from the LRU - we will retrieve it from the
+	// client info manager later.
+	self.lru.Remove(client_id)
 
-	// O(n) but n should be small.
-	if !utils.InString(cached.lower_labels, checked_label) {
-		cached.record.Label = append(cached.record.Label, new_label)
-		cached.lower_labels = append(cached.lower_labels, checked_label)
-	}
-
-	client_path_manager := paths.NewClientPathManager(client_id)
-	err = db.SetSubjectWithCompletion(config_obj,
-		client_path_manager.Labels(), cached.record, nil)
+	// Notify any clients that labels are added.
+	err = self.notifyClient(ctx, config_obj, client_id, new_label, "Add")
 	if err != nil {
 		return err
 	}
 
-	// Cache the new record.
-	self.lru.Set(client_id, cached)
-
-	err = self.notifyClient(config_obj, client_id, new_label, "Add")
-	if err != nil {
-		return err
+	// Also adjust the index so client searches work. If there is no
+	// indexing services it is not an error.
+	indexer, err := services.GetIndexer(config_obj)
+	if err == nil {
+		return indexer.SetIndex(client_id, "label:"+new_label)
 	}
-
-	// Also adjust the index so client searches work.
-	return search.SetIndex(config_obj, client_id, "label:"+new_label)
+	return nil
 }
 
 func (self *Labeler) RemoveClientLabel(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	client_id, new_label string) error {
-	self.mu.Lock()
-	defer self.mu.Unlock()
 
 	checked_label := strings.ToLower(new_label)
-	cached, err := self.getRecord(config_obj, client_id)
+
+	client_info_manager, err := services.GetClientInfoManager(config_obj)
 	if err != nil {
 		return err
 	}
 
-	new_labels := []string{}
-	for _, label := range cached.record.Label {
-		if checked_label != strings.ToLower(label) {
-			new_labels = append(new_labels, label)
-		}
-	}
+	err = client_info_manager.Modify(ctx, client_id,
+		func(client_info *services.ClientInfo) (*services.ClientInfo, error) {
+			if client_info == nil {
+				return nil, errors.New("ClientId not known")
+			}
 
-	cached.record.Timestamp = uint64(self.Clock.Now().UnixNano())
-	cached.record.Label = new_labels
+			new_labels := []string{}
 
-	preCalculatedLowCase(cached)
+			// Label is already set. O(n) but n should be small.
+			for _, l := range client_info.Labels {
+				if checked_label != strings.ToLower(l) {
+					new_labels = append(new_labels, l)
+				}
+			}
 
-	// Store the label in the datastore.
-	db, err := datastore.GetDB(config_obj)
+			// Nothing was done - no change is needed.
+			if len(client_info.Labels) == len(new_labels) {
+				return nil, nil
+			}
+
+			client_info.Labels = new_labels
+			client_info.LabelsTimestamp = uint64(
+				self.Clock.Now().UnixNano())
+
+			return client_info, nil
+		})
 	if err != nil {
 		return err
 	}
 
-	client_path_manager := paths.NewClientPathManager(client_id)
-	err = db.SetSubjectWithCompletion(config_obj,
-		client_path_manager.Labels(), cached.record, nil)
-	if err != nil {
-		return err
-	}
+	// Remove the record from the LRU - we will retrieve it from the
+	// client info manager later.
+	self.lru.Remove(client_id)
 
-	// Cache the new record.
-	self.lru.Set(client_id, cached)
-
-	err = self.notifyClient(config_obj, client_id, new_label, "Remove")
+	err = self.notifyClient(ctx, config_obj, client_id, new_label, "Remove")
 	if err != nil {
 		return err
 	}
 
 	// Also adjust the index.
-	return search.UnsetIndex(config_obj, client_id, "label:"+new_label)
+	indexer, err := services.GetIndexer(config_obj)
+	if err != nil {
+		return err
+	}
+
+	return indexer.UnsetIndex(client_id, "label:"+new_label)
 }
 
 func (self *Labeler) GetClientLabels(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	client_id string) []string {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	cached, err := self.getRecord(config_obj, client_id)
+	cached, err := self.getRecord(ctx, config_obj, client_id)
 	if err != nil {
 		return nil
 	}
@@ -330,18 +350,18 @@ func (self *Labeler) Start(ctx context.Context,
 		metricLabelLRU.Dec()
 	})
 
-	journal, err := services.GetJournal()
+	journal, err := services.GetJournal(config_obj)
 	if err != nil {
 		return err
 	}
 
-	events, cancel := journal.Watch(ctx, "Server.Internal.Label")
+	events, cancel := journal.Watch(
+		ctx, "Server.Internal.Label", "Labeler")
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		defer services.RegisterLabeler(nil)
 
 		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
 		logger.Info("<green>Starting</> Label service.")
@@ -357,7 +377,7 @@ func (self *Labeler) Start(ctx context.Context,
 				}
 				err := self.ProcessRow(ctx, event)
 				if err != nil {
-					logger.Error("Enrollment Service: %v", err)
+					logger.Error("Label Service: %v", err)
 				}
 			}
 		}
@@ -366,25 +386,17 @@ func (self *Labeler) Start(ctx context.Context,
 	return nil
 }
 
-func StartLabelService(
+func NewLabelerService(
 	ctx context.Context,
 	wg *sync.WaitGroup,
-	config_obj *config_proto.Config) error {
+	config_obj *config_proto.Config) (services.Labeler, error) {
 
 	if config_obj.Frontend == nil {
-		services.RegisterLabeler(Dummy{})
-		return nil
+		return Dummy{}, nil
 	}
 
 	labeler := &Labeler{
 		Clock: &utils.RealClock{},
 	}
-	err := labeler.Start(ctx, config_obj, wg)
-	if err != nil {
-		return err
-	}
-
-	services.RegisterLabeler(labeler)
-
-	return nil
+	return labeler, labeler.Start(ctx, config_obj, wg)
 }

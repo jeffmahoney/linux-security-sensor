@@ -16,8 +16,10 @@ message Completion {
     string name = 1;
     string description = 2;
     string type = 3;
+    uint64 version = 6;
     repeated ArgDescriptor args = 4;
     string category = 5;
+    map<string, string> metadata = 7;
 }
 
 message KeywordCompletions {

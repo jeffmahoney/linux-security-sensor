@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"www.velocidex.com/golang/velociraptor/file_store/directory"
+	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/services"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
@@ -20,29 +20,32 @@ type Generator struct {
 
 // Give Generator the vfilter.StoredQuery interface so it can return
 // events.
-
 func (self Generator) Eval(ctx context.Context, scope types.Scope) <-chan types.Row {
 	result := make(chan vfilter.Row)
 
-	b, err := services.GetBroadcastService()
-	if err != nil {
-		scope.Log("generate: %v", err)
-		close(result)
-		return result
-	}
-
-	output_chan, cancel, err := b.Watch(ctx, self.name, directory.QueueOptions{
-		DisableFileBuffering: self.disable_file_buffering,
-	})
-
-	if err != nil {
-		scope.Log("generate: %v", err)
-		close(result)
-		return result
-	}
-
 	go func() {
 		defer close(result)
+
+		config_obj, ok := vql_subsystem.GetServerConfig(scope)
+		if !ok {
+			scope.Log("Command can only run on the server")
+			return
+		}
+
+		b, err := services.GetBroadcastService(config_obj)
+		if err != nil {
+			scope.Log("generate: %v", err)
+			return
+		}
+
+		output_chan, cancel, err := b.Watch(ctx, self.name, api.QueueOptions{
+			DisableFileBuffering: self.disable_file_buffering,
+		})
+		if err != nil {
+			scope.Log("generate: %v", err)
+			return
+		}
+
 		// Remove the watcher when we are done.
 		defer cancel()
 
@@ -64,6 +67,7 @@ type GeneratorArgs struct {
 	Query             types.StoredQuery `vfilter:"optional,field=query,doc=Run this query to generator rows."`
 	Delay             int64             `vfilter:"optional,field=delay,doc=Wait before starting the query"`
 	WithFileBuffering bool              `vfilter:"optional,field=with_file_buffer,doc=Enable file buffering"`
+	FanOut            int64             `vfilter:"optional,field=fan_out,doc=Wait for this many listeners to connect before starting the query"`
 }
 
 type GeneratorFunction struct{}
@@ -78,11 +82,17 @@ func (self *GeneratorFunction) Call(ctx context.Context,
 		return false
 	}
 
-	if arg.Name == "" {
-		arg.Name = types.ToString(arg.Query, scope)
+	config_obj, ok := vql_subsystem.GetServerConfig(scope)
+	if !ok {
+		scope.Log("Command can only run on the server")
+		return false
 	}
 
-	b, err := services.GetBroadcastService()
+	if arg.Name == "" {
+		arg.Name = vfilter.FormatToString(scope, arg.Query)
+	}
+
+	b, err := services.GetBroadcastService(config_obj)
 	if err != nil {
 		scope.Log("generate: %v", err)
 		return types.Null{}
@@ -101,13 +111,12 @@ func (self *GeneratorFunction) Call(ctx context.Context,
 		}
 	}
 
-	scope.Log("generate: registered new query for %v: %v",
-		arg.Name, types.ToString(arg.Query, scope))
+	scope.Log("generate: registered new query for %v", arg.Name)
 
 	sub_ctx, cancel := context.WithCancel(ctx)
 
 	// Remove the generator when the scope destroys.
-	scope.AddDestructor(func() {
+	vql_subsystem.GetRootScope(scope).AddDestructor(func() {
 		scope.Log("generate: Removing generator %v", arg.Name)
 		cancel()
 	})
@@ -124,11 +133,16 @@ func (self *GeneratorFunction) Call(ctx context.Context,
 			}
 		}
 
+		if arg.FanOut > 0 {
+			b.WaitForListeners(sub_ctx, arg.Name, arg.FanOut)
+		}
+
 		for item := range arg.Query.Eval(sub_ctx, scope) {
+			materialized := vfilter.MaterializedLazyRow(ctx, item, scope)
 			select {
 			case <-sub_ctx.Done():
 				return
-			case generator_chan <- vfilter.MaterializedLazyRow(ctx, item, scope):
+			case generator_chan <- materialized:
 			}
 		}
 	}()
@@ -144,6 +158,7 @@ func (self GeneratorFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMa
 		Name:    "generate",
 		Doc:     "Create a named generator that receives rows from the query.",
 		ArgType: type_map.AddType(scope, &GeneratorArgs{}),
+		Version: 2,
 	}
 }
 

@@ -1,6 +1,6 @@
 LET rows <= SELECT * FROM scope()[]SELECT len(list=["a", "b"]), len(list="hello"), len(list=dict(foo=1, bar=2, baz=3)), len(list=rows) FROM scope()[
  {
-  "len(list= [\"a\", \"b\"])": 2,
+  "len(list=[\"a\", \"b\"])": 2,
   "len(list=\"hello\")": 5,
   "len(list=dict(foo=1, bar=2, baz=3))": 3,
   "len(list=rows)": 1
@@ -9,6 +9,14 @@ LET rows <= SELECT * FROM scope()[]SELECT len(list=["a", "b"]), len(list="hello"
  {
   "Filtered": {
    "Z": 3
+  }
+ }
+]SELECT dict(A=1, B=2) + dict(A=3, X=1) FROM scope()[
+ {
+  "dict(A=1, B=2) + dict(A=3, X=1)": {
+   "A": 3,
+   "B": 2,
+   "X": 1
   }
  }
 ]LET Foo(X) = if(condition=log(message=format(format="I Ran with %v", args=X)), then=X + 5)[]SELECT cache(func=Foo(X=5), key=5), cache(func=Foo(X=10), key=5), cache(func=Foo(X=10), key=10) FROM scope()[
@@ -42,10 +50,11 @@ LET rows <= SELECT * FROM scope()[]SELECT len(list=["a", "b"]), len(list="hello"
    "B": 2
   }
  }
-]SELECT cidr_contains(ip="192.168.0.132", ranges="192.168.0.0/24"), cidr_contains(ip="191.168.0.132", ranges="192.168.0.0/24") FROM scope()[
+]SELECT cidr_contains(ip="192.168.0.132", ranges="192.168.0.0/24"), cidr_contains(ip="191.168.0.132", ranges="192.168.0.0/24"), cidr_contains(ip="10.168.0.132", ranges=["192.168.0.0/24", "10.0.0.0/8"]) FROM scope()[
  {
   "cidr_contains(ip=\"192.168.0.132\", ranges=\"192.168.0.0/24\")": true,
-  "cidr_contains(ip=\"191.168.0.132\", ranges=\"192.168.0.0/24\")": false
+  "cidr_contains(ip=\"191.168.0.132\", ranges=\"192.168.0.0/24\")": false,
+  "cidr_contains(ip=\"10.168.0.132\", ranges=[\"192.168.0.0/24\", \"10.0.0.0/8\"])": true
  }
 ]SELECT commandline_split(command='''"C:\Program Files\Velociraptor\Velociraptor.exe" service run'''), commandline_split(command="/usr/bin/ls -l 'file with space.txt'", bash_style=TRUE) FROM scope()[
  {
@@ -63,5 +72,57 @@ LET rows <= SELECT * FROM scope()[]SELECT len(list=["a", "b"]), len(list="hello"
 ]SELECT regex_transform(source="Hello world", map=dict( `^Hello`="Goodbye", `world`="Space"), key="A") FROM scope()[
  {
   "regex_transform(source=\"Hello world\", map=dict(`^Hello`=\"Goodbye\", `world`=\"Space\"), key=\"A\")": "Goodbye Space"
+ }
+]SELECT entropy(string="Hello world") FROM scope()[
+ {
+  "entropy(string=\"Hello world\")": 2.84
+ }
+]LET base64_shellcode = 'H4sICHEBVGMAA3RleHQudHh0AMtIzcnJVyjPL8pJ4QIALTsIrwwAAAA='[]SELECT gunzip(string=base64decode(string=base64_shellcode)) FROM scope()[
+ {
+  "gunzip(string=base64decode(string=base64_shellcode))": "hello world\n"
+ }
+]LET TestArray <= ("Hello", "World", "Goodbye", "Universe")[]SELECT all(items=TestArray, filter="x=>x=~'Hello|Uni|Wo|G'"), all(items=TestArray, filter="x=>x=~'Hello|Uni'"), all(items=["Hi", "There"], filter="x=>x =~ 'Hi'"), all(items=["Hi", "There"], filter="x=>x =~ 'Hi|There'") FROM scope()[
+ {
+  "all(items=TestArray, filter=\"x=\u003ex=~'Hello|Uni|Wo|G'\")": true,
+  "all(items=TestArray, filter=\"x=\u003ex=~'Hello|Uni'\")": false,
+  "all(items=[\"Hi\", \"There\"], filter=\"x=\u003ex =~ 'Hi'\")": false,
+  "all(items=[\"Hi\", \"There\"], filter=\"x=\u003ex =~ 'Hi|There'\")": true
+ }
+]SELECT all(items=TestArray, regex='Hello|Uni|Wo|G'), all(items=TestArray, regex='Hello|Uni'), all(items=["Hi", "There"], regex='Hi'), all(items=["Hi", "There"], regex='Hi|There') FROM scope()[
+ {
+  "all(items=TestArray, regex='Hello|Uni|Wo|G')": true,
+  "all(items=TestArray, regex='Hello|Uni')": false,
+  "all(items=[\"Hi\", \"There\"], regex='Hi')": false,
+  "all(items=[\"Hi\", \"There\"], regex='Hi|There')": true
+ }
+]SELECT all(items="Hi There", regex=['Hi', "Goodbye"]), all(items="Hi There", regex=['Hi', "ere"]), all(items=["Hi", "There"], regex=['H|T', 'i|r']) FROM scope()[
+ {
+  "all(items=\"Hi There\", regex=['Hi', \"Goodbye\"])": false,
+  "all(items=\"Hi There\", regex=['Hi', \"ere\"])": true,
+  "all(items=[\"Hi\", \"There\"], regex=['H|T', 'i|r'])": true
+ }
+]LET TestArray <= (dict(X=1, Y="Hello"), dict(X=2, Y="Goodbye"), dict(X=1, Y="World"))[]SELECT *, all(items=Y, filter="x=>x =~ 'Hello|World'"), all(items=Y, filter="x=>x =~ 'World'"), all(items=Y, filter="x=>x =~ 'Goodby'") FROM foreach(row=TestArray) GROUP BY X[
+ {
+  "X": 1,
+  "Y": "World",
+  "all(items=Y, filter=\"x=\u003ex =~ 'Hello|World'\")": true,
+  "all(items=Y, filter=\"x=\u003ex =~ 'World'\")": false,
+  "all(items=Y, filter=\"x=\u003ex =~ 'Goodby'\")": false
+ },
+ {
+  "X": 2,
+  "Y": "Goodbye",
+  "all(items=Y, filter=\"x=\u003ex =~ 'Hello|World'\")": false,
+  "all(items=Y, filter=\"x=\u003ex =~ 'World'\")": false,
+  "all(items=Y, filter=\"x=\u003ex =~ 'Goodby'\")": true
+ }
+]SELECT all(items={ SELECT * FROM foreach(row=TestArray) WHERE X = 1 }, filter="x=> x.Y =~ 'Hel|Worl'") FROM scope()[
+ {
+  "all(items={ SELECT * FROM foreach(row=TestArray) WHERE X = 1 }, filter=\"x=\u003e x.Y =~ 'Hel|Worl'\")": true
+ }
+]SELECT any(items=TestArray, filter="x=>x.Y =~ 'Good'"), all(items=TestArray, filter="x=>x.Y =~ 'Good'") FROM scope()[
+ {
+  "any(items=TestArray, filter=\"x=\u003ex.Y =~ 'Good'\")": true,
+  "all(items=TestArray, filter=\"x=\u003ex.Y =~ 'Good'\")": false
  }
 ]

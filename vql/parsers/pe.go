@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -19,10 +19,15 @@ package parsers
 
 import (
 	"context"
+	"io"
 
 	"github.com/Velocidex/ordereddict"
 	pe "www.velocidex.com/golang/go-pe"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/constants"
+	utils "www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/readers"
 	vfilter "www.velocidex.com/golang/vfilter"
@@ -30,23 +35,28 @@ import (
 )
 
 type _PEFunctionArgs struct {
-	Filename string `vfilter:"required,field=file,doc=The PE file to open."`
-	Accessor string `vfilter:"optional,field=accessor,doc=The accessor to use."`
+	Filename   *accessors.OSPath `vfilter:"required,field=file,doc=The PE file to open."`
+	Accessor   string            `vfilter:"optional,field=accessor,doc=The accessor to use."`
+	BaseOffset int64             `vfilter:"optional,field=base_offset,doc=The offset in the file for the base address."`
 }
 
 type _PEFunction struct{}
 
 func (self _PEFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "parse_pe",
-		Doc:     "Parse a PE file.",
-		ArgType: type_map.AddType(scope, &_PEFunctionArgs{}),
+		Name:     "parse_pe",
+		Doc:      "Parse a PE file.",
+		ArgType:  type_map.AddType(scope, &_PEFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
 func (self _PEFunction) Call(
 	ctx context.Context, scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
+
+	defer utils.RecoverVQL(scope)
+
 	arg := &_PEFunctionArgs{}
 	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
@@ -68,7 +78,15 @@ func (self _PEFunction) Call(
 	}
 	defer paged_reader.Close()
 
-	pe_file, err := pe.NewPEFile(paged_reader)
+	var reader io.ReaderAt = paged_reader
+	var reader_size int64 = paged_reader.MaxSize()
+
+	if arg.BaseOffset > 0 {
+		reader = utils.NewOffsetReader(reader, arg.BaseOffset,
+			arg.BaseOffset+reader_size)
+	}
+
+	pe_file, err := pe.NewPEFileWithSize(reader, reader_size)
 	if err != nil {
 		// Suppress logging for invalid PE files.
 		// scope.Log("parse_pe: %v for %v", err, arg.Filename)
@@ -80,6 +98,9 @@ func (self _PEFunction) Call(
 		Set("FileHeader", pe_file.FileHeader).
 		Set("GUIDAge", pe_file.GUIDAge).
 		Set("PDB", pe_file.PDB).
+		Set("Directories", func() vfilter.Any {
+			return pe_file.GetDirectories()
+		}).
 		Set("Sections", pe_file.Sections).
 		Set("Resources", pe_file.Resources()).
 		Set("VersionInformation", func() vfilter.Any {
@@ -98,6 +119,8 @@ func (self _PEFunction) Call(
 			return pe_file.ImpHash()
 		}).
 		Set("Authenticode", func() vfilter.Any {
+			defer utils.RecoverVQL(scope)
+
 			info, err := pe.ParseAuthenticode(pe_file)
 			if err != nil {
 				return vfilter.Null{}

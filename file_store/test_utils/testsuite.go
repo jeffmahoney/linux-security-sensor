@@ -4,24 +4,23 @@ import (
 	"context"
 	"io/ioutil"
 	"os"
+	"sync"
 	"time"
 
+	"github.com/Velocidex/yaml/v2"
 	"github.com/alecthomas/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+
+	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	"www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/memory"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/services/client_info"
-	"www.velocidex.com/golang/velociraptor/services/frontend"
-	"www.velocidex.com/golang/velociraptor/services/inventory"
-	"www.velocidex.com/golang/velociraptor/services/journal"
-	"www.velocidex.com/golang/velociraptor/services/labels"
-	"www.velocidex.com/golang/velociraptor/services/launcher"
-	"www.velocidex.com/golang/velociraptor/services/notifications"
-	"www.velocidex.com/golang/velociraptor/services/repository"
+	"www.velocidex.com/golang/velociraptor/services/indexing"
+	"www.velocidex.com/golang/velociraptor/services/orgs"
+	"www.velocidex.com/golang/velociraptor/vtesting"
 )
 
 var (
@@ -29,6 +28,9 @@ var (
 	// them separately for tests.
 	definitions = []string{`
 name: Server.Internal.HuntModification
+type: INTERNAL
+`, `
+name: Server.Internal.ClientInfoSnapshot
 type: INTERNAL
 `, `
 name: Server.Internal.ClientDelete
@@ -67,6 +69,12 @@ type: CLIENT_EVENT
 name: System.Hunt.Participation
 type: INTERNAL
 `, `
+name: System.Upload.Completion
+type: SERVER
+`, `
+name: Server.Internal.Enrollment
+type: INTERNAL
+`, `
 name: Server.Internal.MasterRegistrations
 type: INTERNAL
 `, `
@@ -93,6 +101,9 @@ type TestSuite struct {
 	Ctx       context.Context
 	cancel    func()
 	Sm        *services.Service
+	Wg        *sync.WaitGroup
+
+	Services *orgs.ServiceContainer
 }
 
 func (self *TestSuite) LoadConfig() *config_proto.Config {
@@ -113,46 +124,70 @@ func (self *TestSuite) SetupTest() {
 		self.ConfigObj = self.LoadConfig()
 	}
 
+	self.LoadArtifactsIntoConfig(definitions)
+
 	// Start essential services.
 	self.Ctx, self.cancel = context.WithTimeout(context.Background(), time.Second*60)
 	self.Sm = services.NewServiceManager(self.Ctx, self.ConfigObj)
+	self.Wg = &sync.WaitGroup{}
 
-	require.NoError(self.T(), self.Sm.Start(frontend.StartFrontendService))
-	require.NoError(self.T(), self.Sm.Start(journal.StartJournalService))
-	require.NoError(self.T(), self.Sm.Start(notifications.StartNotificationService))
-	require.NoError(self.T(), self.Sm.Start(inventory.StartInventoryService))
-	require.NoError(self.T(), self.Sm.Start(client_info.StartClientInfoService))
-	require.NoError(self.T(), self.Sm.Start(launcher.StartLauncherService))
-	require.NoError(self.T(), self.Sm.Start(repository.StartRepositoryManagerForTest))
-	require.NoError(self.T(), self.Sm.Start(labels.StartLabelService))
+	err := orgs.StartTestOrgManager(
+		self.Ctx, self.Wg, self.ConfigObj, self.Services)
+	require.NoError(self.T(), err)
 
-	self.LoadArtifacts(definitions)
+	// Wait here until the indexer is all ready.
+	vtesting.WaitUntil(time.Second*5, self.T(), func() bool {
+		indexer, err := services.GetIndexer(self.ConfigObj)
+		assert.NoError(self.T(), err)
+		return indexer.(*indexing.Indexer).IsReady()
+	})
 }
 
-func (self *TestSuite) LoadArtifacts(definitions []string) {
-	manager, _ := services.GetRepositoryManager()
-	global_repo, err := manager.GetGlobalRepository(self.ConfigObj)
-	assert.NoError(self.T(), err)
+func (self *TestSuite) LoadArtifacts(definitions ...string) services.Repository {
+	manager, _ := services.GetRepositoryManager(self.ConfigObj)
+	repository, _ := manager.GetGlobalRepository(self.ConfigObj)
 
-	for _, def := range definitions {
-		_, err := global_repo.LoadYaml(def, true, true)
+	for _, definition := range definitions {
+		_, err := repository.LoadYaml(definition,
+			services.ArtifactOptions{
+				ValidateArtifact:  false,
+				ArtifactIsBuiltIn: true})
 		assert.NoError(self.T(), err)
 	}
+	return repository
 }
 
-func (self *TestSuite) LoadCustomArtifacts(definitions []string) {
-	manager, _ := services.GetRepositoryManager()
-	global_repo, err := manager.GetGlobalRepository(self.ConfigObj)
-	assert.NoError(self.T(), err)
-
-	for _, def := range definitions {
-		_, err := global_repo.LoadYaml(def, true, false)
-		assert.NoError(self.T(), err)
+// Parse the definitions and add them to the config so they will be
+// loaded by the repository manager.
+func (self *TestSuite) LoadArtifactsIntoConfig(definitions []string) {
+	if self.ConfigObj.Autoexec == nil {
+		self.ConfigObj.Autoexec = &config_proto.AutoExecConfig{}
 	}
+
+	existing_artifacts := make(map[string]*artifacts_proto.Artifact)
+	for _, def := range self.ConfigObj.Autoexec.ArtifactDefinitions {
+		existing_artifacts[def.Name] = def
+	}
+
+	for _, definition := range definitions {
+		artifact := &artifacts_proto.Artifact{}
+		err := yaml.Unmarshal([]byte(definition), artifact)
+		assert.NoError(self.T(), err)
+		_, pres := existing_artifacts[artifact.Name]
+		if !pres {
+			existing_artifacts[artifact.Name] = artifact
+		}
+	}
+	artifacts := []*artifacts_proto.Artifact{}
+	for _, v := range existing_artifacts {
+		artifacts = append(artifacts, v)
+	}
+
+	self.ConfigObj.Autoexec.ArtifactDefinitions = artifacts
 }
 
 func (self *TestSuite) LoadArtifactFiles(paths ...string) {
-	manager, _ := services.GetRepositoryManager()
+	manager, _ := services.GetRepositoryManager(self.ConfigObj)
 	global_repo, err := manager.GetGlobalRepository(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
@@ -163,7 +198,10 @@ func (self *TestSuite) LoadArtifactFiles(paths ...string) {
 		def, err := ioutil.ReadAll(fd)
 		assert.NoError(self.T(), err)
 
-		_, err = global_repo.LoadYaml(string(def), true, true)
+		_, err = global_repo.LoadYaml(string(def),
+			services.ArtifactOptions{
+				ValidateArtifact:  true,
+				ArtifactIsBuiltIn: true})
 		assert.NoError(self.T(), err)
 	}
 }

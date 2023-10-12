@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -24,6 +24,7 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -61,9 +62,10 @@ func (self *EnvFunction) Call(ctx context.Context,
 
 func (self *EnvFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "environ",
-		Doc:     "Get an environment variable.",
-		ArgType: type_map.AddType(scope, &EnvFunctionArgs{}),
+		Name:     "environ",
+		Doc:      "Get an environment variable.",
+		ArgType:  type_map.AddType(scope, &EnvFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	}
 }
 
@@ -78,8 +80,14 @@ func init() {
 				args *ordereddict.Dict) []vfilter.Row {
 				var result []vfilter.Row
 
+				err := vql_subsystem.CheckAccess(scope, acls.MACHINE_STATE)
+				if err != nil {
+					scope.Log("environ: %s", err)
+					return result
+				}
+
 				arg := &EnvPluginArgs{}
-				err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
+				err = arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 				if err != nil {
 					scope.Log("%s: %s", "environ", err.Error())
 					return result

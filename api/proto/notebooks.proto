@@ -8,6 +8,11 @@ package proto;
 
 option go_package = "www.velocidex.com/golang/velociraptor/api/proto";
 
+message ReformatVQLMessage {
+    string vql = 1;
+}
+
+
 message Env {
     string key = 1;
     string value = 2;
@@ -22,6 +27,7 @@ message NotebookCellRequest {
     string notebook_id = 1;
     string cell_id = 2;
     string input = 3;
+    string name = 11;
 
     uint64 offset = 4;
     uint64 count = 5;
@@ -30,6 +36,8 @@ message NotebookCellRequest {
     bool currently_editing = 8;
 
     repeated Env env = 9;
+
+    bool include_uploads = 10;
 }
 
 message NotebookContext {
@@ -37,6 +45,9 @@ message NotebookContext {
     string hunt_id = 2;
     string flow_id = 3;
     string client_id = 4;
+    string event_artifact = 5;
+    int64 start_time = 6;
+    int64 end_time = 7;
 }
 
 message NotebookMetadata {
@@ -69,6 +80,8 @@ message NotebookMetadata {
 
     AvailableDownloads available_downloads = 10;
 
+    AvailableDownloads available_uploads = 18;
+
     // These environment variables will be populated into each
     // notebook cell in this notebook.
     repeated Env env = 14;
@@ -76,6 +89,10 @@ message NotebookMetadata {
     repeated string timelines = 15;
 
     repeated ColumnType column_types = 17;
+
+    // Cells that are not immediately included but may be included by
+    // the GUI as suggestions.
+    repeated NotebookCellRequest suggestions = 19;
 }
 
 message Notebooks {
@@ -89,6 +106,10 @@ message NotebookCell {
     string cell_id = 4;
     repeated string messages = 5;
 
+    // True if there are more messages than are included in the
+    // messages field above.
+    bool more_messages = 12;
+
     int64 timestamp = 6;
     int64 duration = 10;
 
@@ -100,11 +121,14 @@ message NotebookCell {
     bool calculating = 9;
 
     repeated Env env = 11;
+
+    string error = 13;
 }
 
 message NotebookFileUploadRequest {
     string data = 1;
     string filename = 2;
+    repeated string components = 4;
     string notebook_id = 3;
 }
 

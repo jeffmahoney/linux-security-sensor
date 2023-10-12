@@ -1,20 +1,23 @@
 package http_comms
 
 import (
+	"context"
 	"encoding/binary"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 
-	errors "github.com/pkg/errors"
+	"github.com/go-errors/errors"
 	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
-	"www.velocidex.com/golang/velociraptor/executor"
+	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/responder"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
@@ -25,10 +28,21 @@ const (
 
 type IRingBuffer interface {
 	Enqueue(item []byte)
+
+	// How many bytes are currently available to be sent.
 	AvailableBytes() uint64
+
+	// Lease this much data from the buffer - the data is not deleted,
+	// but it is kept in the file until it is committed.
 	Lease(size uint64) []byte
+
+	// The total size of data in the ring buffer - sum of
+	// AvailableBytes and LeasedBytes
+	TotalSize() uint64
+
 	Commit()
 	Reset()
+	Close()
 }
 
 type Header struct {
@@ -88,6 +102,7 @@ type FileBasedRingBuffer struct {
 
 	fd     *os.File
 	header *Header
+	closed bool
 
 	read_buf  []byte
 	write_buf []byte
@@ -96,11 +111,17 @@ type FileBasedRingBuffer struct {
 	leased_pointer int64
 
 	log_ctx *logging.LogContext
+
+	flow_manager *responder.FlowManager
 }
 
 func (self *FileBasedRingBuffer) Enqueue(item []byte) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
+
+	if self.closed {
+		return
+	}
 
 	binary.LittleEndian.PutUint64(self.write_buf, uint64(len(item)))
 	_, err := self.fd.WriteAt(self.write_buf, int64(self.header.WritePointer))
@@ -126,7 +147,7 @@ func (self *FileBasedRingBuffer) Enqueue(item []byte) {
 
 	logger := logging.GetLogger(self.config_obj, &logging.ClientComponent)
 	logger.WithFields(logrus.Fields{
-		"header":         self.header,
+		"header":         json.MustMarshalString(self.header),
 		"leased_pointer": self.leased_pointer,
 	}).Info("File Ring Buffer: Enqueue")
 
@@ -136,9 +157,16 @@ func (self *FileBasedRingBuffer) Enqueue(item []byte) {
 	// the server, and enough room is available. This has the
 	// effect of blocking the executor and stopping the query
 	// until we return.
-	for self.header.WritePointer > self.header.MaxSize {
+	for self.header.WritePointer > self.header.MaxSize && !self.closed {
 		self.c.Wait()
 	}
+}
+
+func (self *FileBasedRingBuffer) TotalSize() uint64 {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return uint64(self.header.AvailableBytes + self.header.LeasedBytes)
 }
 
 func (self *FileBasedRingBuffer) AvailableBytes() uint64 {
@@ -150,7 +178,8 @@ func (self *FileBasedRingBuffer) AvailableBytes() uint64 {
 
 // Call Lease() repeatadly and compress each result until we get
 // closer to the required size.
-func LeaseAndCompress(self IRingBuffer, size uint64) [][]byte {
+func LeaseAndCompress(self IRingBuffer, size uint64,
+	compression crypto_proto.PackedMessageList_CompressionType) [][]byte {
 	result := [][]byte{}
 	total_len := uint64(0)
 	step := size / 4
@@ -163,42 +192,24 @@ func LeaseAndCompress(self IRingBuffer, size uint64) [][]byte {
 			break
 		}
 
-		compressed_message_list, err := utils.Compress(next_message_list)
-		if err != nil || len(compressed_message_list) == 0 {
-			// Something terrible happened! The file is
-			// corrupted and it is better to start again.
-			self.Reset()
-			break
+		if compression == crypto_proto.PackedMessageList_ZCOMPRESSION {
+			compressed_message_list, err := utils.Compress(next_message_list)
+			if err != nil || len(compressed_message_list) == 0 {
+				// Something terrible happened! The file is
+				// corrupted and it is better to start again.
+				self.Reset()
+				break
+			}
+			result = append(result, compressed_message_list)
+			total_len += uint64(len(compressed_message_list))
+
+		} else {
+			result = append(result, next_message_list)
+			total_len += uint64(len(next_message_list))
 		}
-		result = append(result, compressed_message_list)
-		total_len += uint64(len(compressed_message_list))
 	}
 
 	return result
-}
-
-// Determine if the item is blacklisted. Items are blacklisted when
-// their corresponding flow is cancelled.
-func (self *FileBasedRingBuffer) IsItemBlackListed(item []byte) bool {
-	message_list := crypto_proto.MessageList{}
-	err := proto.Unmarshal(item, &message_list)
-	if err != nil || len(message_list.Job) == 0 {
-		return false
-	}
-
-	message := message_list.Job[0]
-
-	// Always allow log messages through - even after a flow has
-	// been cancelled. This allows us to register the cancellation
-	// message in the flow logs.
-	if message.LogMessage != nil {
-		return false
-	}
-
-	if executor.Canceller != nil {
-		return executor.Canceller.IsCancelled(message.SessionId)
-	}
-	return false
 }
 
 func (self *FileBasedRingBuffer) Lease(size uint64) []byte {
@@ -211,26 +222,30 @@ func (self *FileBasedRingBuffer) Lease(size uint64) []byte {
 		n, err := self.fd.ReadAt(self.read_buf, self.leased_pointer)
 		if err == nil && n == len(self.read_buf) {
 			length := int64(binary.LittleEndian.Uint64(self.read_buf))
-			// File might be corrupt - just reset the
-			// entire file.
+
+			// File might be corrupt - just reset the entire file.
 			if length > constants.MAX_MEMORY*2 || length <= 0 {
 				self.log_ctx.Error("Possible corruption detected - item length is too large.")
 				self._Truncate()
 				return nil
 			}
 			item := make([]byte, length)
-			n, _ := self.fd.ReadAt(item, self.leased_pointer+8)
-			if int64(n) != length {
+			n, err := self.fd.ReadAt(item, self.leased_pointer+8)
+			if err != nil || int64(n) != length {
 				self.log_ctx.Errorf(
 					"Possible corruption detected - expected item of length %v received %v.",
 					length, n)
 				self._Truncate()
 				return nil
 			}
-			if !self.IsItemBlackListed(item) {
-				result = append(result, item...)
-			}
 
+			// Filter the item from any blacklisted flow ids
+			filtered_item := FilterBlackListedItems(
+				context.Background(), self.flow_manager, self.config_obj, item)
+			result = append(result, filtered_item...)
+
+			// Skip the full length of the unfiltered item to maintain
+			// alignment.
 			self.leased_pointer += 8 + int64(n)
 			self.header.LeasedBytes += int64(n)
 			self.header.AvailableBytes -= int64(n)
@@ -260,6 +275,9 @@ func (self *FileBasedRingBuffer) _Truncate() {
 	self.leased_pointer = FirstRecordOffset
 	serialized, _ := self.header.MarshalBinary()
 	_, _ = self.fd.WriteAt(serialized, 0)
+
+	// Unblock any blocked writers to let them know there is now room
+	// in the file.
 	self.c.Broadcast()
 }
 
@@ -271,7 +289,16 @@ func (self *FileBasedRingBuffer) Reset() {
 }
 
 func (self *FileBasedRingBuffer) Close() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self.closed = true
 	self.fd.Close()
+	os.Remove(self.fd.Name())
+
+	// Unblock any blocked writers to let them know this file is now
+	// closed.
+	self.c.Broadcast()
 }
 
 func (self *FileBasedRingBuffer) Commit() {
@@ -293,12 +320,34 @@ func (self *FileBasedRingBuffer) Commit() {
 	_, _ = self.fd.WriteAt(serialized, 0)
 
 	logger.WithFields(logrus.Fields{
-		"header": self.header,
+		"header": json.MustMarshalString(self.header),
 	}).Info("File Ring Buffer: Commit")
 }
 
-func NewFileBasedRingBuffer(
+// Open an existing ring buffer file.
+func OpenFileBasedRingBuffer(
+	ctx context.Context,
 	config_obj *config_proto.Config,
+	flow_manager *responder.FlowManager,
+	log_ctx *logging.LogContext) (*FileBasedRingBuffer, error) {
+
+	filename := getLocalBufferName(config_obj)
+	if filename == "" {
+		return nil, errors.New("Unsupport platform")
+	}
+
+	fd, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0700)
+	if err != nil {
+		return nil, err
+	}
+
+	return newFileBasedRingBuffer(fd, config_obj, flow_manager, log_ctx)
+}
+
+func NewFileBasedRingBuffer(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	flow_manager *responder.FlowManager,
 	log_ctx *logging.LogContext) (*FileBasedRingBuffer, error) {
 
 	if config_obj.Client == nil || config_obj.Client.LocalBuffer == nil {
@@ -310,10 +359,43 @@ func NewFileBasedRingBuffer(
 		return nil, errors.New("Unsupport platform")
 	}
 
-	fd, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0700)
+	// Reset the buffer file by removing old data. We prevent symlink
+	// attacks by replacing any existing file with a new file. In this
+	// case we do not want to use a random file name because the
+	// Velociraptor client is often killed without warning and
+	// restarted (e.g. system reboot). This means we dont always get a
+	// chance to cleanup and after a lot of restarts random file names
+	// will accumulate.  By default the temp directory is created
+	// inside a protected directory
+	// (`C:\Program Files\Velociraptor\Tools`) so symlink attacks are
+	// mitigated but in case Velociraptor is misconfigured we are
+	// extra careful.
+	fd, err := os.CreateTemp(filepath.Dir(filename), "")
 	if err != nil {
 		return nil, err
 	}
+
+	err = os.Rename(fd.Name(), filename)
+	if err != nil {
+		// On Windows the above rename operation does not work because
+		// the file is still open.
+		fd.Close()
+		os.Remove(fd.Name())
+
+		fd, err = os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0700)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return newFileBasedRingBuffer(fd, config_obj, flow_manager, log_ctx)
+}
+
+func newFileBasedRingBuffer(
+	fd *os.File,
+	config_obj *config_proto.Config,
+	flow_manager *responder.FlowManager,
+	log_ctx *logging.LogContext) (*FileBasedRingBuffer, error) {
 
 	header := &Header{
 		// Pad the header a bit to allow for extensions.
@@ -363,12 +445,13 @@ func NewFileBasedRingBuffer(
 		write_buf:      make([]byte, 8),
 		leased_pointer: header.ReadPointer,
 		log_ctx:        log_ctx,
+		flow_manager:   flow_manager,
 	}
 
 	result.c = sync.NewCond(&result.mu)
 
 	log_ctx.WithFields(logrus.Fields{
-		"filename": filename,
+		"filename": fd.Name(),
 		"max_size": result.header.MaxSize,
 	}).Info("Ring Buffer: Creation")
 
@@ -382,6 +465,7 @@ type RingBuffer struct {
 	// arrive.
 	mu       sync.Mutex
 	messages [][]byte
+	closed   bool
 
 	// The index in the messages array where messages before it
 	// are leased.
@@ -398,18 +482,26 @@ type RingBuffer struct {
 
 	// The maximum size of the ring buffer
 	Size uint64
+
+	flow_manager *responder.FlowManager
 }
 
 func (self *RingBuffer) Reset() {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
+	self.total_length = 0
 	self.messages = nil
+	self.c.Broadcast()
 }
 
 func (self *RingBuffer) Enqueue(item []byte) {
 	self.c.L.Lock()
 	defer self.c.L.Unlock()
+
+	if self.closed {
+		return
+	}
 
 	// Write the message immediately into the ring buffer. If we
 	// crash, the message will be written to disk and
@@ -429,40 +521,68 @@ func (self *RingBuffer) Enqueue(item []byte) {
 	// the server, and enough room is available. This has the
 	// effect of blocking the executor and stopping the query
 	// until we return.
-	for self.total_length > self.Size {
+	for self.total_length > self.Size && !self.closed {
 		self.c.Wait()
 	}
 }
 
-func (self *RingBuffer) AvailableBytes() uint64 {
+func (self *RingBuffer) TotalSize() uint64 {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
 	return self.total_length
 }
 
+func (self *RingBuffer) AvailableBytes() uint64 {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return self.total_length - self.leased_length
+}
+
 // Determine if the item is blacklisted. Items are blacklisted when
 // their corresponding flow is cancelled.
-func (self *RingBuffer) IsItemBlackListed(item []byte) bool {
-	message_list := crypto_proto.MessageList{}
-	err := proto.Unmarshal(item, &message_list)
+func FilterBlackListedItems(
+	ctx context.Context,
+	flow_manager *responder.FlowManager,
+	config_obj *config_proto.Config, item []byte) []byte {
+
+	message_list := &crypto_proto.MessageList{}
+	err := proto.Unmarshal(item, message_list)
 	if err != nil || len(message_list.Job) == 0 {
-		return false
+		return item
 	}
 
-	message := message_list.Job[0]
+	modified := false
+	result := &crypto_proto.MessageList{}
+	for _, message := range message_list.Job {
+		// Always allow log messages through - even after a flow has
+		// been cancelled. This allows us to register the cancellation
+		// message in the flow logs.
+		if message.LogMessage != nil ||
 
-	// Always allow log messages through - even after a flow has
-	// been cancelled. This allows us to register the cancellation
-	// message in the flow logs.
-	if message.LogMessage != nil {
-		return false
+			// Always allow FlowStat to be sent
+			message.FlowStats != nil ||
+
+			// Remove blacklisted collections (because they were
+			// cancelled).
+			!flow_manager.IsCancelled(message.SessionId) {
+
+			result.Job = append(result.Job, message)
+		} else {
+			modified = true
+		}
 	}
 
-	if executor.Canceller != nil {
-		return executor.Canceller.IsCancelled(message.SessionId)
+	if !modified {
+		return item
 	}
-	return false
+
+	serialized, err := proto.Marshal(result)
+	if err != nil {
+		return item
+	}
+	return serialized
 }
 
 // Leases a group of messages for transmission. Will not advance the
@@ -482,9 +602,13 @@ func (self *RingBuffer) Lease(size uint64) []byte {
 	leased := make([]byte, 0)
 
 	for _, item := range self.messages[self.leased_idx:] {
-		if !self.IsItemBlackListed(item) {
-			leased = append(leased, item...)
-		}
+		filtered := FilterBlackListedItems(
+			context.Background(), self.flow_manager, self.config_obj, item)
+
+		leased = append(leased, filtered...)
+
+		// Skip the full length of the unfiltered message - the
+		// filtered message may be shorter.
 		self.leased_length += uint64(len(item))
 		self.leased_idx += 1
 		if uint64(len(leased)) > size {
@@ -516,6 +640,16 @@ func (self *RingBuffer) Rollback() {
 	}).Info("Ring Buffer: Rollback")
 }
 
+func (self *RingBuffer) Close() {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self.closed = true
+	self.total_length = 0
+	self.messages = nil
+	self.c.Broadcast()
+}
+
 // Commits by removing the read messages from the ring buffer.
 func (self *RingBuffer) Commit() {
 	self.mu.Lock()
@@ -542,11 +676,13 @@ func (self *RingBuffer) Commit() {
 	self.c.Broadcast()
 }
 
-func NewRingBuffer(config_obj *config_proto.Config, size uint64) *RingBuffer {
+func NewRingBuffer(config_obj *config_proto.Config,
+	flow_manager *responder.FlowManager, size uint64) *RingBuffer {
 	result := &RingBuffer{
-		messages:   make([][]byte, 0),
-		Size:       size,
-		config_obj: config_obj,
+		messages:     make([][]byte, 0),
+		Size:         size,
+		config_obj:   config_obj,
+		flow_manager: flow_manager,
 	}
 	result.c = sync.NewCond(&result.mu)
 
@@ -566,16 +702,20 @@ func getLocalBufferName(config_obj *config_proto.Config) string {
 	}
 }
 
-func NewLocalBuffer(config_obj *config_proto.Config) IRingBuffer {
+func NewLocalBuffer(
+	ctx context.Context,
+	flow_manager *responder.FlowManager,
+	config_obj *config_proto.Config) IRingBuffer {
 	if config_obj.Client.LocalBuffer.DiskSize > 0 &&
 		getLocalBufferName(config_obj) != "" {
 
 		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
-		rb, err := NewFileBasedRingBuffer(config_obj, logger)
+		rb, err := NewFileBasedRingBuffer(ctx, config_obj, flow_manager, logger)
 		if err == nil {
 			return rb
 		}
 		logger.Error("Unable to create a file based ring buffer - using in memory only.")
 	}
-	return NewRingBuffer(config_obj, config_obj.Client.LocalBuffer.MemorySize)
+	return NewRingBuffer(config_obj, flow_manager,
+		config_obj.Client.LocalBuffer.MemorySize)
 }

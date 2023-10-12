@@ -13,14 +13,27 @@ reports:
 
       {{ if $artifact.BuiltIn }}
       {{ else }}
-      #### User Added
+      ##### Custom Artifact
       {{ end }}
 
       {{ if $artifact.Author }}
-      ##### by {{ $artifact.Author }}
+      ##### Author: {{ $artifact.Author }}
       {{end}}
 
+      <div class="description-content">
+
       {{ $artifact.Description }}
+
+      {{ if $artifact.Reference }}
+      ---
+      References:
+      <ul>
+      {{- range $item := $artifact.Reference -}}
+      <li>{{ $item }}</li>
+      {{- end -}}
+      </ul>
+      {{ end }}
+      </div>
 
       {{ if $artifact.Tools }}
       ### Tools
@@ -35,7 +48,7 @@ reports:
 
       ### Parameters
 
-      <table class="table table-striped table-hover">
+      <table class="table table-striped">
       <thead>
          <tr>
            <th>Name</th>
@@ -61,7 +74,7 @@ reports:
 
       {{ if $artifact.Imports }}
 
-      <table class="table table-striped table-hover">
+      <table class="table table-striped">
       <thead>
          <tr>
            <th>Imports</th>

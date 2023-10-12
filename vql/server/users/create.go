@@ -2,11 +2,10 @@ package users
 
 import (
 	"context"
-	"crypto/rand"
 
 	"github.com/Velocidex/ordereddict"
-	"www.velocidex.com/golang/velociraptor/acls"
-	"www.velocidex.com/golang/velociraptor/api/authenticators"
+	acl_proto "www.velocidex.com/golang/velociraptor/acls/proto"
+	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/users"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
@@ -14,9 +13,10 @@ import (
 )
 
 type UserCreateFunctionArgs struct {
-	Username string   `vfilter:"required,field=user,docs=The user to create or update."`
-	Roles    []string `vfilter:"required,field=roles,docs=List of roles to give the user."`
-	Password string   `vfilter:"optional,field=password,docs=A password to set for the user (If not using SSO this might be needed)."`
+	Username string   `vfilter:"required,field=user,doc=The user to create or update."`
+	Roles    []string `vfilter:"required,field=roles,doc=List of roles to give the user."`
+	Password string   `vfilter:"optional,field=password,doc=A password to set for the user (If not using SSO this might be needed)."`
+	OrgIds   []string `vfilter:"optional,field=orgs,doc=One or more org IDs to grant access to. If empty we use the current org."`
 }
 
 type UserCreateFunction struct{}
@@ -26,73 +26,52 @@ func (self UserCreateFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
-	if err != nil {
-		scope.Log("user_create: %s", err)
-		return vfilter.Null{}
-	}
-
-	config_obj, ok := vql_subsystem.GetServerConfig(scope)
-	if !ok {
-		scope.Log("Command can only run on the server")
-		return vfilter.Null{}
-	}
-
+	// ACLs are checked by the users module
 	arg := &UserCreateFunctionArgs{}
-	err = arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
+	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
 		scope.Log("user_create: %s", err)
 		return vfilter.Null{}
 	}
 
-	// OK - Lets make the user now
-	user_record, err := users.NewUserRecord(arg.Username)
+	org_config_obj, ok := vql_subsystem.GetServerConfig(scope)
+	if !ok {
+		scope.Log("user_create: Command can only run on the server")
+		return vfilter.Null{}
+	}
+
+	// Add the user to the current org if no orgs are specified
+	if len(arg.OrgIds) == 0 {
+		arg.OrgIds = append(arg.OrgIds, org_config_obj.OrgId)
+	}
+
+	principal := vql_subsystem.GetPrincipal(scope)
+	policy := &acl_proto.ApiClientACL{
+		Roles: arg.Roles,
+	}
+
+	err = users.AddUserToOrg(ctx, users.AddNewUser,
+		principal, arg.Username, arg.OrgIds, policy)
 	if err != nil {
 		scope.Log("user_create: %s", err)
 		return vfilter.Null{}
 	}
 
-	// Check the password if needed
-	authenticator, err := authenticators.NewAuthenticator(config_obj)
-	if err != nil {
-		scope.Log("user_create: %s", err)
-		return vfilter.Null{}
-	}
+	services.LogAudit(ctx,
+		org_config_obj, principal, "user_create",
+		ordereddict.NewDict().
+			Set("username", arg.Username).
+			Set("acl", policy).
+			Set("org_ids", arg.OrgIds))
 
-	if authenticator.IsPasswordLess() {
-		// Set a random password on the account to prevent login if
-		// the authenticator is accidentally changed to a password
-		// based one.
-		password := make([]byte, 100)
-		_, err = rand.Read(password)
+	if arg.Password != "" {
+		// Write the user record.
+		err = users.SetUserPassword(
+			ctx, org_config_obj, principal, arg.Username, arg.Password, "")
 		if err != nil {
 			scope.Log("user_create: %s", err)
 			return vfilter.Null{}
 		}
-		users.SetPassword(user_record, string(password))
-
-	} else if arg.Password == "" {
-		// Do not accept an empty password if we are using a password
-		// based authenticator.
-		scope.Log("Authentication requires a password but one was not provided.")
-		return vfilter.Null{}
-
-	} else {
-		users.SetPassword(user_record, arg.Password)
-	}
-
-	// Grant the roles to the user
-	err = acls.GrantRoles(config_obj, arg.Username, arg.Roles)
-	if err != nil {
-		scope.Log("user_create: %s", err)
-		return vfilter.Null{}
-	}
-
-	// Write the user record.
-	err = users.SetUser(config_obj, user_record)
-	if err != nil {
-		scope.Log("user_create: %s", err)
-		return vfilter.Null{}
 	}
 
 	return arg.Username

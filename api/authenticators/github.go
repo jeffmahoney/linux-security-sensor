@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -22,13 +22,12 @@ import (
 	"io"
 	"io/ioutil"
 	"net/http"
-	"time"
 
-	jwt "github.com/golang-jwt/jwt"
 	"github.com/sirupsen/logrus"
 	context "golang.org/x/net/context"
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/github"
+	utils "www.velocidex.com/golang/velociraptor/api/utils"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/json"
@@ -40,37 +39,62 @@ type GitHubUser struct {
 	AvatarUrl string `json:"avatar_url"`
 }
 
-type GitHubAuthenticator struct{}
+type GitHubAuthenticator struct {
+	config_obj       *config_proto.Config
+	authenticator    *config_proto.Authenticator
+	base, public_url string
+}
+
+// The URL that will be used to log in.
+func (self *GitHubAuthenticator) LoginURL() string {
+	return utils.Join(self.base, "/auth/github/login")
+}
 
 func (self *GitHubAuthenticator) IsPasswordLess() bool {
 	return true
 }
 
-func (self *GitHubAuthenticator) AddHandlers(config_obj *config_proto.Config, mux *http.ServeMux) error {
-	mux.Handle("/auth/github/login", oauthGithubLogin(config_obj))
-	mux.Handle("/auth/github/callback", oauthGithubCallback(config_obj))
+func (self *GitHubAuthenticator) RequireClientCerts() bool {
+	return false
+}
 
-	installLogoff(config_obj, mux)
+func (self *GitHubAuthenticator) AuthRedirectTemplate() string {
+	return self.authenticator.AuthRedirectTemplate
+}
+
+func (self *GitHubAuthenticator) AddHandlers(mux *http.ServeMux) error {
+	mux.Handle(utils.Join(self.base, "/auth/github/login"),
+		IpFilter(self.config_obj, self.oauthGithubLogin()))
+	mux.Handle(utils.Join(self.base, "/auth/github/callback"),
+		IpFilter(self.config_obj, self.oauthGithubCallback()))
+	return nil
+}
+
+func (self *GitHubAuthenticator) AddLogoff(mux *http.ServeMux) error {
+	installLogoff(self.config_obj, mux)
 	return nil
 }
 
 // Check that the user is proerly authenticated.
 func (self *GitHubAuthenticator) AuthenticateUserHandler(
-	config_obj *config_proto.Config,
 	parent http.Handler) http.Handler {
 
 	return authenticateUserHandle(
-		config_obj, parent, "/auth/github/login", "GitHub")
+		self.config_obj,
+		func(w http.ResponseWriter, r *http.Request, err error, username string) {
+			reject_with_username(self.config_obj, w, r, err, username,
+				utils.Join(self.base, "/auth/github/login"), "Github")
+		},
+		parent)
 }
 
-func oauthGithubLogin(config_obj *config_proto.Config) http.Handler {
-	authenticator := config_obj.GUI.Authenticator
-
+func (self *GitHubAuthenticator) oauthGithubLogin() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var githubOauthConfig = &oauth2.Config{
-			RedirectURL:  config_obj.GUI.PublicUrl + "auth/github/callback",
-			ClientID:     authenticator.OauthClientId,
-			ClientSecret: authenticator.OauthClientSecret,
+			RedirectURL: utils.Join(self.public_url, self.base,
+				"/auth/github/callback"),
+			ClientID:     self.authenticator.OauthClientId,
+			ClientSecret: self.authenticator.OauthClientSecret,
 			Scopes:       []string{"user:email"},
 			Endpoint:     github.Endpoint,
 		}
@@ -78,7 +102,7 @@ func oauthGithubLogin(config_obj *config_proto.Config) http.Handler {
 		// Create oauthState cookie
 		oauthState, err := r.Cookie("oauthstate")
 		if err != nil {
-			oauthState = generateStateOauthCookie(w)
+			oauthState = generateStateOauthCookie(self.config_obj, w)
 		}
 
 		u := githubOauthConfig.AuthCodeURL(oauthState.Value, oauth2.ApprovalForce)
@@ -86,85 +110,89 @@ func oauthGithubLogin(config_obj *config_proto.Config) http.Handler {
 	})
 }
 
-func oauthGithubCallback(config_obj *config_proto.Config) http.Handler {
+func (self *GitHubAuthenticator) oauthGithubCallback() http.Handler {
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Read oauthState from Cookie
 		oauthState, _ := r.Cookie("oauthstate")
 
-		if r.FormValue("state") != oauthState.Value {
-			logging.GetLogger(config_obj, &logging.GUIComponent).
+		if oauthState == nil || r.FormValue("state") != oauthState.Value {
+			logging.GetLogger(self.config_obj, &logging.GUIComponent).
 				Error("invalid oauth github state")
-			http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+			http.Redirect(w, r, utils.Homepage(self.config_obj),
+				http.StatusTemporaryRedirect)
 			return
 		}
 
-		data, err := getUserDataFromGithub(
-			r.Context(), config_obj, r.FormValue("code"))
-		if err != nil {
-			logging.GetLogger(config_obj, &logging.GUIComponent).
+		formError := r.FormValue("error")
+		if formError != "" {
+			desc := r.FormValue("error_description")
+			if desc != "" {
+				formError = desc
+			}
+			logging.GetLogger(self.config_obj, &logging.GUIComponent).
 				WithFields(logrus.Fields{
-					"err": err,
+					"err": formError,
 				}).Error("getUserDataFromGithub")
-			http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+			http.Redirect(w, r, utils.Homepage(self.config_obj),
+				http.StatusTemporaryRedirect)
+			return
+		}
+
+		data, err := self.getUserDataFromGithub(r.Context(), r.FormValue("code"))
+		if err != nil {
+			logging.GetLogger(self.config_obj, &logging.GUIComponent).
+				WithFields(logrus.Fields{
+					"err": err.Error(),
+				}).Error("getUserDataFromGithub")
+			http.Redirect(w, r, utils.Homepage(self.config_obj),
+				http.StatusTemporaryRedirect)
 			return
 		}
 
 		user_info := &GitHubUser{}
 		err = json.Unmarshal(data, &user_info)
 		if err != nil {
-			logging.GetLogger(config_obj, &logging.GUIComponent).
+			logging.GetLogger(self.config_obj, &logging.GUIComponent).
 				WithFields(logrus.Fields{
-					"err": err,
+					"err": err.Error(),
 				}).Error("getUserDataFromGithub")
-			http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+			http.Redirect(w, r, utils.Homepage(self.config_obj),
+				http.StatusTemporaryRedirect)
 			return
 		}
 
-		// Create a new token object, specifying signing method and the claims
-		// you would like it to contain.
-		token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
-			"user": user_info.Login,
-			// Required re-auth after one day.
-			"expires": float64(time.Now().AddDate(0, 0, 1).Unix()),
-			"picture": user_info.AvatarUrl,
-		})
-
-		// Sign and get the complete encoded token as a string using the secret
-		tokenString, err := token.SignedString(
-			[]byte(config_obj.Frontend.PrivateKey))
+		cookie, err := getSignedJWTTokenCookie(
+			self.config_obj, self.authenticator,
+			&Claims{
+				Username: user_info.Login,
+				Picture:  user_info.AvatarUrl,
+			})
 		if err != nil {
-			logging.GetLogger(config_obj, &logging.GUIComponent).
+			logging.GetLogger(self.config_obj, &logging.GUIComponent).
 				WithFields(logrus.Fields{
-					"err": err,
+					"err": err.Error(),
 				}).Error("getUserDataFromGithub")
-			http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+			http.Redirect(w, r, utils.Homepage(self.config_obj),
+				http.StatusTemporaryRedirect)
 			return
 		}
 
-		// Set the cookie and redirect.
-		cookie := &http.Cookie{
-			Name:     "VelociraptorAuth",
-			Value:    tokenString,
-			Path:     "/",
-			Secure:   true,
-			HttpOnly: true,
-			Expires:  time.Now().AddDate(0, 0, 1),
-		}
 		http.SetCookie(w, cookie)
-		http.Redirect(w, r, "/", http.StatusTemporaryRedirect)
+		http.Redirect(w, r, utils.Homepage(self.config_obj),
+			http.StatusTemporaryRedirect)
 	})
 }
 
-func getUserDataFromGithub(
-	ctx context.Context,
-	config_obj *config_proto.Config, code string) ([]byte, error) {
-	authenticator := config_obj.GUI.Authenticator
+func (self *GitHubAuthenticator) getUserDataFromGithub(
+	ctx context.Context, code string) ([]byte, error) {
 
 	// Use code to get token and get user info from GitHub.
 	var githubOauthConfig = &oauth2.Config{
-		RedirectURL:  config_obj.GUI.PublicUrl + "auth/github/callback",
-		ClientID:     authenticator.OauthClientId,
-		ClientSecret: authenticator.OauthClientSecret,
+		RedirectURL: utils.Join(self.public_url, self.base,
+			"/auth/github/callback"),
+		ClientID:     self.authenticator.OauthClientId,
+		ClientSecret: self.authenticator.OauthClientSecret,
 		Scopes:       []string{},
 		Endpoint:     github.Endpoint,
 	}

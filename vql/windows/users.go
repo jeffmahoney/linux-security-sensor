@@ -1,8 +1,8 @@
 // +build windows
 
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -27,6 +27,7 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -165,33 +166,36 @@ func (self *LookupSidFunction) Call(ctx context.Context,
 		return false
 	}
 
-	sid, err := syscall.StringToSid(arg.Sid)
+	return GetNameFromSID(arg.Sid)
+}
+
+func GetNameFromSID(name string) string {
+	sid, err := syscall.StringToSid(name)
 	if err != nil {
-		scope.Log("LookupSID: %s", err.Error())
-		return vfilter.Null{}
+		return name
 	}
 
 	namelen := uint32(255)
-	name := make([]uint16, namelen)
+	utf16_name := make([]uint16, namelen)
 	sid_name_use := uint32(0)
 	domain_len := uint32(255)
 	domain := make([]uint16, domain_len)
 	system_name := make([]uint16, 10)
-	err = syscall.LookupAccountSid(&system_name[0], sid, &name[0], &namelen,
+	err = syscall.LookupAccountSid(&system_name[0], sid, &utf16_name[0], &namelen,
 		&domain[0], &domain_len, &sid_name_use)
 	if err != nil {
-		scope.Log("LookupSID: %s", err.Error())
-		return vfilter.Null{}
+		return name
 	}
 
-	return syscall.UTF16ToString(name)
+	return syscall.UTF16ToString(utf16_name)
 }
 
 func (self *LookupSidFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "lookupSID",
-		Doc:     "Get information about the SID.",
-		ArgType: type_map.AddType(scope, &LookupSidFunctionArgs{}),
+		Name:     "lookupSID",
+		Doc:      "Get information about the SID.",
+		ArgType:  type_map.AddType(scope, &LookupSidFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	}
 }
 

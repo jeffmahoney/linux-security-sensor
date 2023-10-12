@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	"github.com/Velocidex/ttlcache/v2"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/crypto/client"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
@@ -17,17 +18,16 @@ import (
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services/journal"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 type ServerCryptoManager struct {
 	*client.CryptoManager
 }
 
-func (self *ServerCryptoManager) Delete(client_id string) {
-
-}
-
-func (self *ServerCryptoManager) AddCertificateRequest(csr_pem []byte) (string, error) {
+func (self *ServerCryptoManager) AddCertificateRequest(
+	config_obj *config_proto.Config,
+	csr_pem []byte) (string, error) {
 	csr, err := crypto_utils.ParseX509CSRFromPemStr(csr_pem)
 	if err != nil {
 		return "", err
@@ -57,11 +57,16 @@ func (self *ServerCryptoManager) AddCertificateRequest(csr_pem []byte) (string, 
 		return "", errors.New("Invalid CSR")
 	}
 	err = self.Resolver.SetPublicKey(
-		common_name, csr.PublicKey.(*rsa.PublicKey))
+		config_obj,
+		utils.ClientIdFromConfigObj(common_name, config_obj),
+		csr.PublicKey.(*rsa.PublicKey))
 	if err != nil {
 		return "", err
 	}
-	return csr.Subject.CommonName, nil
+
+	// Derive the client id from the common name and the org id
+	client_id := utils.ClientIdFromConfigObj(csr.Subject.CommonName, config_obj)
+	return client_id, nil
 }
 
 func NewServerCryptoManager(
@@ -90,10 +95,14 @@ func NewServerCryptoManager(
 		return nil, err
 	}
 
-	server_manager := &ServerCryptoManager{base}
+	server_manager := &ServerCryptoManager{
+		CryptoManager: base,
+	}
 
 	err = journal.WatchQueueWithCB(ctx, config_obj, wg,
-		"Server.Internal.ClientDelete", func(ctx context.Context,
+		"Server.Internal.ClientDelete",
+		"CryptoServerManager",
+		func(ctx context.Context,
 			config_obj *config_proto.Config,
 			row *ordereddict.Dict) error {
 
@@ -101,7 +110,7 @@ func NewServerCryptoManager(
 			logger.Info("Removing client key from cache because client was deleted  %v\n", row)
 			client_id, pres := row.GetString("ClientId")
 			if pres {
-				server_manager.Delete(client_id)
+				server_manager.DeleteSubject(client_id)
 			}
 			return nil
 		})
@@ -110,27 +119,43 @@ func NewServerCryptoManager(
 }
 
 type serverPublicKeyResolver struct {
-	config_obj *config_proto.Config
+	// Cache a failure to get the key for a while so we do not get
+	// overwhelmed in the slow path for clients that are not yet
+	// enrolled.
+	negative_lru *ttlcache.Cache
+}
+
+func (self *serverPublicKeyResolver) DeleteSubject(client_id string) {
+	self.negative_lru.Remove(client_id)
 }
 
 func (self *serverPublicKeyResolver) GetPublicKey(
+	config_obj *config_proto.Config,
 	client_id string) (*rsa.PublicKey, bool) {
 
+	// Check if we failed to get this key recently - this reduces IO
+	// while clients enrol.
+	_, err := self.negative_lru.Get(client_id)
+	if err == nil {
+		return nil, false
+	}
+
 	client_path_manager := paths.NewClientPathManager(client_id)
-	db, err := datastore.GetDB(self.config_obj)
+	db, err := datastore.GetDB(config_obj)
 	if err != nil {
 		return nil, false
 	}
 
 	pem := &crypto_proto.PublicKey{}
-	err = db.GetSubject(self.config_obj,
-		client_path_manager.Key(), pem)
+	err = db.GetSubject(config_obj, client_path_manager.Key(), pem)
 	if err != nil {
+		self.negative_lru.Set(client_id, true)
 		return nil, false
 	}
 
 	key, err := crypto_utils.PemToPublicKey(pem.Pem)
 	if err != nil {
+		self.negative_lru.Set(client_id, true)
 		return nil, false
 	}
 
@@ -138,10 +163,13 @@ func (self *serverPublicKeyResolver) GetPublicKey(
 }
 
 func (self *serverPublicKeyResolver) SetPublicKey(
+	config_obj *config_proto.Config,
 	client_id string, key *rsa.PublicKey) error {
 
+	self.negative_lru.Remove(client_id)
+
 	client_path_manager := paths.NewClientPathManager(client_id)
-	db, err := datastore.GetDB(self.config_obj)
+	db, err := datastore.GetDB(config_obj)
 	if err != nil {
 		return err
 	}
@@ -150,7 +178,7 @@ func (self *serverPublicKeyResolver) SetPublicKey(
 		Pem:        crypto_utils.PublicKeyToPem(key),
 		EnrollTime: uint64(time.Now().Unix()),
 	}
-	return db.SetSubjectWithCompletion(self.config_obj,
+	return db.SetSubjectWithCompletion(config_obj,
 		client_path_manager.Key(), pem, nil)
 }
 
@@ -160,9 +188,25 @@ func NewServerPublicKeyResolver(
 	ctx context.Context,
 	config_obj *config_proto.Config,
 	wg *sync.WaitGroup) (client.PublicKeyResolver, error) {
+
 	result := &serverPublicKeyResolver{
-		config_obj: config_obj,
+		// Cache missing keys for 60 seconds.
+		negative_lru: ttlcache.NewCache(),
 	}
+
+	timeout := time.Duration(10 * time.Second)
+	if config_obj.Defaults != nil {
+		if config_obj.Defaults.UnauthenticatedLruTimeoutSec < 0 {
+			return result, nil
+		}
+
+		if config_obj.Defaults.UnauthenticatedLruTimeoutSec > 0 {
+			timeout = time.Duration(
+				config_obj.Defaults.UnauthenticatedLruTimeoutSec) * time.Second
+		}
+	}
+
+	result.negative_lru.SetTTL(timeout)
 
 	return result, nil
 }

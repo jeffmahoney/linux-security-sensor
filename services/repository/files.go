@@ -11,20 +11,56 @@ import (
 
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/services"
 )
 
-// Loads the global repository with artifacts from the frontend path
-// and the file store.
+// Loads the global repository with artifacts from local filesystem
+// directories. You can specify additional artifact directories in
+// - Frontend.ArtifactDefinitionsDirectory
+// - Defaults.ArtifactDefinitionsDirectories
+
+// Artifacts added through the --definition file will be added to
+// these locations.
 func InitializeGlobalRepositoryFromFilesystem(
 	ctx context.Context, config_obj *config_proto.Config,
-	global_repository *Repository) (*Repository, error) {
-	if config_obj.Frontend == nil ||
-		config_obj.Frontend.ArtifactDefinitionsDirectory == "" {
-		return global_repository, nil
+	global_repository services.Repository) (services.Repository, error) {
+	var err error
+
+	options := services.ArtifactOptions{
+		ArtifactIsBuiltIn:    true,
+		ArtifactIsCompiledIn: false,
 	}
 
+	if config_obj.Frontend != nil &&
+		config_obj.Frontend.ArtifactDefinitionsDirectory != "" {
+		global_repository, err = loadRepositoryFromDirectory(
+			ctx, config_obj, global_repository,
+			config_obj.Frontend.ArtifactDefinitionsDirectory, options)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if config_obj.Defaults != nil {
+		for _, directory := range config_obj.Defaults.ArtifactDefinitionsDirectories {
+			global_repository, err = loadRepositoryFromDirectory(
+				ctx, config_obj, global_repository, directory, options)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return global_repository, nil
+}
+
+func loadRepositoryFromDirectory(
+	ctx context.Context, config_obj *config_proto.Config,
+	global_repository services.Repository,
+	directory string, options services.ArtifactOptions) (services.Repository, error) {
+
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	err := filepath.Walk(config_obj.Frontend.ArtifactDefinitionsDirectory,
+	err := filepath.Walk(directory,
 		func(path string, finfo os.FileInfo, err error) error {
 			if err != nil {
 				return fmt.Errorf(
@@ -56,10 +92,7 @@ func InitializeGlobalRepositoryFromFilesystem(
 				return nil
 			}
 
-			artifact_obj, err := global_repository.LoadYaml(
-				string(data),
-				false, /* validate */
-				false /* built_in */)
+			artifact_obj, err := global_repository.LoadYaml(string(data), options)
 			if err != nil {
 				logger.Info("Unable to load custom "+
 					"artifact %s: %v", path, err)

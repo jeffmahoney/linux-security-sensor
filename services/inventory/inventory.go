@@ -43,22 +43,27 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/go-errors/errors"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/protobuf/proto"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/datastore"
-	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
+	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/networking"
 )
 
-type HTTPClient interface {
-	Do(req *http.Request) (*http.Response, error)
-}
+var (
+	inventoryTotalLoad = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "inventory_service_total_file_load",
+		Help: "Total number of times we synced from the filestore.",
+	})
+)
 
 type githubReleasesAPI struct {
 	Assets []githubAssets `json:"assets"`
@@ -70,10 +75,26 @@ type githubAssets struct {
 }
 
 type InventoryService struct {
-	mu       sync.Mutex
+	mu sync.Mutex
+
+	// An index of all tools keyed by name, version. These tools are
+	// possibly materialized or updated by the user and contain more
+	// information than the original definition within the artifact.
 	binaries *artifacts_proto.ThirdParty
-	Client   HTTPClient
-	Clock    utils.Clock
+
+	// An index of all original definitions keyed by tool name and
+	// version. It is possible to reset the definitions in `binaries`
+	// above with one of these original definitions.
+	versions map[string][]*artifacts_proto.Tool
+
+	// A HTTPClient that is used to download tools automatically.
+	Client networking.HTTPClient
+	Clock  utils.Clock
+
+	// The parent is the inventory service of the root org. The root
+	// org maintain the parent's repository and takes the default
+	// settings.
+	parent services.Inventory
 }
 
 func (self *InventoryService) Close() {}
@@ -92,13 +113,112 @@ func (self *InventoryService) ClearForTests() {
 	self.binaries = &artifacts_proto.ThirdParty{}
 }
 
-func (self *InventoryService) ProbeToolInfo(name string) (*artifacts_proto.Tool, error) {
+func (self *InventoryService) ProbeToolInfo(
+	ctx context.Context, config_obj *config_proto.Config,
+	name, version string) (*artifacts_proto.Tool, error) {
+
+	var match *artifacts_proto.Tool
 	for _, tool := range self.Get().Tools {
-		if tool.Name == name {
-			return tool, nil
+		// If version is specified we look for the exact tool version
+		if version != "" {
+			if tool.Name == name && tool.Version == version {
+				return self.AddAllVersions(ctx, config_obj, tool), nil
+			}
+			continue
+		}
+
+		if tool.Name != name {
+			continue
+		}
+
+		// Otherwise get the latest version available
+		if match == nil {
+			match = tool
+			continue
+		}
+
+		if utils.CompareVersions(tool.Name, match.Version, tool.Version) < 0 {
+			match = tool
 		}
 	}
+
+	if match != nil {
+		return self.AddAllVersions(ctx, config_obj, match), nil
+	}
+
+	if self.parent != nil {
+		tool, err := self.parent.ProbeToolInfo(ctx, config_obj, name, version)
+		if err == nil {
+			// Add all the parent's versions into our own repository.
+			for _, v := range tool.Versions {
+				self.AddTool(ctx, config_obj, v, services.ToolOptions{
+					ArtifactDefinition: true,
+				})
+			}
+
+			// Return the first version that matched
+			for _, tool := range tool.Versions {
+				// If version is specified we look for the exact tool version
+				if version != "" {
+					if tool.Name == name && tool.Version == version {
+						return self.AddAllVersions(ctx, config_obj, tool), nil
+					}
+					continue
+				}
+
+				if tool.Name == name {
+					return self.AddAllVersions(ctx, config_obj, tool), nil
+				}
+			}
+		}
+	}
+
 	return nil, errors.New("Not Found")
+}
+
+// Enrich the tool definition with all known versions of this tool.
+func (self *InventoryService) AddAllVersions(
+	ctx context.Context, config_obj *config_proto.Config,
+	tool *artifacts_proto.Tool) *artifacts_proto.Tool {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return self.addAllVersions(ctx, config_obj, tool)
+}
+
+// The same tool may be defined in multiple artifacts and these
+// definitions may be different. This function collects all compatible
+// definitions into the Tool protobuf. This gives us a list of all
+// definitions of the tool.
+//
+// Compatible definitions are those with the same name and version.
+// The user may select one of these definitions to be used by all
+// artifacts.
+func (self *InventoryService) addAllVersions(
+	ctx context.Context, config_obj *config_proto.Config,
+	tool *artifacts_proto.Tool) *artifacts_proto.Tool {
+	result := proto.Clone(tool).(*artifacts_proto.Tool)
+
+	versions, _ := self.versions[tool.Name]
+	result.Versions = nil
+
+	for _, v := range versions {
+		if tool.Version != "" && tool.Version != v.Version {
+			continue
+		}
+
+		result.Versions = append(result.Versions, v)
+	}
+
+	// Merge the parent's versions as well.
+	if self.parent != nil {
+		parent_tool, err := self.parent.ProbeToolInfo(ctx, config_obj, tool.Name, "")
+		if err == nil {
+			result.Versions = append(result.Versions, parent_tool.Versions...)
+		}
+	}
+
+	return result
 }
 
 // Gets the tool information from the inventory. If the tool is not
@@ -106,7 +226,7 @@ func (self *InventoryService) ProbeToolInfo(name string) (*artifacts_proto.Tool,
 func (self *InventoryService) GetToolInfo(
 	ctx context.Context,
 	config_obj *config_proto.Config,
-	tool string) (*artifacts_proto.Tool, error) {
+	tool, version string) (*artifacts_proto.Tool, error) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
@@ -114,23 +234,48 @@ func (self *InventoryService) GetToolInfo(
 		self.binaries = &artifacts_proto.ThirdParty{}
 	}
 
+	// If a version is not specified, we need to sort the tools by
+	// semantic version so we get the latest version available.
+	var match *artifacts_proto.Tool
 	for _, item := range self.binaries.Tools {
-		if item.Name == tool {
-			// Currently we require to know all tool's
-			// hashes. If the hash is missing then the
-			// tool is not tracked. We have to materialize
-			// it in order to track it.
-			if item.Hash == "" {
-				// Try to download the item.
-				err := self.materializeTool(ctx, config_obj, item)
-				if err != nil {
-					return nil, err
-				}
-			}
-			return proto.Clone(item).(*artifacts_proto.Tool), nil
+		if item.Name != tool {
+			continue
+		}
+
+		if version != "" && version == item.Version {
+			match = item
+			break
+		}
+
+		// Look for the largest version available
+		if match == nil {
+			match = item
+			continue
+		}
+
+		if utils.CompareVersions(item.Name, match.Version, item.Version) < 0 {
+			match = item
 		}
 	}
-	return nil, errors.New(fmt.Sprintf("Tool %v not declared in inventory.", tool))
+
+	if match != nil {
+		// Currently we require to know all tool's hashes. If the hash
+		// is missing then the tool is not tracked. We have to
+		// materialize it in order to track it.
+		if match.Hash == "" {
+			// Try to download the item.
+			err := self.materializeTool(ctx, config_obj, match)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		// Already holding the mutex here - call the lock free
+		// version.
+		return self.addAllVersions(ctx, config_obj, match), nil
+	}
+
+	return nil, fmt.Errorf("Tool %v not declared in inventory.", tool)
 }
 
 // Actually download and resolve the tool and make sure it is
@@ -139,7 +284,7 @@ func (self *InventoryService) GetToolInfo(
 // calls to this function will just retrieve those fields directly.
 func (self *InventoryService) materializeTool(
 	ctx context.Context,
-	config_obj *config_proto.Config,
+	org_config_obj *config_proto.Config,
 	tool *artifacts_proto.Tool) error {
 
 	if self.Client == nil {
@@ -150,10 +295,11 @@ func (self *InventoryService) materializeTool(
 	// verify the binary URL now.
 	if tool.GithubProject != "" {
 		var err error
-		tool.Url, err = getGithubRelease(ctx, self.Client, config_obj, tool)
+		tool.Url, err = getGithubRelease(ctx, self.Client, org_config_obj, tool)
 		if err != nil {
-			return errors.Wrap(
-				err, "While resolving github release "+tool.GithubProject)
+			return fmt.Errorf(
+				"While resolving github release %v: %w ",
+				tool.GithubProject, err)
 		}
 
 		// Set the filename to something sensible so it is always valid.
@@ -172,13 +318,19 @@ func (self *InventoryService) materializeTool(
 			tool.Name)
 	}
 
-	file_store_factory := file_store.GetFileStore(config_obj)
-	if file_store_factory == nil {
-		return errors.New("No filestore configured")
+	// All tools are written to the root org's public directory since
+	// this is the only one mapped for external access. File names
+	// should never clash because the names are derived from a hash
+	// mixed with org id and filename so should be unique to each
+	// org. Therefore we use the root orgs file store but get a path
+	// manager specific to each org.
+	path_manager := paths.NewInventoryPathManager(org_config_obj, tool)
+	pathspec, file_store_factory, err := path_manager.Path()
+	if err != nil {
+		return err
 	}
 
-	path_manager := paths.NewInventoryPathManager(config_obj, tool)
-	fd, err := file_store_factory.WriteFile(path_manager.Path())
+	fd, err := file_store_factory.WriteFile(pathspec)
 	if err != nil {
 		return err
 	}
@@ -189,8 +341,8 @@ func (self *InventoryService) materializeTool(
 		return err
 	}
 
-	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	logger.Info("Downloading tool <green>%v</> FROM <red>%v</>", tool.Name,
+	logger := logging.GetLogger(org_config_obj, &logging.FrontendComponent)
+	logger.Info("Downloading tool <green>%v</> FROM <cyan>%v</>", tool.Name,
 		tool.Url)
 	request, err := http.NewRequestWithContext(ctx, "GET", tool.Url, nil)
 	if err != nil {
@@ -204,8 +356,8 @@ func (self *InventoryService) materializeTool(
 
 	// If the download failed, we can not store this tool.
 	if res.StatusCode != 200 {
-		return errors.New(fmt.Sprintf("Unable to download file from %v: %v",
-			tool.Url, res.Status))
+		return fmt.Errorf("Unable to download file from %v: %v",
+			tool.Url, res.Status)
 	}
 	sha_sum := sha256.New()
 
@@ -214,21 +366,33 @@ func (self *InventoryService) materializeTool(
 		tool.Hash = hex.EncodeToString(sha_sum.Sum(nil))
 	}
 
+	if tool.ExpectedHash != "" && tool.ExpectedHash != tool.Hash {
+		err := fmt.Errorf(
+			"Downloaded tool hash of %v does not match the expected hash of %v\n",
+			tool.Hash, tool.ExpectedHash)
+
+		// Record the invalid hash so the user can opt to trust it.
+		tool.InvalidHash = tool.Hash
+		tool.Hash = ""
+		return err
+	}
+	tool.InvalidHash = ""
+
 	if tool.ServeLocally {
-		if config_obj.Client == nil || len(config_obj.Client.ServerUrls) == 0 {
+		if org_config_obj.Client == nil || len(org_config_obj.Client.ServerUrls) == 0 {
 			return errors.New("No server URLs configured!")
 		}
-		tool.ServeUrl = config_obj.Client.ServerUrls[0] + "public/" + tool.FilestorePath
+		tool.ServeUrl = org_config_obj.Client.ServerUrls[0] + "public/" + tool.FilestorePath
 
 	} else {
 		tool.ServeUrl = tool.Url
 	}
 
-	db, err := datastore.GetDB(config_obj)
+	db, err := datastore.GetDB(org_config_obj)
 	if err != nil {
 		return err
 	}
-	return db.SetSubject(config_obj, paths.ThirdPartyInventory, self.binaries)
+	return db.SetSubject(org_config_obj, paths.ThirdPartyInventory, self.binaries)
 }
 
 func (self *InventoryService) RemoveTool(
@@ -256,10 +420,52 @@ func (self *InventoryService) RemoveTool(
 	return db.SetSubject(config_obj, paths.ThirdPartyInventory, self.binaries)
 }
 
-func (self *InventoryService) AddTool(config_obj *config_proto.Config,
+func (self *InventoryService) UpdateVersion(tool_request *artifacts_proto.Tool) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	// Update the list of versions for this tool, replacing existing
+	// definitions.
+	versions, _ := self.versions[tool_request.Name]
+	version_known := false
+	for idx, v := range versions {
+		if v.Artifact == tool_request.Artifact {
+			versions[idx] = tool_request
+			version_known = true
+			break
+		}
+	}
+
+	if !version_known {
+		versions = append(versions, proto.Clone(tool_request).(*artifacts_proto.Tool))
+	}
+	self.versions[tool_request.Name] = versions
+}
+
+// This gets called by the repository for each artifact loaded to
+// inform us about any tools it contains. The InventoryService looks
+// at its current definition for the tool in the inventory to see if
+// it needs to upgrade the definition or add a new entry to the
+// inventory automatically.
+func (self *InventoryService) AddTool(
+	ctx context.Context, config_obj *config_proto.Config,
 	tool_request *artifacts_proto.Tool, opts services.ToolOptions) error {
+
+	// Clear out the system managed fields.
+	tool_request.Versions = nil
+	tool_request.ServeUrl = ""
+	tool_request.InvalidHash = ""
+
+	// Keep a reference to all known versions of this tool. We keep
+	// the clean definitions from the artifact together, so we can
+	// always reset back to them.
+	if opts.ArtifactDefinition {
+		self.UpdateVersion(tool_request)
+	}
+
 	if opts.Upgrade {
-		existing_tool, err := self.ProbeToolInfo(tool_request.Name)
+		existing_tool, err := self.ProbeToolInfo(
+			ctx, config_obj, tool_request.Name, tool_request.Version)
 		if err == nil {
 			// Ignore the request if the existing
 			// definition is better than the new one.
@@ -285,6 +491,8 @@ func (self *InventoryService) AddTool(config_obj *config_proto.Config,
 	tool := proto.Clone(tool_request).(*artifacts_proto.Tool)
 	tool.FilestorePath = paths.ObfuscateName(config_obj, tool.Name)
 
+	// No client config so we dont know any server urls - therefore we
+	// can not serve locally at all.
 	if tool.ServeLocally && config_obj.Client == nil {
 		tool.ServeLocally = false
 	}
@@ -294,6 +502,10 @@ func (self *InventoryService) AddTool(config_obj *config_proto.Config,
 			return errors.New("No server URLs configured!")
 		}
 		tool.ServeUrl = config_obj.Client.ServerUrls[0] + "public/" + tool.FilestorePath
+	} else {
+		// If we dont serve the tool, the clients will directly get
+		// the tool from its upstream URL.
+		tool.ServeUrl = tool.Url
 	}
 
 	// Set the filename to something sensible so it is always valid.
@@ -306,7 +518,8 @@ func (self *InventoryService) AddTool(config_obj *config_proto.Config,
 	// Replace the tool in the inventory.
 	found := false
 	for i, item := range self.binaries.Tools {
-		if item.Name == tool.Name {
+		if item.Name == tool.Name &&
+			item.Version == tool.Version {
 			found = true
 			self.binaries.Tools[i] = tool
 			break
@@ -321,14 +534,29 @@ func (self *InventoryService) AddTool(config_obj *config_proto.Config,
 
 	db, err := datastore.GetDB(config_obj)
 	if err != nil {
-		return err
+		// If the datastore is not available this is not an error - we
+		// just do not write the inventory to storage. This happens
+		// when we a client starts the inventory service instead of
+		// DummyService.
+		return nil
 	}
-	return db.SetSubject(config_obj, paths.ThirdPartyInventory, self.binaries)
+	err = db.SetSubject(config_obj, paths.ThirdPartyInventory, self.binaries)
+	if err != nil {
+		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+		logger.Warn("Unable to store inventory - will run with an in memory one.")
+	}
+	return nil
 }
 
 func (self *InventoryService) LoadFromFile(config_obj *config_proto.Config) error {
 	self.mu.Lock()
 	defer self.mu.Unlock()
+
+	inventoryTotalLoad.Inc()
+
+	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+	logger.Info("InventoryService: Reloading inventory from file for org %v",
+		config_obj.OrgId)
 
 	inventory := &artifacts_proto.ThirdParty{}
 
@@ -347,51 +575,82 @@ func (self *InventoryService) LoadFromFile(config_obj *config_proto.Config) erro
 	return nil
 }
 
-func StartInventoryService(
+func NewInventoryService(
 	ctx context.Context,
 	wg *sync.WaitGroup,
-	config_obj *config_proto.Config) error {
+	config_obj *config_proto.Config) (services.Inventory, error) {
 
 	if config_obj.Datastore == nil {
-		return StartInventoryDummyService(ctx, wg, config_obj)
+		return NewInventoryDummyService(ctx, wg, config_obj)
 	}
 
-	default_client, err := networking.GetDefaultHTTPClient(config_obj.Client, "")
+	scope := vql_subsystem.MakeScope()
+	default_client, err := networking.GetDefaultHTTPClient(
+		ctx, config_obj.Client, scope, "", networking.EmptyCookieJar)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	inventory_service := &InventoryService{
 		Clock:    utils.RealClock{},
 		binaries: &artifacts_proto.ThirdParty{},
+		versions: make(map[string][]*artifacts_proto.Tool),
 		// Use the VQL http client so it can accept the same certs.
 		Client: default_client,
 	}
-	services.RegisterInventory(inventory_service)
-
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
 
-	notifier := services.GetNotifier()
-	if notifier == nil {
-		return errors.New("Notification service not started")
+	if config_obj.Defaults != nil &&
+		config_obj.Defaults.DisableInventoryServiceExternalAccess {
+		inventory_service.Client = DummyHTTPClient{}
 	}
+
+	// If we are not the root inventory we need to delegate any
+	// unknown tools to the root inventory.
+	if !utils.IsRootOrg(config_obj.OrgId) {
+		org_manager, err := services.GetOrgManager()
+		if err != nil {
+			return nil, err
+		}
+
+		root_org_config, err := org_manager.GetOrgConfig(services.ROOT_ORG_ID)
+		if err != nil {
+			return nil, err
+		}
+
+		root_inventory_service, err := services.GetInventory(root_org_config)
+		if err != nil {
+			return nil, err
+		}
+
+		inventory_service.parent = root_inventory_service
+	}
+
+	journal, err := services.GetJournal(config_obj)
+	if err != nil {
+		return nil, err
+	}
+
+	// Reload the inventory_service when another server wakes us up.
+	row_chan, cancel := journal.Watch(ctx,
+		"Server.Internal.Inventory", "InventoryService")
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer services.RegisterInventory(nil)
 		defer inventory_service.Close()
+		defer cancel()
 
 		for {
-			// Watch for notifications that the inventory is changed.
-			notification, cancel := notifier.ListenForNotification(
-				"Server.Internal.Inventory")
-
 			select {
 			case <-ctx.Done():
 				return
 
-			case <-notification:
+			case _, ok := <-row_chan:
+				if !ok {
+					return
+				}
+
 				err := inventory_service.LoadFromFile(config_obj)
 				if err != nil {
 					logger.Error("StartInventoryService: %v", err)
@@ -403,16 +662,17 @@ func StartInventoryService(
 					logger.Error("StartInventoryService: %v", err)
 				}
 			}
-
-			cancel()
 		}
 	}()
 
-	logger.Info("<green>Starting</> Inventory Service")
+	logger.Info("<green>Starting</> Inventory Service for %v",
+		services.GetOrgName(config_obj))
 
+	// If we fail to load from the file start from a new empty
+	// inventory.
 	_ = inventory_service.LoadFromFile(config_obj)
 
-	return nil
+	return inventory_service, nil
 }
 
 func isDefinitionBetter(old, new *artifacts_proto.Tool) bool {

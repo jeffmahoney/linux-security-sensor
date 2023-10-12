@@ -1,13 +1,12 @@
 package responder
 
 import (
+	"context"
 	"fmt"
 	"sync"
 
-	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	"www.velocidex.com/golang/velociraptor/json"
-	"www.velocidex.com/golang/velociraptor/logging"
 )
 
 // The pool event responder is a singleton which distributes any
@@ -27,19 +26,40 @@ import (
 // pool client immediately.
 
 var (
-	GlobalPoolEventResponder = NewPoolEventResponder()
+	mu                       sync.Mutex
+	GlobalPoolEventResponder *PoolEventResponder
 )
 
 type PoolEventResponder struct {
 	mu sync.Mutex
 
+	ctx context.Context
+
+	// Event table will push messages to this channel and we will
+	// distribute them to all the other clients.
+	EventTableInput chan *crypto_proto.VeloMessage
+
 	client_responders map[int]chan *crypto_proto.VeloMessage
 }
 
-func NewPoolEventResponder() *PoolEventResponder {
-	return &PoolEventResponder{
+func GetPoolEventResponder(ctx context.Context) *PoolEventResponder {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if GlobalPoolEventResponder != nil {
+		return GlobalPoolEventResponder
+	}
+
+	result := &PoolEventResponder{
+		ctx:               ctx,
+		EventTableInput:   make(chan *crypto_proto.VeloMessage),
 		client_responders: make(map[int]chan *crypto_proto.VeloMessage),
 	}
+
+	result.Start()
+
+	GlobalPoolEventResponder = result
+	return result
 }
 
 func (self *PoolEventResponder) RegisterPoolClientResponder(
@@ -51,46 +71,40 @@ func (self *PoolEventResponder) RegisterPoolClientResponder(
 }
 
 // Gets a new responder which is feeding the GlobalPoolEventResponder
-func (self *PoolEventResponder) NewResponder(
-	config_obj *config_proto.Config,
-	req *crypto_proto.VeloMessage) *Responder {
-	// The PoolEventResponder input
-	in := make(chan *crypto_proto.VeloMessage)
-
-	// Prepare a new responder that will feed us.
-	result := &Responder{
-		request: req,
-		output:  in,
-		logger:  logging.GetLogger(config_obj, &logging.ClientComponent),
-	}
+func (self *PoolEventResponder) Start() {
 
 	go func() {
 		for {
-			message, ok := <-in
-			if !ok {
+			select {
+			case <-self.ctx.Done():
 				return
-			}
 
-			children := make([]chan *crypto_proto.VeloMessage, 0,
-				len(self.client_responders))
-			self.mu.Lock()
-			for _, c := range self.client_responders {
-				children = append(children, c)
-			}
-			self.mu.Unlock()
+			case message, ok := <-self.EventTableInput:
+				if !ok {
+					return
+				}
 
-			fmt.Printf("Pushing message to %v listeners\n", len(children))
-			json.Debug(message)
-			for _, c := range children {
-				select {
+				children := make([]chan *crypto_proto.VeloMessage, 0,
+					len(self.client_responders))
+				self.mu.Lock()
+				for _, c := range self.client_responders {
+					children = append(children, c)
+				}
+				self.mu.Unlock()
 
-				// Try to push the message if possible.
-				case c <- message:
-				default:
+				fmt.Printf("Pushing message to %v listeners\n", len(children))
+				json.Debug(message)
+				for _, c := range children {
+					select {
+					case <-self.ctx.Done():
+						return
+
+					// Try to push the message if possible.
+					case c <- message:
+					default:
+					}
 				}
 			}
 		}
 	}()
-
-	return result
 }

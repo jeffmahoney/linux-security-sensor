@@ -25,16 +25,63 @@ parameters:
     type: bool
 
 sources:
-  - precondition:
+  - name: Windows
+    precondition:
       SELECT OS From info() where OS = 'windows'
 
     query:  |
-      LET packages = SELECT Name, DisplayName FROM Artifact.Windows.Sys.Programs()
+      LET packages = SELECT KeyName, DisplayName,UninstallString
+      FROM Artifact.Windows.Sys.Programs()
       WHERE DisplayName =~ DisplayNameRegex AND
         log(message="Will uninstall " + DisplayName)
 
-      LET uninstall(Name) = SELECT * FROM execve(argv=['msiexec', '/quiet', '/x', Name])
+      LET uninstall(UninstallString) = SELECT * FROM execve(
+          argv=commandline_split(command=UninstallString) + "/quiet")
 
-      SELECT Name, DisplayName,
-          if(condition=ReallyDoIt, then=uninstall(Name=Name).Stdout) AS UninstallLog
+      SELECT KeyName, DisplayName, UninstallString,
+          if(condition=ReallyDoIt, then=uninstall(Name=UninstallString).Stdout) AS UninstallLog
       FROM packages
+
+  - name: Debian
+    precondition: |
+      -- Only run if dpkg is installed.
+      SELECT OS, {
+         SELECT ReturnCode FROM execve(argv=["dpkg", "--help"])
+      } AS ReturnCode
+      FROM info()
+      WHERE OS = 'linux' AND ReturnCode = 0
+
+    query:  |
+      SELECT * FROM if(condition=ReallyDoIt,
+      then={
+        SELECT * FROM execve(argv=["dpkg", "--remove", "velociraptor-client"])
+      })
+
+  - name: RPMBased
+    precondition: |
+      -- Only run if rpm is installed.
+      SELECT OS, {
+         SELECT ReturnCode FROM execve(argv=["rpm", "--help"])
+      } AS ReturnCode
+      FROM info()
+      WHERE OS = 'linux' AND ReturnCode = 0
+
+    query:  |
+      SELECT * FROM if(condition=ReallyDoIt,
+      then={
+        SELECT * FROM execve(argv=["rpm", "--erase", "velociraptor-client"])
+      })
+
+  - name: MacOS
+    precondition: |
+      SELECT OS
+      FROM info()
+      WHERE OS = 'darwin'
+
+    query:  |
+      LET me <= SELECT Exe FROM info()
+
+      SELECT * FROM if(condition=ReallyDoIt,
+      then={
+        SELECT * FROM execve(argv=[me[0].Exe, "service", "remove"])
+      })

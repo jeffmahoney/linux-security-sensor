@@ -4,7 +4,8 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 
-	"github.com/pkg/errors"
+	"github.com/Velocidex/ttlcache/v2"
+	"github.com/go-errors/errors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
 	"www.velocidex.com/golang/velociraptor/logging"
@@ -15,7 +16,9 @@ type ClientCryptoManager struct {
 }
 
 // Adds the server certificate to the crypto manager.
-func (self *ClientCryptoManager) AddCertificate(certificate_pem []byte) (string, error) {
+func (self *ClientCryptoManager) AddCertificate(
+	config_obj *config_proto.Config,
+	certificate_pem []byte) (string, error) {
 	server_cert, err := crypto_utils.ParseX509CertFromPemStr(certificate_pem)
 	if err != nil {
 		return "", err
@@ -37,14 +40,14 @@ func (self *ClientCryptoManager) AddCertificate(certificate_pem []byte) (string,
 
 	server_name := crypto_utils.GetSubjectName(server_cert)
 	err = self.Resolver.SetPublicKey(
-		server_name, server_cert.PublicKey.(*rsa.PublicKey))
+		config_obj, server_name, server_cert.PublicKey.(*rsa.PublicKey))
 	if err != nil {
 		return "", err
 	}
 
 	// Remove the cached key for this server. This is essential to
 	// ensure servers can rotate their keys.
-	self.cipher_lru.Delete(server_name)
+	self.cipher_lru.DeleteCipher(server_name)
 
 	return server_name, nil
 }
@@ -67,18 +70,18 @@ func NewClientCryptoManager(config_obj *config_proto.Config, client_private_key_
 	}
 
 	lru_size := int64(100)
-	if config_obj.Frontend != nil {
+	if config_obj.Frontend != nil &&
+		config_obj.Frontend.Resources != nil {
 		lru_size = config_obj.Frontend.Resources.ExpectedClients
 	}
 
 	return &ClientCryptoManager{CryptoManager{
-		config:      config_obj,
-		ClientId:    client_id,
-		private_key: private_key,
-		source:      client_id,
-		Resolver:    NewInMemoryPublicKeyResolver(),
-		cipher_lru:  NewCipherLRU(lru_size),
-		caPool:      roots,
-		logger:      logger,
+		client_id:           client_id,
+		private_key:         private_key,
+		Resolver:            NewInMemoryPublicKeyResolver(),
+		cipher_lru:          NewCipherLRU(lru_size),
+		unauthenticated_lru: ttlcache.NewCache(),
+		caPool:              roots,
+		logger:              logger,
 	}}, nil
 }

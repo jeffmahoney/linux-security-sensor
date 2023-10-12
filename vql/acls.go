@@ -3,11 +3,7 @@ package vql
 import (
 	"fmt"
 
-	"github.com/sirupsen/logrus"
 	"www.velocidex.com/golang/velociraptor/acls"
-	acl_proto "www.velocidex.com/golang/velociraptor/acls/proto"
-	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -23,72 +19,12 @@ type ACLManager interface {
 		permission acls.ACL_PERMISSION, args ...string) (bool, error)
 }
 
-// NullACLManager is an acl manager which allows everything. This is
-// currently used on the client and on the command line where there is
-// no clear principal or ACL controls.
-type NullACLManager struct{}
-
-func (self NullACLManager) CheckAccess(
-	permission ...acls.ACL_PERMISSION) (bool, error) {
-	return true, nil
+type OrgACLManager interface {
+	CheckAccessInOrg(org_id string, permission ...acls.ACL_PERMISSION) (bool, error)
 }
 
-func (self NullACLManager) CheckAccessWithArgs(
-	permission acls.ACL_PERMISSION, args ...string) (bool, error) {
-	return true, nil
-}
-
-// ServerACLManager is used when running server side VQL to control
-// ACLs on various VQL plugins.
-type ServerACLManager struct {
-	principal string
-	Token     *acl_proto.ApiClientACL
-}
-
-// Token must have *ALL* the specified permissions.
-func (self *ServerACLManager) CheckAccess(
-	permissions ...acls.ACL_PERMISSION) (bool, error) {
-	for _, permission := range permissions {
-		ok, err := acls.CheckAccessWithToken(self.Token, permission)
-		if !ok || err != nil {
-			return ok, err
-		}
-	}
-
-	return true, nil
-}
-
-func (self *ServerACLManager) CheckAccessWithArgs(
-	permission acls.ACL_PERMISSION, args ...string) (bool, error) {
-	return acls.CheckAccessWithToken(self.Token, permission, args...)
-}
-
-// NewRoleACLManager creates an ACL manager with only the assigned
-// roles. This is useful for creating limited VQL permissions
-// internally.
-func NewRoleACLManager(role string) ACLManager {
-	policy := &acl_proto.ApiClientACL{}
-
-	// If we fail just return an empty policy
-	_ = acls.GetRolePermissions(nil, []string{role}, policy)
-
-	return &ServerACLManager{Token: policy}
-}
-
-func NewServerACLManager(
-	config_obj *config_proto.Config,
-	principal string) ACLManager {
-	policy, err := acls.GetEffectivePolicy(config_obj, principal)
-	if err != nil {
-		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-		logger.WithFields(logrus.Fields{
-			"user":  principal,
-			"error": err,
-		}).Error("Unable to get policy")
-		policy = &acl_proto.ApiClientACL{}
-	}
-
-	return &ServerACLManager{principal: principal, Token: policy}
+type PrincipalACLManager interface {
+	GetPrincipal() string
 }
 
 // Check access through the ACL manager in the scope.  NOTE: This
@@ -109,7 +45,37 @@ func CheckAccess(scope vfilter.Scope, permissions ...acls.ACL_PERMISSION) error 
 	}
 
 	perm, err := manager.CheckAccess(permissions...)
-	if !perm || err != nil {
+	if !perm {
+		if err == nil {
+			return fmt.Errorf("Permission denied: %v", permissions)
+		}
+		return fmt.Errorf("%v: %v", err, permissions)
+	}
+
+	return nil
+}
+
+// A variant of CheckAccess() that can check access in a different org.
+func CheckAccessInOrg(scope vfilter.Scope, org_id string, permissions ...acls.ACL_PERMISSION) error {
+	manager_any, pres := scope.Resolve(ACL_MANAGER_VAR)
+	if !pres {
+		return fmt.Errorf("Permission denied: %v", permissions)
+	}
+
+	manager, ok := manager_any.(OrgACLManager)
+	if !ok {
+		return fmt.Errorf("Permission denied: %v", permissions)
+	}
+
+	if org_id == "root" {
+		org_id = ""
+	}
+
+	perm, err := manager.CheckAccessInOrg(org_id, permissions...)
+	if !perm {
+		if err != nil {
+			return fmt.Errorf("%v: %v", err, permissions)
+		}
 		return fmt.Errorf("Permission denied: %v", permissions)
 	}
 
@@ -129,7 +95,10 @@ func CheckAccessWithArgs(scope vfilter.Scope, permissions acls.ACL_PERMISSION,
 	}
 
 	perm, err := manager.CheckAccessWithArgs(permissions, args...)
-	if !perm || err != nil {
+	if !perm {
+		if err != nil {
+			return fmt.Errorf("%v: %v", err, permissions)
+		}
 		return fmt.Errorf("Permission denied: %v", permissions)
 	}
 
@@ -148,6 +117,9 @@ func CheckFilesystemAccess(scope vfilter.Scope, accessor string) error {
 	case "filestore", "fs":
 		return CheckAccess(scope, acls.SERVER_ADMIN)
 
+	case "process":
+		return CheckAccess(scope, acls.MACHINE_STATE)
+
 	default:
 		return CheckAccess(scope, acls.FILESYSTEM_READ)
 	}
@@ -160,10 +132,10 @@ func GetPrincipal(scope vfilter.Scope) string {
 		return ""
 	}
 
-	manager, ok := manager_any.(*ServerACLManager)
+	manager, ok := manager_any.(PrincipalACLManager)
 	if !ok {
 		return ""
 	}
 
-	return manager.principal
+	return manager.GetPrincipal()
 }

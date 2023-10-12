@@ -2,8 +2,10 @@ package directory_test
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -11,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
 	"www.velocidex.com/golang/velociraptor/config"
+	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/directory"
 	"www.velocidex.com/golang/velociraptor/file_store/memory"
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
@@ -69,14 +72,18 @@ func (self *TestSuite) TearDownTest() {
 	self.TestSuite.TearDownTest()
 	os.RemoveAll(self.dir) // clean up
 }
+
 func (self *TestSuite) TestQueueManager() {
-	repo_manager, err := services.GetRepositoryManager()
+	repo_manager, err := services.GetRepositoryManager(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	repository, err := repo_manager.GetGlobalRepository(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
-	_, err = repository.LoadYaml(monitoringArtifact, true, true)
+	_, err = repository.LoadYaml(monitoringArtifact,
+		services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: true})
 	assert.NoError(self.T(), err)
 
 	file_store := test_utils.GetMemoryFileStore(self.T(), self.ConfigObj)
@@ -86,9 +93,11 @@ func (self *TestSuite) TestQueueManager() {
 	// Push some rows to the queue manager
 	ctx := context.Background()
 
-	reader, cancel := manager.Watch(ctx, "TestQueue")
+	reader, cancel := manager.Watch(ctx, "TestQueue", &api.QueueOptions{
+		FileBufferLeaseSize: 1,
+	})
 
-	path_manager, err := artifacts.NewArtifactPathManager(self.ConfigObj,
+	path_manager, err := artifacts.NewArtifactPathManager(self.Ctx, self.ConfigObj,
 		"C.123", "", "TestQueue")
 	assert.NoError(self.T(), err)
 
@@ -141,6 +150,51 @@ func (self *TestSuite) TestQueueManager() {
 	tempfile := utils.GetString(dbg, "TestQueue.0.BackingFile")
 	_, err = os.Stat(tempfile)
 	assert.Error(self.T(), err)
+}
+
+func (self *TestSuite) TestQueueManagerJsonl() {
+	repo_manager, err := services.GetRepositoryManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	repository, err := repo_manager.GetGlobalRepository(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	_, err = repository.LoadYaml(monitoringArtifact,
+		services.ArtifactOptions{
+			ValidateArtifact:  true,
+			ArtifactIsBuiltIn: true})
+
+	assert.NoError(self.T(), err)
+
+	file_store := test_utils.GetMemoryFileStore(self.T(), self.ConfigObj)
+	manager := directory.NewDirectoryQueueManager(
+		self.ConfigObj, file_store).(*directory.DirectoryQueueManager)
+
+	path_manager, err := artifacts.NewArtifactPathManager(self.Ctx, self.ConfigObj,
+		"C.123", "", "TestQueue")
+	assert.NoError(self.T(), err)
+
+	// Query the state of the manager for testing.
+	dbg := manager.Debug()
+
+	// The initial size is zero
+	assert.Equal(self.T(), int64(0), utils.GetInt64(dbg, "TestQueue.0.Size"))
+
+	// Push some rows without reading - this should write to the
+	// file buffer and not block.
+	for i := 0; i < 10; i++ {
+		// For performance critical parts it is more efficient to
+		// build the JSONL manually
+		err = manager.PushEventJsonl(path_manager,
+			[]byte(fmt.Sprintf("{\"Foo\":%q}\n", "Bar")), 1)
+		assert.NoError(self.T(), err)
+	}
+
+	vtesting.WaitUntil(15*time.Second, self.T(), func() bool {
+		// The file should have 10 records or 11 lines.
+		return len(strings.Split(test_utils.FileReadAll(
+			self.T(), self.ConfigObj, path_manager.Path()), "\n")) == 11
+	})
 }
 
 func TestFileBasedQueueManager(t *testing.T) {

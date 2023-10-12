@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -34,22 +34,23 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"github.com/jmoiron/sqlx"
 	_ "github.com/mattn/go-sqlite3"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/constants"
 	utils "www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 )
 
-type _SQLiteArgs struct {
-	Filename string      `vfilter:"required,field=file"`
-	Accessor string      `vfilter:"optional,field=accessor,doc=The accessor to use."`
-	Query    string      `vfilter:"required,field=query"`
-	Args     vfilter.Any `vfilter:"optional,field=args"`
+type SQLiteArgs struct {
+	Filename *accessors.OSPath `vfilter:"required,field=file"`
+	Accessor string            `vfilter:"optional,field=accessor,doc=The accessor to use."`
+	Query    string            `vfilter:"required,field=query"`
+	Args     vfilter.Any       `vfilter:"optional,field=args"`
 }
 
-type _SQLitePlugin struct{}
+type SQLitePlugin struct{}
 
-func (self _SQLitePlugin) Call(
+func (self SQLitePlugin) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) <-chan vfilter.Row {
@@ -68,19 +69,67 @@ func VFSPathToFilesystemPath(path string) string {
 	return strings.TrimPrefix(path, "\\")
 }
 
+// Check the file header - ignore if this is not really an sqlite
+// file.
+func checkSQLiteHeader(scope vfilter.Scope,
+	accessor accessors.FileSystemAccessor,
+	filename *accessors.OSPath) (bool, error) {
+	file, err := accessor.OpenWithOSPath(filename)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+
+	header := make([]byte, 12)
+	_, err = file.Read(header)
+	if err != nil {
+		return false, err
+	}
+
+	return string(header) == "SQLite forma", nil
+}
+
 func GetHandleSqlite(ctx context.Context,
 	arg *SQLPluginArgs, scope vfilter.Scope) (
 	handle *sqlx.DB, err error) {
-	filename := VFSPathToFilesystemPath(arg.Filename)
+	accessor, err := accessors.GetAccessor(arg.Accessor, scope)
+	if err != nil {
+		return nil, err
+	}
 
-	if filename == "" {
+	filename := arg.Filename.String()
+	if arg.Filename == nil || filename == "" {
 		return nil, errors.New("file parameter required for sqlite driver!")
 	}
 
 	key := "sqlite_" + filename + arg.Accessor
 	handle, ok := vql_subsystem.CacheGet(scope, key).(*sqlx.DB)
 	if !ok {
-		if arg.Accessor == "file" || arg.Accessor == "" {
+		// Check the header quickly to ensure that we dont copy the
+		// file needlessly. If the file does not exist, we allow a
+		// connection because this will create a new file.
+		header_ok, err := checkSQLiteHeader(scope, accessor, arg.Filename)
+		if !errors.Is(err, os.ErrNotExist) && !header_ok {
+			return nil, notValidDatabase
+		}
+
+		should_make_copy := vql_subsystem.GetBoolFromRow(
+			scope, scope, constants.SQLITE_ALWAYS_MAKE_TEMPFILE)
+
+		if !should_make_copy {
+			// We need raw file access to use the sqlite library directly.
+			raw_accessor, ok := accessor.(accessors.RawFileAPIAccessor)
+			if !ok {
+				should_make_copy = true
+			} else {
+				filename, err = raw_accessor.GetUnderlyingAPIFilename(arg.Filename)
+				if err != nil {
+					should_make_copy = true
+				}
+			}
+		}
+
+		if !should_make_copy {
 			handle, err = sqlx.Connect("sqlite3", filename)
 			if err != nil {
 				// An error occurred maybe the database
@@ -93,9 +142,8 @@ func GetHandleSqlite(ctx context.Context,
 					scope.Log("Unable to open sqlite file: %v", err)
 				}
 
-				//If the database is missing etc we
-				//just return the error, but locked
-				//files are handled especially.
+				// If the database is missing etc we just return the
+				// error, but locked files are handled especially.
 				if !strings.Contains(err.Error(), "locked") {
 					return nil, err
 				}
@@ -103,19 +151,18 @@ func GetHandleSqlite(ctx context.Context,
 				scope.Log("Sqlite file %v is locked with %v, creating a local copy",
 					filename, err)
 
-				// When using the file accessor it is
-				// possible to pass sqlite options by
-				// encoding them into the filename. In
-				// this case we need to extract the
-				// filename (from before the ?) so we
-				// can copy it over.
+				// When using the file accessor it is possible to pass
+				// sqlite options by encoding them into the
+				// filename. In this case we need to extract the
+				// filename (from before the ?) so we can copy it
+				// over.
 				parts := strings.Split(filename, "?")
 				filename, err = _MakeTempfile(ctx, arg, parts[0], scope)
 				if err != nil {
-					scope.Log("Unable to create temp file: %v", err)
+					scope.Log("sqlite: Unable to create temp file: %v", err)
 					return nil, err
 				}
-				scope.Log("Using local copy %v", filename)
+				scope.Log("sqlite: Using local copy %v", filename)
 			}
 
 			// All other accessors, make a copy and
@@ -125,6 +172,7 @@ func GetHandleSqlite(ctx context.Context,
 			if err != nil {
 				return nil, err
 			}
+			scope.Log("sqlite: Using local copy %v", filename)
 		}
 
 		// Try once again to connect to the new file
@@ -143,6 +191,7 @@ func GetHandleSqlite(ctx context.Context,
 			handle.Close()
 		})
 		if err != nil {
+			scope.Log("sqlite: Unable to set destructor for %v", filename)
 			handle.Close()
 			return nil, err
 		}
@@ -156,7 +205,7 @@ func _MakeTempfile(ctx context.Context,
 	string, error) {
 
 	if arg.Accessor != "data" {
-		scope.Log("Will try to copy %v to temp file", filename)
+		scope.Log("sqlite: Will try to copy %v to temp file", filename)
 	}
 
 	tmpfile, err := ioutil.TempFile("", "tmp*.sqlite")
@@ -169,7 +218,7 @@ func _MakeTempfile(ctx context.Context,
 	remove := func() {
 		// Try to remove it immediately
 		err := os.Remove(tmpfile.Name())
-		if err == nil || os.IsNotExist(err) {
+		if err == nil || errors.Is(err, os.ErrNotExist) {
 			scope.Log("sqlite: removing tempfile %v", tmpfile.Name())
 			return
 		}
@@ -180,7 +229,7 @@ func _MakeTempfile(ctx context.Context,
 		go func() {
 			for i := 0; i < 100; i++ {
 				err := os.Remove(tmpfile.Name())
-				if err == nil || os.IsNotExist(err) {
+				if err == nil || errors.Is(err, os.ErrNotExist) {
 					scope.Log("sqlite: removing tempfile %v", tmpfile.Name())
 					return
 				}
@@ -195,7 +244,7 @@ func _MakeTempfile(ctx context.Context,
 		return "", err
 	}
 
-	fs, err := glob.GetAccessor(arg.Accessor, scope)
+	fs, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
 		return "", err
 	}
@@ -214,14 +263,14 @@ func _MakeTempfile(ctx context.Context,
 	return tmpfile.Name(), nil
 }
 
-func (self _SQLitePlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
+func (self SQLitePlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
 		Name:    "sqlite",
 		Doc:     "Opens an SQLite file and run a query against it (This is an alias to the sql() plugin which supports more database types).",
-		ArgType: type_map.AddType(scope, &_SQLiteArgs{}),
+		ArgType: type_map.AddType(scope, &SQLiteArgs{}),
 	}
 }
 
 func init() {
-	vql_subsystem.RegisterPlugin(&_SQLitePlugin{})
+	vql_subsystem.RegisterPlugin(&SQLitePlugin{})
 }

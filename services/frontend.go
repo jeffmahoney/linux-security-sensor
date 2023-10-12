@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
 
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
@@ -15,25 +14,17 @@ import (
 // frontends to spread the load between them.
 
 var (
-	frontend_mu sync.Mutex
-
-	gFrontend FrontendManager
-
 	FrontendIsMaster = os.ErrNotExist
 )
 
-func RegisterFrontendManager(frontend FrontendManager) {
-	frontend_mu.Lock()
-	defer frontend_mu.Unlock()
+func GetFrontendManager(config_obj *config_proto.Config) (
+	FrontendManager, error) {
+	org_manager, err := GetOrgManager()
+	if err != nil {
+		return nil, err
+	}
 
-	gFrontend = frontend
-}
-
-func GetFrontendManager() FrontendManager {
-	frontend_mu.Lock()
-	defer frontend_mu.Unlock()
-
-	return gFrontend
+	return org_manager.Services(config_obj.OrgId).FrontendManager()
 }
 
 type FrontendManager interface {
@@ -56,6 +47,9 @@ func IsMaster(config_obj *config_proto.Config) bool {
 }
 
 func GetNodeName(frontend_config *config_proto.FrontendConfig) string {
+	if frontend_config == nil {
+		return "-"
+	}
 	return fmt.Sprintf("%s-%d", frontend_config.Hostname,
 		frontend_config.BindPort)
 }

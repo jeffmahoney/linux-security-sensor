@@ -1,0 +1,5 @@
+LET URL <= url(parse="http://www.google.com/?q=Hello&lang=fr")[]SELECT url(scheme="http", host="www.google.com", query=dict(foo="bar")).String FROM scope()[
+ {
+  "url(scheme=\"http\", host=\"www.google.com\", query=dict(foo=\"bar\")).String": "http://www.google.com?foo=bar"
+ }
+]LET NewQuery <= URL.Query + dict(lang="en")[]

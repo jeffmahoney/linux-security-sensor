@@ -9,9 +9,9 @@ description: |
 
   This artifact works on Windows 10 1607 version.
 
-  References:
-    https://www.andreafortuna.org/cybersecurity/amcache-and-shimcache-in-forensic-analysis/
-    https://www.ssi.gouv.fr/uploads/2019/01/anssi-coriin_2019-analysis_amcache.pdf
+reference:
+  - https://www.andreafortuna.org/cybersecurity/amcache-and-shimcache-in-forensic-analysis/
+  - https://www.ssi.gouv.fr/uploads/2019/01/anssi-coriin_2019-analysis_amcache.pdf
 
 parameters:
   - name: amCacheGlob
@@ -28,24 +28,26 @@ precondition: |
 sources:
   - name: InventoryApplicationFile
     query: |
+        LET X = scope()
         SELECT FileId,
-               Key.FullPath as Key,
+               Key.OSPath.Path as Key,
+               Key.OSPath.DelegatePath AS Hive,
                Key.Mtime as LastModified,
-               LowerCaseLongPath as Binary,
-               Name,
-               Size,
-               ProductName,
-               Publisher,
-               Version,
-               BinFileVersion
+               X.LowerCaseLongPath as Binary,
+               X.Name AS Name,
+               X.Size AS Size,
+               X.ProductName AS ProductName,
+               X.Publisher AS Publisher,
+               X.Version AS Version,
+               X.BinFileVersion AS BinFileVersion
         FROM foreach(
           row={
-            SELECT FullPath from glob(globs=expand(path=amCacheGlob))
-            WHERE log(message="Processing "+FullPath)
+            SELECT OSPath from glob(globs=expand(path=amCacheGlob))
+            WHERE log(message="Processing "+OSPath)
           }, query={
             SELECT * from read_reg_key(
-               globs=url(scheme='file', path=FullPath,
-                         fragment=amCacheRegPath).String,
+               globs=amCacheRegPath,
+               root=pathspec(DelegatePath=OSPath),
                accessor='raw_reg'
             )
         })
@@ -54,15 +56,15 @@ sources:
     query: |
         SELECT * FROM foreach(
           row={
-            SELECT FullPath from glob(globs=expand(path=amCacheGlob))
+            SELECT OSPath from glob(globs=expand(path=amCacheGlob))
           }, query={
             SELECT get(item=scope(), member="100") As ProductId,
                    get(item=scope(), member="101") As SHA1,
-                   get(item=scope(), member="15") As FullPath,
+                   get(item=scope(), member="15") As OSPath,
                    Key.Mtime as LastModifiedKey
             FROM read_reg_key(
-               globs=url(scheme='file', path=FullPath,
-                         fragment='/Root/File/*/*').String,
+               root=pathspec(DelegatePath=OSPath),
+               globs='/Root/File/*/*',
                accessor='raw_reg'
             )
         })

@@ -2,19 +2,21 @@ package parsers
 
 import (
 	"context"
-	"encoding/json"
 
 	"github.com/Velocidex/ordereddict"
 	"howett.net/plist"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/json"
 	utils "www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 /*
-   Velociraptor - Hunting Evil
+   Velociraptor - Dig Deeper
    Copyright (C) 2019-2021 Velocidex Innovations.
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -29,17 +31,18 @@ import (
 */
 
 type _PlistFunctionArgs struct {
-	Filename string `vfilter:"required,field=file,doc=A list of files to parse."`
-	Accessor string `vfilter:"optional,field=accessor,doc=The accessor to use."`
+	Filename *accessors.OSPath `vfilter:"required,field=file,doc=A list of files to parse."`
+	Accessor string            `vfilter:"optional,field=accessor,doc=The accessor to use."`
 }
 
 type PlistFunction struct{}
 
 func (self PlistFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "plist",
-		Doc:     "Parse plist file",
-		ArgType: type_map.AddType(scope, &_PlistFunctionArgs{}),
+		Name:     "plist",
+		Doc:      "Parse plist file",
+		ArgType:  type_map.AddType(scope, &_PlistFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
@@ -59,13 +62,13 @@ func (self *PlistFunction) Call(ctx context.Context,
 		return
 	}
 
-	accessor, err := glob.GetAccessor(arg.Accessor, scope)
+	accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
 		scope.Log("plist: %v", err)
 		return vfilter.Null{}
 	}
 
-	file, err := accessor.Open(arg.Filename)
+	file, err := accessor.OpenWithOSPath(arg.Filename)
 	if err != nil {
 		scope.Log("plist: %v", err)
 		return vfilter.Null{}
@@ -103,17 +106,18 @@ func (self *PlistFunction) Call(ctx context.Context,
 }
 
 type _PlistPluginArgs struct {
-	Filenames []string `vfilter:"required,field=file,doc=A list of files to parse."`
-	Accessor  string   `vfilter:"optional,field=accessor,doc=The accessor to use."`
+	Filenames []*accessors.OSPath `vfilter:"required,field=file,doc=A list of files to parse."`
+	Accessor  string              `vfilter:"optional,field=accessor,doc=The accessor to use."`
 }
 
 type _PlistPlugin struct{}
 
 func (self _PlistPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "plist",
-		Doc:     "Parses a plist file.",
-		ArgType: type_map.AddType(scope, &_PlistPluginArgs{}),
+		Name:     "plist",
+		Doc:      "Parses a plist file.",
+		ArgType:  type_map.AddType(scope, &_PlistPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
@@ -143,13 +147,13 @@ func (self _PlistPlugin) Call(
 			func() {
 				defer utils.RecoverVQL(scope)
 
-				accessor, err := glob.GetAccessor(arg.Accessor, scope)
+				accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 				if err != nil {
 					scope.Log("plist: %v", err)
 					return
 				}
 
-				file, err := accessor.Open(filename)
+				file, err := accessor.OpenWithOSPath(filename)
 				if err != nil {
 					scope.Log("Unable to open file %s: %v",
 						filename, err)

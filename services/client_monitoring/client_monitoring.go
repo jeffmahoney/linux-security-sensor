@@ -23,7 +23,6 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"github.com/google/uuid"
-	"github.com/sirupsen/logrus"
 	"google.golang.org/protobuf/proto"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
@@ -35,7 +34,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 )
 
 type ClientEventTable struct {
@@ -73,7 +72,9 @@ type ClientEventTable struct {
 
 	Clock utils.Clock
 
-	id string
+	// There is a separate manager for each org.
+	config_obj *config_proto.Config
+	id         string
 }
 
 func (self *ClientEventTable) SetClock(clock utils.Clock) {
@@ -96,6 +97,7 @@ func (self ClientEventTable) GetClock() utils.Clock {
 // When the table is refreshed its version is set to the current
 // timestamp which implied after both of these conditions.
 func (self *ClientEventTable) CheckClientEventsVersion(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	client_id string, client_version uint64) bool {
 
@@ -108,14 +110,14 @@ func (self *ClientEventTable) CheckClientEventsVersion(
 	}
 
 	// Now check the label group
-	labeler := services.GetLabeler()
+	labeler := services.GetLabeler(config_obj)
 	if labeler == nil {
 		return false
 	}
 
 	// If the client's labels have changed after their table
 	// timestamp, then they will need to update as well.
-	if client_version < labeler.LastLabelTimestamp(config_obj, client_id) {
+	if client_version < labeler.LastLabelTimestamp(ctx, config_obj, client_id) {
 		return true
 	}
 
@@ -146,12 +148,12 @@ func (self *ClientEventTable) compileArtifactCollectorArgs(
 	artifact *flows_proto.ArtifactCollectorArgs) (
 	[]*actions_proto.VQLCollectorArgs, error) {
 
-	launcher, err := services.GetLauncher()
+	launcher, err := services.GetLauncher(config_obj)
 	if err != nil {
 		return nil, err
 	}
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return nil, err
 	}
@@ -161,11 +163,19 @@ func (self *ClientEventTable) compileArtifactCollectorArgs(
 		return nil, err
 	}
 
+	var log_delay uint64
+	if config_obj.Frontend != nil &&
+		config_obj.Frontend.Resources != nil &&
+		config_obj.Frontend.Resources.DefaultMonitoringLogBatchTime > 0 {
+		log_delay = config_obj.Frontend.Resources.DefaultMonitoringLogBatchTime
+	}
+
 	return launcher.CompileCollectorArgs(
-		ctx, config_obj, vql_subsystem.NullACLManager{},
+		ctx, config_obj, acl_managers.NullACLManager{},
 		repository, services.CompilerOptions{
 			ObfuscateNames:         true,
 			IgnoreMissingArtifacts: true,
+			LogBatchTime:           log_delay,
 		}, artifact)
 }
 
@@ -235,20 +245,20 @@ func (self *ClientEventTable) setClientMonitoringState(
 
 	// Notify all the client monitoring tables that we got
 	// updated. This should cause all frontends to refresh.
-	journal, err := services.GetJournal()
+	journal, err := services.GetJournal(config_obj)
 	if err != nil {
 		return err
 	}
 
 	if principal != "" {
-		logging.GetLogger(config_obj, &logging.Audit).
-			WithFields(logrus.Fields{
-				"user":  principal,
-				"state": self.state,
-			}).Info("SetClientMonitoringState")
+		services.LogAudit(ctx,
+			config_obj, principal, "SetClientMonitoringState",
+			ordereddict.NewDict().
+				Set("user", principal).
+				Set("state", self.state))
 	}
 
-	return journal.PushRowsToArtifact(config_obj,
+	err = journal.PushRowsToArtifact(ctx, config_obj,
 		[]*ordereddict.Dict{
 			ordereddict.NewDict().
 				Set("setter", self.id).
@@ -256,9 +266,28 @@ func (self *ClientEventTable) setClientMonitoringState(
 				Set("artifact", "ClientEventTable").
 				Set("op", "set"),
 		}, "Server.Internal.ArtifactModification", "", "")
+	if err != nil {
+		return err
+	}
+
+	// This does not happen usually - on when running in GUI mode
+	// because we need low latency there.
+	if config_obj.Defaults.EventChangeNotifyAllClients {
+		notifier, err := services.GetNotifier(config_obj)
+		if err != nil {
+			return err
+		}
+
+		for _, c := range notifier.ListClients() {
+			notifier.NotifyDirectListener(c)
+		}
+	}
+
+	return nil
 }
 
 func (self *ClientEventTable) GetClientUpdateEventTableMessage(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	client_id string) *crypto_proto.VeloMessage {
 	self.mu.Lock()
@@ -278,9 +307,9 @@ func (self *ClientEventTable) GetClientUpdateEventTableMessage(
 	}
 
 	// Now apply any event queries that belong to this client based on labels.
-	labeler := services.GetLabeler()
+	labeler := services.GetLabeler(config_obj)
 	for _, table := range state.LabelEvents {
-		if labeler.IsLabelSet(config_obj, client_id, table.Label) {
+		if labeler.IsLabelSet(ctx, config_obj, client_id, table.Label) {
 			for _, event := range table.Artifacts.CompiledCollectorArgs {
 				result.Event = append(result.Event,
 					proto.Clone(event).(*actions_proto.VQLCollectorArgs))
@@ -296,11 +325,19 @@ func (self *ClientEventTable) GetClientUpdateEventTableMessage(
 		// because this increases the load on the server. We
 		// need the client to queue at least 60 seconds worth
 		// of data before reconnecting.
-		if event.MaxWait < 60 {
+		if event.MaxWait == 0 {
+			event.MaxWait = config_obj.Defaults.EventMaxWait
+		}
+
+		if event.MaxWait == 0 {
 			event.MaxWait = 120
 		}
 
-		event.MaxWait += uint64(rand.Intn(20))
+		jitter := config_obj.Defaults.EventMaxWaitJitter
+		if jitter == 0 {
+			jitter = 20
+		}
+		event.MaxWait += uint64(rand.Intn(int(jitter)))
 
 		// Event queries never time out
 		event.Timeout = 99999999
@@ -310,6 +347,31 @@ func (self *ClientEventTable) GetClientUpdateEventTableMessage(
 		UpdateEventTable: result,
 		SessionId:        constants.MONITORING_WELL_KNOWN_FLOW,
 	}
+}
+
+func (self *ClientEventTable) ProcessServerMetadataModificationEvent(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	event *ordereddict.Dict) {
+
+	// Only trigger on server metadata changes
+	client_id, pres := event.GetString("client_id")
+	if !pres || client_id != "server" {
+		return
+	}
+
+	logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
+	logger.Info("<green>client_monitoring</>: Reloading table because server metadata was updated")
+
+	err := self.load_from_file(ctx, config_obj)
+	if err != nil {
+		logger := logging.GetLogger(
+			config_obj, &logging.FrontendComponent)
+		logger.Error("self.setClientMonitoringState: %v", err)
+	}
+
+	// Update version to reflect the new time.
+	self.state.Version = uint64(self.Clock.Now().UnixNano())
 }
 
 func (self *ClientEventTable) ProcessArtifactModificationEvent(
@@ -324,7 +386,7 @@ func (self *ClientEventTable) ProcessArtifactModificationEvent(
 	}
 
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	logger.Info("Updating Client Event Table because %v was updated", modified_name)
+	logger.Info("<green>Updating Client Event Table</> because %v was updated", modified_name)
 
 	setter, _ := event.GetString("setter")
 
@@ -427,36 +489,50 @@ func (self *ClientEventTable) load_from_file(
 }
 
 // Runs at frontend start to initialize the client monitoring table.
-func StartClientMonitoringService(
+func NewClientMonitoringService(
 	ctx context.Context,
 	wg *sync.WaitGroup,
-	config_obj *config_proto.Config) error {
+	config_obj *config_proto.Config) (services.ClientEventTable, error) {
 
 	event_table := &ClientEventTable{
-		Clock: &utils.RealClock{},
-		id:    uuid.New().String(),
+		Clock:      &utils.RealClock{},
+		id:         uuid.New().String(),
+		config_obj: config_obj,
 	}
-	services.RegisterClientEventManager(event_table)
 
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	logger.Info("<green>Starting</> Client Monitoring Service")
-	journal, err := services.GetJournal()
+	logger.Info("<green>Starting</> Client Monitoring Service for %v",
+		services.GetOrgName(config_obj))
+	journal, err := services.GetJournal(config_obj)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	events, cancel := journal.Watch(ctx, "Server.Internal.ArtifactModification")
+	events, cancel := journal.Watch(
+		ctx, "Server.Internal.ArtifactModification",
+		"client_monitoring_service")
+
+	metadata_mod_event, metadata_mod_event_cancel := journal.Watch(
+		ctx, "Server.Internal.MetadataModifications",
+		"client_monitoring_service")
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		defer services.RegisterClientEventManager(nil)
+		defer metadata_mod_event_cancel()
 
 		for {
 			select {
 			case <-ctx.Done():
 				return
+
+			case event, ok := <-metadata_mod_event:
+				if !ok {
+					return
+				}
+				event_table.ProcessServerMetadataModificationEvent(
+					ctx, config_obj, event)
 
 			case event, ok := <-events:
 				if !ok {
@@ -468,5 +544,5 @@ func StartClientMonitoringService(
 		}
 	}()
 
-	return event_table.LoadFromFile(ctx, config_obj)
+	return event_table, event_table.LoadFromFile(ctx, config_obj)
 }

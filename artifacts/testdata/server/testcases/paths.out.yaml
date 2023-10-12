@@ -1,63 +1,137 @@
-SELECT basename(path="/foo/bar/baz") FROM scope()[
+SELECT basename(path="/foo/bar/baz", path_type='linux') FROM scope()[
  {
-  "basename(path=\"/foo/bar/baz\")": "baz"
+  "basename(path=\"/foo/bar/baz\", path_type='linux')": "baz"
  }
-]SELECT dirname(path="/foo/bar/baz") FROM scope()[
+]SELECT dirname(path="/foo/bar/baz", path_type='linux') FROM scope()[
  {
-  "dirname(path=\"/foo/bar/baz\")": "/foo/bar"
+  "dirname(path=\"/foo/bar/baz\", path_type='linux')": "/foo/bar"
  }
-]SELECT basename(path='/foo/bar/"http://www.google.com/"') FROM scope()[
+]SELECT relpath(path=pathspec(parse="/foo/bar"), base="/foo", sep="/") FROM scope()[
  {
-  "basename(path='/foo/bar/\"http://www.google.com/\"')": "http://www.google.com/"
+  "relpath(path=pathspec(parse=\"/foo/bar\"), base=\"/foo\", sep=\"/\")": "bar"
  }
-]SELECT basename(path='c:\\foo\\bar\\"http://www.google.com/"') FROM scope()[
+]SELECT basename(path='/foo/bar/"http://www.google.com/"', path_type='generic') FROM scope()[
  {
-  "basename(path='c:\\\\foo\\\\bar\\\\\"http://www.google.com/\"')": "http://www.google.com/"
+  "basename(path='/foo/bar/\"http://www.google.com/\"', path_type='generic')": "http://www.google.com/"
  }
-]SELECT basename(path='c:\\foo\\bar\\"http://www.google.com/"/Foobar') FROM scope()[
+]SELECT basename(path='c:\\foo\\bar\\"http://www.google.com/"', path_type='windows') FROM scope()[
  {
-  "basename(path='c:\\\\foo\\\\bar\\\\\"http://www.google.com/\"/Foobar')": "Foobar"
+  "basename(path='c:\\\\foo\\\\bar\\\\\"http://www.google.com/\"', path_type='windows')": "http://www.google.com/"
  }
-]SELECT dirname(path='c:\\foo\\bar\\"http://www.google.com/"/Foobar') FROM scope()[
+]SELECT basename(path='c:\\foo\\bar\\"http://www.google.com/"/Foobar', path_type='windows') FROM scope()[
  {
-  "dirname(path='c:\\\\foo\\\\bar\\\\\"http://www.google.com/\"/Foobar')": "c:/foo/bar/\"http://www.google.com/\""
+  "basename(path='c:\\\\foo\\\\bar\\\\\"http://www.google.com/\"/Foobar', path_type='windows')": "Foobar"
  }
-]SELECT basename(path='c:\\foo\\bar\\"F:\\foobar.txt"') FROM scope()[
+]SELECT dirname(path='c:\\foo\\bar\\"http://www.google.com/"/Foobar', path_type='windows') FROM scope()[
  {
-  "basename(path='c:\\\\foo\\\\bar\\\\\"F:\\\\foobar.txt\"')": "F:\\foobar.txt"
+  "dirname(path='c:\\\\foo\\\\bar\\\\\"http://www.google.com/\"/Foobar', path_type='windows')": "c:\\foo\\bar\\\"http://www.google.com/\""
  }
-]SELECT basename(path='c:\\foo\\bar\\"F:\\foo/bar.txt"') FROM scope()[
+]SELECT basename(path='c:\\foo\\bar\\"F:\\foobar.txt"', path='windows') FROM scope()[
  {
-  "basename(path='c:\\\\foo\\\\bar\\\\\"F:\\\\foo/bar.txt\"')": "F:\\foo/bar.txt"
+  "basename(path='c:\\\\foo\\\\bar\\\\\"F:\\\\foobar.txt\"', path='windows')": "windows"
  }
-]SELECT path_split(path="/a/b/c/d/e")[-2] FROM scope()[
+]SELECT basename(path='c:\\foo\\bar\\"F:\\foo/bar.txt"', path='windows') FROM scope()[
  {
-  "path_split(path=\"/a/b/c/d/e\")[-2]": "d"
+  "basename(path='c:\\\\foo\\\\bar\\\\\"F:\\\\foo/bar.txt\"', path='windows')": "windows"
  }
-]SELECT path_split(path="/a/b")[-20] FROM scope()[
+]SELECT path_split(path="/a/b/c/d/e", path_type='linux')[-2] FROM scope()[
  {
-  "path_split(path=\"/a/b\")[-20]": "a"
+  "path_split(path=\"/a/b/c/d/e\", path_type='linux')[-2]": "d"
  }
-]LET path_spec = pathspec(DelegateAccessor="file", DelegatePath="C:/Windows")[]SELECT path_spec, pathspec(parse=path_spec.String), pathspec(parse="C:\\Windows"), pathspec(parse="/usr/lib"), pathspec(parse="file:///usr/lib#*") FROM scope()[
+]SELECT path_split(path="/a/b", path_type='linux')[-20] FROM scope()[
  {
-  "path_spec": {
-   "DelegateAccessor": "file",
-   "DelegatePath": "C:/Windows"
-  },
-  "pathspec(parse=path_spec.String)": {
-   "DelegateAccessor": "file",
-   "DelegatePath": "C:/Windows"
-  },
-  "pathspec(parse=\"C:\\\\Windows\")": {
-   "DelegatePath": "C:\\Windows"
-  },
-  "pathspec(parse=\"/usr/lib\")": {
-   "DelegatePath": "/usr/lib"
-  },
-  "pathspec(parse=\"file:///usr/lib#*\")": {
-   "DelegateAccessor": "file",
-   "DelegatePath": "/usr/lib",
-   "Path": "*"
-  }
+  "path_split(path=\"/a/b\", path_type='linux')[-20]": "a"
+ }
+]LET path_spec = pathspec(DelegateAccessor="file", DelegatePath="C:/Windows")[]SELECT
+   -- Serialize to JSON string
+   path_spec,
+
+   -- Parse from string
+   pathspec(parse=path_spec.String),
+
+   -- Parse from OSPath
+   pathspec(parse=path_spec),
+
+   -- Parse a windows path
+   pathspec(parse="C:\\Windows", path_type='windows'),
+
+   -- Parse a linux path
+   pathspec(parse="/usr/lib", path_type='linux'),
+
+   -- Parse a registry path (Expand hive)
+   pathspec(parse="HKU/Software", path_type='registry'),
+   pathspec(parse="HKU/Software", path_type='registry') + "Microsoft",
+
+   -- Access components from an OSPath
+   pathspec(parse="HKU/Software", path_type='registry').Components,
+
+   -- Addition operation on OSPath - adding a string parses the string as
+   -- a path and joins the components..
+   (pathspec(parse="C:\\Windows", path_type='windows') + "\\foo\\bar").Components,
+
+   -- adding a list of strings joins the components without parsing each one.
+   (pathspec(parse="C:\\Windows", path_type='windows') + ("foo/bar",)).Components
+
+
+FROM scope()
+[
+ {
+  "path_spec": "{\"DelegateAccessor\":\"file\",\"DelegatePath\":\"C:/Windows\"}",
+  "pathspec(parse=path_spec.String)": "{\"DelegateAccessor\":\"file\",\"DelegatePath\":\"C:/Windows\"}",
+  "pathspec(parse=path_spec)": "{\"DelegateAccessor\":\"file\",\"DelegatePath\":\"C:/Windows\"}",
+  "pathspec(parse=\"C:\\\\Windows\", path_type='windows')": "C:\\Windows",
+  "pathspec(parse=\"/usr/lib\", path_type='linux')": "/usr/lib",
+  "pathspec(parse=\"HKU/Software\", path_type='registry')": "HKEY_USERS\\Software",
+  "pathspec(parse=\"HKU/Software\", path_type='registry') + \"Microsoft\"": "HKEY_USERS\\Software\\Microsoft",
+  "pathspec(parse=\"HKU/Software\", path_type='registry').Components": [
+   "HKEY_USERS",
+   "Software"
+  ],
+  "(pathspec(parse=\"C:\\\\Windows\", path_type='windows') + \"\\\\foo\\\\bar\").Components": [
+   "C:",
+   "Windows",
+   "foo",
+   "bar"
+  ],
+  "(pathspec(parse=\"C:\\\\Windows\", path_type='windows') + (\"foo/bar\", )).Components": [
+   "C:",
+   "Windows",
+   "foo/bar"
+  ]
+ }
+]LET shadow_path <= pathspec(parse="\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1\\Windows\\System32\\Notepad.exe", path_type="windows")[]SELECT shadow_path, shadow_path.Dirname, shadow_path.Dirname.Basename, shadow_path.Basename, shadow_path.Components FROM scope()[
+ {
+  "shadow_path": "\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1\\Windows\\System32\\Notepad.exe",
+  "shadow_path.Dirname": "\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1\\Windows\\System32",
+  "shadow_path.Dirname.Basename": "System32",
+  "shadow_path.Basename": "Notepad.exe",
+  "shadow_path.Components": [
+   "\\\\?\\GLOBALROOT\\Device\\HarddiskVolumeShadowCopy1",
+   "Windows",
+   "System32",
+   "Notepad.exe"
+  ]
+ }
+]LET OSPath = pathspec(parse='''C:\Users\test\desktop.ini''', path_type="windows")[]SELECT OSPath,
+  OSPath.Components[0] AS Drive,
+  OSPath.Components[-2] AS UserName,
+  OSPath[:-1] AS HomeDirectory,
+  OSPath[1:] AS DriveRelative,
+  -- Adding components to an OSPath extends it into a new path.
+  pathspec(parse="D:", path_type="windows") + OSPath.Components[1:] AS PathOnDDrive
+FROM scope()
+[
+ {
+  "OSPath": "C:\\Users\\test\\desktop.ini",
+  "Drive": "C:",
+  "UserName": "test",
+  "HomeDirectory": "C:\\Users\\test",
+  "DriveRelative": "Users\\test\\desktop.ini",
+  "PathOnDDrive": "D:\\Users\\test\\desktop.ini"
+ }
+]LET ComplexOSPath <= pathspec( Path="ControlSet001", DelegateAccessor="raw_ntfs", DelegatePath=pathspec( Path="/Windows/System32/Config/SYSTEM", DelegateAccessor="offset", DelegatePath=pathspec( Path="122683392", DelegateAccessor="zip", DelegatePath="/shared/mnt/flat")))[]SELECT ComplexOSPath, ComplexOSPath.HumanString FROM scope()[
+ {
+  "ComplexOSPath": "{\"DelegateAccessor\":\"raw_ntfs\",\"DelegatePath\":\"{\\\"DelegateAccessor\\\":\\\"offset\\\",\\\"DelegatePath\\\":\\\"{\\\\\\\"DelegateAccessor\\\\\\\":\\\\\\\"zip\\\\\\\",\\\\\\\"DelegatePath\\\\\\\":\\\\\\\"/shared/mnt/flat\\\\\\\",\\\\\\\"Path\\\\\\\":\\\\\\\"/122683392\\\\\\\"}\\\",\\\"Path\\\":\\\"/Windows/System32/Config/SYSTEM\\\"}\",\"Path\":\"/ControlSet001\"}",
+  "ComplexOSPath.HumanString": "/shared/mnt/flat -\u003e /122683392 -\u003e Windows\\System32\\Config\\SYSTEM -\u003e /ControlSet001"
  }
 ]

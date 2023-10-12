@@ -2,17 +2,20 @@ package clients
 
 import (
 	"context"
+	"errors"
 	"os"
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/constants"
 	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/paths"
-	"www.velocidex.com/golang/velociraptor/search"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -48,6 +51,11 @@ func (self DeleteClientPlugin) Call(ctx context.Context,
 			return
 		}
 
+		if !constants.ClientIdRegex.MatchString(arg.ClientId) {
+			scope.Log("ERROR:client_delete: Client Id should be of the form C.XXXX")
+			return
+		}
+
 		config_obj, ok := vql_subsystem.GetServerConfig(scope)
 		if !ok {
 			scope.Log("Command can only run on the server")
@@ -64,6 +72,7 @@ func (self DeleteClientPlugin) Call(ctx context.Context,
 
 		// Indiscriminately delete all the client's datastore files.
 		err = datastore.Walk(config_obj, db, client_path_manager.Path(),
+			datastore.WalkWithoutDirectories,
 			func(filename api.DSPathSpec) error {
 				select {
 				case <-ctx.Done():
@@ -77,8 +86,8 @@ func (self DeleteClientPlugin) Call(ctx context.Context,
 				}
 
 				if arg.ReallyDoIt {
-					err = db.DeleteSubject(config_obj, filename)
-					if err != nil && os.IsExist(err) {
+					err := db.DeleteSubject(config_obj, filename)
+					if err != nil && errors.Is(err, os.ErrNotExist) {
 						scope.Log("client_delete: while deleting %v: %s",
 							filename, err)
 					}
@@ -88,16 +97,6 @@ func (self DeleteClientPlugin) Call(ctx context.Context,
 		if err != nil {
 			scope.Log("client_delete: %s", err.Error())
 			return
-		}
-
-		// Delete the actual client record.
-		if arg.ReallyDoIt {
-			err = reallyDeleteClient(ctx, config_obj, scope, db, arg)
-			if err != nil {
-				scope.Log("client_delete: %s", err)
-				return
-			}
-
 		}
 
 		// Delete the filestore files.
@@ -129,11 +128,40 @@ func (self DeleteClientPlugin) Call(ctx context.Context,
 			return
 		}
 
+		// Remove the empty directories
+		err = datastore.Walk(config_obj, db, client_path_manager.Path(),
+			datastore.WalkWithDirectories,
+			func(filename api.DSPathSpec) error {
+				err := db.DeleteSubject(config_obj, filename)
+				if err != nil {
+					scope.Log("client_delete: Removig directory %v: %v",
+						filename.AsClientPath(), err)
+				}
+				return nil
+			})
+
+		// Delete the actual client record.
+		if arg.ReallyDoIt {
+			err = reallyDeleteClient(ctx, config_obj, scope, db, arg)
+			if err != nil {
+				scope.Log("client_delete: %s", err)
+				return
+			}
+
+			// Finally remove the containing directory
+			err = db.DeleteSubject(
+				config_obj,
+				paths.NewClientPathManager(arg.ClientId).Path().SetDir())
+			if err != nil {
+				scope.Log("client_delete: %s", err)
+			}
+		}
+
 		// Notify the client to force it to disconnect in case
 		// it is already up.
-		notifier := services.GetNotifier()
-		if notifier != nil {
-			err = notifier.NotifyListener(
+		notifier, err := services.GetNotifier(config_obj)
+		if err == nil {
+			err = notifier.NotifyListener(ctx,
 				config_obj, arg.ClientId, "DeleteClient")
 			if err != nil {
 				scope.Log("client_delete: %s", err)
@@ -148,7 +176,19 @@ func reallyDeleteClient(ctx context.Context,
 	config_obj *config_proto.Config, scope vfilter.Scope,
 	db datastore.DataStore, arg *DeleteClientArgs) error {
 
-	client_info, err := search.FastGetApiClient(ctx,
+	client_info_manager, err := services.GetClientInfoManager(config_obj)
+	if err != nil {
+		return err
+	}
+
+	client_info_manager.Remove(ctx, arg.ClientId)
+
+	indexer, err := services.GetIndexer(config_obj)
+	if err != nil {
+		return err
+	}
+
+	client_info, err := indexer.FastGetApiClient(ctx,
 		config_obj, arg.ClientId)
 	if err != nil {
 		return err
@@ -156,15 +196,15 @@ func reallyDeleteClient(ctx context.Context,
 
 	client_path_manager := paths.NewClientPathManager(arg.ClientId)
 	err = db.DeleteSubject(config_obj, client_path_manager.Path())
-	if err != nil && os.IsExist(err) {
+	if err != nil && errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 
 	// Remove any labels
-	labeler := services.GetLabeler()
-	for _, label := range labeler.GetClientLabels(config_obj, arg.ClientId) {
-		err := labeler.RemoveClientLabel(config_obj, arg.ClientId, label)
-		if err != nil && os.IsExist(err) {
+	labeler := services.GetLabeler(config_obj)
+	for _, label := range labeler.GetClientLabels(ctx, config_obj, arg.ClientId) {
+		err := labeler.RemoveClientLabel(ctx, config_obj, arg.ClientId, label)
+		if err != nil && errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
@@ -177,31 +217,72 @@ func reallyDeleteClient(ctx context.Context,
 		keywords = append(keywords, "host:"+client_info.OsInfo.Fqdn)
 	}
 	for _, keyword := range keywords {
-		err = search.UnsetIndex(config_obj, arg.ClientId, keyword)
-		if err != nil && os.IsExist(err) {
+		err = indexer.UnsetIndex(arg.ClientId, keyword)
+		if err != nil && errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
 
-	// Send an event that the client was deleted.
-	journal, err := services.GetJournal()
+	journal, err := services.GetJournal(config_obj)
 	if err != nil {
 		return err
 	}
 
-	return journal.PushRowsToArtifact(config_obj,
+	principal := vql_subsystem.GetPrincipal(scope)
+	services.LogAudit(ctx,
+		config_obj, principal, "client_delete",
+		ordereddict.NewDict().
+			Set("client_id", arg.ClientId).
+			Set("org_id", config_obj.OrgId))
+
+	err = journal.PushRowsToArtifact(ctx, config_obj,
 		[]*ordereddict.Dict{ordereddict.NewDict().
 			Set("ClientId", arg.ClientId).
-			Set("Principal", vql_subsystem.GetPrincipal(scope))},
+			Set("OrgId", config_obj.OrgId).
+			Set("Principal", principal)},
+		"Server.Internal.ClientDelete", "server", "")
+
+	if err != nil {
+		return err
+	}
+
+	// Send an event that the client was deleted to the root org as
+	// well. The Frontend is not org aware and needs to be informed to
+	// client deletion events.
+	if utils.IsRootOrg(config_obj.OrgId) {
+		return nil
+	}
+
+	org_manager, err := services.GetOrgManager()
+	if err != nil {
+		return err
+	}
+
+	root_config_obj, err := org_manager.GetOrgConfig("root")
+	if err != nil {
+		return err
+	}
+
+	journal, err = services.GetJournal(root_config_obj)
+	if err != nil {
+		return err
+	}
+
+	return journal.PushRowsToArtifact(ctx, root_config_obj,
+		[]*ordereddict.Dict{ordereddict.NewDict().
+			Set("ClientId", arg.ClientId).
+			Set("OrgId", config_obj.OrgId).
+			Set("Principal", principal)},
 		"Server.Internal.ClientDelete", "server", "")
 }
 
 func (self DeleteClientPlugin) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "client_delete",
-		Doc:     "Delete all information related to a client. ",
-		ArgType: type_map.AddType(scope, &DeleteClientArgs{}),
+		Name:     "client_delete",
+		Doc:      "Delete all information related to a client. ",
+		ArgType:  type_map.AddType(scope, &DeleteClientArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.DELETE_RESULTS).Build(),
 	}
 }
 

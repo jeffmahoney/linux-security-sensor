@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -44,7 +44,6 @@ import (
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
-	"www.velocidex.com/golang/vfilter/types"
 )
 
 type _FIFOCacheEntry struct {
@@ -212,7 +211,7 @@ func (self _FIFOPlugin) Call(ctx context.Context,
 		fifo_cache := vql_subsystem.CacheGet(scope, key)
 		if fifo_cache == nil {
 			scope.Log("Creating FIFO Cache for %v\n",
-				types.ToString(arg.Query, scope))
+				vfilter.FormatToString(scope, arg.Query))
 			fifo_cache = NewFIFOCache(
 				ctx, scope,
 				time.Duration(arg.MaxAge)*time.Second,

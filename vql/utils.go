@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -18,11 +18,31 @@
 package vql
 
 import (
+	"context"
 	"runtime/debug"
+	"strconv"
 	"time"
 
 	vfilter "www.velocidex.com/golang/vfilter"
+	"www.velocidex.com/golang/vfilter/types"
 )
+
+func Materialize(ctx context.Context, scope vfilter.Scope,
+	in types.Any) types.Any {
+	switch t := in.(type) {
+	case types.LazyExpr:
+		return t.Reduce(ctx)
+
+	case types.StoredQuery:
+		return types.Materialize(ctx, scope, t)
+
+	case types.StoredExpression:
+		return t.Reduce(ctx, scope)
+
+	default:
+		return in
+	}
+}
 
 // GetStringFromRow gets a string value from row. If it is not there
 // or not a string return ""
@@ -30,6 +50,7 @@ func GetStringFromRow(scope vfilter.Scope,
 	row vfilter.Row, key string) string {
 	value, pres := scope.Associative(row, key)
 	if pres {
+		value = Materialize(context.Background(), scope, value)
 		value_str, ok := value.(string)
 		if ok {
 			return value_str
@@ -38,12 +59,23 @@ func GetStringFromRow(scope vfilter.Scope,
 	return ""
 }
 
+func GetBoolFromRow(scope vfilter.Scope,
+	row vfilter.Row, key string) bool {
+	value, pres := scope.Associative(row, key)
+	if pres {
+		value = Materialize(context.Background(), scope, value)
+		return scope.Bool(value)
+	}
+	return false
+}
+
 // GetIntFromRow gets a uint64 value from row. If it is not there
 // or not a string return 0. Floats etc are coerced to uint64.
 func GetIntFromRow(scope vfilter.Scope,
 	row vfilter.Row, key string) uint64 {
 	value, pres := scope.Associative(row, key)
 	if pres {
+		value = Materialize(context.Background(), scope, value)
 		switch t := value.(type) {
 		case int:
 			return uint64(t)
@@ -63,6 +95,41 @@ func GetIntFromRow(scope vfilter.Scope,
 			return uint64(t)
 		case uint64:
 			return t
+		case float64:
+			return uint64(t)
+		}
+	}
+	return 0
+}
+
+func GetFloatFromRow(scope vfilter.Scope, row vfilter.Row, key string) float64 {
+	value, pres := scope.Associative(row, key)
+	if pres {
+		value = Materialize(context.Background(), scope, value)
+		switch t := value.(type) {
+		case int:
+			return float64(t)
+		case int8:
+			return float64(t)
+		case int16:
+			return float64(t)
+		case int32:
+			return float64(t)
+		case int64:
+			return float64(t)
+		case uint8:
+			return float64(t)
+		case uint16:
+			return float64(t)
+		case uint32:
+			return float64(t)
+		case uint64:
+			return float64(t)
+		case float64:
+			return t
+		case string:
+			res, _ := strconv.ParseFloat(t, 64)
+			return res
 		}
 	}
 	return 0

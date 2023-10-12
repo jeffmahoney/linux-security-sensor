@@ -113,7 +113,6 @@ func (self *FileStoreTestSuite) TestListChildrenWithTypes() {
 
 		// TMP files
 		api.PATH_TYPE_FILESTORE_TMP,
-		api.PATH_TYPE_FILESTORE_LOCK,
 		api.PATH_TYPE_FILESTORE_CSV,
 
 		// Used for artifacts
@@ -209,6 +208,67 @@ func (self *FileStoreTestSuite) TestListDirectory() {
 		})
 	assert.NoError(self.T(), err)
 	assert.Equal(self.T(), len(names), 0)
+}
+
+func (self *FileStoreTestSuite) TestFileUpdate() {
+	filename := path_specs.NewSafeFilestorePath("test", "foo")
+	fd, err := self.filestore.WriteFile(filename)
+	assert.NoError(self.T(), err)
+
+	// Write some data.
+	_, err = fd.Write([]byte("this is some long data"))
+	assert.NoError(self.T(), err)
+
+	fd.Close()
+
+	// Now update the data in place
+	fd, err = self.filestore.WriteFile(filename)
+	assert.NoError(self.T(), err)
+
+	err = fd.Update([]byte("short"), 13)
+	assert.NoError(self.T(), err)
+
+	buff := make([]byte, 60)
+	reader, err := self.filestore.ReadFile(filename)
+	assert.NoError(self.T(), err)
+	defer reader.Close()
+
+	// Check the data was updated correctly.
+	n, err := reader.Read(buff)
+	assert.NoError(self.T(), err)
+	assert.Equal(self.T(), "this is some shortdata", string(buff[:n]))
+}
+
+func (self *FileStoreTestSuite) TestFileUpdatePastEndOfFile() {
+	filename := path_specs.NewSafeFilestorePath("test", "foo")
+	fd, err := self.filestore.WriteFile(filename)
+	assert.NoError(self.T(), err)
+
+	// Write some data.
+	_, err = fd.Write([]byte("this is some data"))
+	assert.NoError(self.T(), err)
+
+	fd.Close()
+
+	// Now update the data in place
+	fd, err = self.filestore.WriteFile(filename)
+	assert.NoError(self.T(), err)
+
+	err = fd.Update([]byte("a long string that should extend the file"), 13)
+	assert.NoError(self.T(), err)
+
+	buff := make([]byte, 600)
+	reader, err := self.filestore.ReadFile(filename)
+	assert.NoError(self.T(), err)
+	defer reader.Close()
+
+	// Check the data was updated correctly.
+	n, err := reader.Read(buff)
+	assert.NoError(self.T(), err)
+
+	assert.Equal(self.T(),
+		"this is some a long string that should extend the file",
+		string(buff[:n]))
 }
 
 func (self *FileStoreTestSuite) TestFileReadWrite() {
@@ -348,7 +408,7 @@ func (self *QueueManagerTestSuite) TestPush() {
 		ordereddict.NewDict().Set("foo", 2)}
 
 	ctx := context.Background()
-	output, cancel := self.manager.Watch(ctx, artifact_name)
+	output, cancel := self.manager.Watch(ctx, artifact_name, nil)
 	defer cancel()
 
 	log_path := path_specs.NewUnsafeFilestorePath("log_path")

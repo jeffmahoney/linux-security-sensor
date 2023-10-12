@@ -2,16 +2,12 @@ package hunts
 
 import (
 	"context"
-	"os"
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	"www.velocidex.com/golang/velociraptor/datastore"
-	"www.velocidex.com/golang/velociraptor/file_store"
-	"www.velocidex.com/golang/velociraptor/file_store/api"
-	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -53,90 +49,71 @@ func (self DeleteHuntPlugin) Call(ctx context.Context,
 			return
 		}
 
+		principal := vql_subsystem.GetPrincipal(scope)
+
+		launcher, err := services.GetLauncher(config_obj)
+		if err != nil {
+			scope.Log("hunt_delete: %s", err)
+			return
+		}
+
+		hunt_dispatcher, err := services.GetHuntDispatcher(config_obj)
+		if err != nil {
+			scope.Log("hunt_delete: %s", err)
+			return
+		}
+
+		hunt_obj, pres := hunt_dispatcher.GetHunt(arg.HuntId)
+		if !pres {
+			scope.Log("hunt_delete: not found")
+			return
+		}
+
+		services.LogAudit(ctx,
+			config_obj, principal, "hunt_delete",
+			ordereddict.NewDict().
+				Set("hunt_id", arg.HuntId).
+				Set("details", hunt_obj))
+
+		for flow_details := range hunt_dispatcher.GetFlows(
+			ctx, config_obj, scope, arg.HuntId, 0) {
+
+			results, err := launcher.Storage().DeleteFlow(ctx, config_obj,
+				flow_details.Context.ClientId,
+				flow_details.Context.SessionId,
+				services.NoAuditLogging, arg.ReallyDoIt)
+			if err != nil {
+				scope.Log("hunt_delete: %v", err)
+				return
+			}
+
+			for _, res := range results {
+				select {
+				case <-ctx.Done():
+					return
+				case output_chan <- res:
+				}
+			}
+		}
+
 		// Now remove the hunt from the hunt manager
 		if arg.ReallyDoIt {
 			mutation := api_proto.HuntMutation{
 				HuntId: arg.HuntId,
 				State:  api_proto.Hunt_ARCHIVED,
 			}
-			journal, err := services.GetJournal()
+			journal, err := services.GetJournal(config_obj)
 			if err != nil {
 				scope.Log("hunt_delete: %s", err)
 				return
 			}
 
-			journal.PushRowsToArtifactAsync(config_obj,
+			journal.PushRowsToArtifactAsync(ctx, config_obj,
 				ordereddict.NewDict().
 					Set("hunt_id", arg.HuntId).
 					Set("mutation", mutation),
 				"Server.Internal.HuntModification")
 		}
-
-		db, err := datastore.GetDB(config_obj)
-		if err != nil {
-			return
-		}
-
-		file_store_factory := file_store.GetFileStore(config_obj)
-		hunt_path_manager := paths.NewHuntPathManager(arg.HuntId)
-
-		// Indiscriminately delete all the hunts's datastore files.
-		err = datastore.Walk(config_obj, db, hunt_path_manager.Path(),
-			func(filename api.DSPathSpec) error {
-				select {
-				case <-ctx.Done():
-					return nil
-
-				case output_chan <- ordereddict.NewDict().
-					Set("hunt_id", arg.HuntId).
-					Set("type", "Datastore").
-					Set("vfs_path", filename.AsClientPath()).
-					Set("really_do_it", arg.ReallyDoIt):
-				}
-
-				if arg.ReallyDoIt {
-					err = db.DeleteSubject(config_obj, filename)
-					if err != nil && os.IsExist(err) {
-						scope.Log("hunt_delete: while deleting %v: %s",
-							filename, err)
-					}
-				}
-				return nil
-			})
-		if err != nil {
-			scope.Log("hunt_delete: %s", err.Error())
-			return
-		}
-
-		// Delete the filestore files.
-		err = api.Walk(file_store_factory,
-			hunt_path_manager.Path().AsFilestorePath(),
-			func(filename api.FSPathSpec, info os.FileInfo) error {
-				select {
-				case <-ctx.Done():
-					return nil
-
-				case output_chan <- ordereddict.NewDict().
-					Set("hunt_id", arg.HuntId).
-					Set("type", "Filestore").
-					Set("vfs_path", filename.AsClientPath()).
-					Set("really_do_it", arg.ReallyDoIt):
-				}
-
-				if arg.ReallyDoIt {
-					err := file_store_factory.Delete(filename)
-					if err != nil {
-						scope.Log("hunt_delete: while deleting %v: %s",
-							filename, err)
-					}
-				}
-				return nil
-			})
-		if err != nil {
-			scope.Log("hunt_delete: %s", err)
-			return
-		}
-
 	}()
 
 	return output_chan
@@ -145,9 +122,10 @@ func (self DeleteHuntPlugin) Call(ctx context.Context,
 func (self DeleteHuntPlugin) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "hunt_delete",
-		Doc:     "Delete a hunt. ",
-		ArgType: type_map.AddType(scope, &DeleteHuntArgs{}),
+		Name:     "hunt_delete",
+		Doc:      "Delete a hunt. ",
+		ArgType:  type_map.AddType(scope, &DeleteHuntArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.SERVER_ADMIN).Build(),
 	}
 }
 

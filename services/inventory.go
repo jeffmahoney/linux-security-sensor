@@ -9,37 +9,32 @@ package services
 
 import (
 	"context"
-	"sync"
 
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 )
 
-var (
-	inventory_mu sync.Mutex
-	ginventory   Inventory
-)
+func GetInventory(config_obj *config_proto.Config) (Inventory, error) {
+	org_manager, err := GetOrgManager()
+	if err != nil {
+		return nil, err
+	}
 
-func GetInventory() Inventory {
-	inventory_mu.Lock()
-	defer inventory_mu.Unlock()
-
-	return ginventory
+	return org_manager.Services(config_obj.OrgId).Inventory()
 }
 
-func RegisterInventory(inventory Inventory) {
-	inventory_mu.Lock()
-	defer inventory_mu.Unlock()
-
-	ginventory = inventory
-}
-
+// Options to the AddTool() API
 type ToolOptions struct {
 	// Tool is being upgraded.
 	Upgrade bool
 
 	// Admin is overriding tool in inventory.
 	AdminOverride bool
+
+	// Tool definition is from an artifact definition. Hold onto this
+	// as one of the prestine versions so the user can reset it back
+	// if needed.
+	ArtifactDefinition bool
 }
 
 type Inventory interface {
@@ -47,7 +42,8 @@ type Inventory interface {
 	Get() *artifacts_proto.ThirdParty
 
 	// Probe for a specific tool without materializing the tool.
-	ProbeToolInfo(name string) (*artifacts_proto.Tool, error)
+	ProbeToolInfo(ctx context.Context, config_obj *config_proto.Config,
+		name, version string) (*artifacts_proto.Tool, error)
 
 	// Get information about a specific tool. If the tool is set
 	// to serve locally, the tool will be fetched from its
@@ -55,7 +51,7 @@ type Inventory interface {
 	// update the state fields  (e.g. serve_url, filestore_path,
 	// filename, hash)
 	GetToolInfo(ctx context.Context, config_obj *config_proto.Config,
-		tool string) (*artifacts_proto.Tool, error)
+		tool, version string) (*artifacts_proto.Tool, error)
 
 	// Add a new tool to the inventory. Adding the tool does not
 	// force it to be downloaded - it simply adds it to the
@@ -65,9 +61,9 @@ type Inventory interface {
 	// actually valid and available, they need to call
 	// GetToolInfo() after this to force the tool to be
 	// materialized.
-	AddTool(config_obj *config_proto.Config,
+	AddTool(ctx context.Context, config_obj *config_proto.Config,
 		tool *artifacts_proto.Tool, opts ToolOptions) error
 
-	// Remove the tool from the inventory.
+	// Remove the tool from the inventory and all its versions.
 	RemoveTool(config_obj *config_proto.Config, tool_name string) error
 }

@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -26,6 +26,7 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -92,33 +93,20 @@ func (self *TempfileFunction) Call(ctx context.Context,
 		return &vfilter.Null{}
 	}
 
-	// Make sure the file is removed when the query is done.
-	removal := func() {
-		scope.Log("tempfile: removing tempfile %v", tmpfile.Name())
-
-		// On windows especially we can not remove files that
-		// are opened by something else, so we keep trying for
-		// a while.
-		for i := 0; i < 100; i++ {
-			err := os.Remove(tmpfile.Name())
-			if err == nil {
-				break
-			}
-			time.Sleep(time.Second)
-		}
-	}
-
 	if arg.RemoveLast {
 		scope.Log("Adding global destructor for %v", tmpfile.Name())
-		err := vql_subsystem.GetRootScope(scope).AddDestructor(removal)
+		err := vql_subsystem.GetRootScope(scope).
+			AddDestructor(func() { RemoveFile(scope, tmpfile.Name()) })
 		if err != nil {
-			removal()
+			RemoveFile(scope, tmpfile.Name())
 			scope.Log("tempfile: %v", err)
 		}
 	} else {
-		err := scope.AddDestructor(removal)
+		err := scope.AddDestructor(func() {
+			RemoveFile(scope, tmpfile.Name())
+		})
 		if err != nil {
-			removal()
+			RemoveFile(scope, tmpfile.Name())
 			scope.Log("tempfile: %v", err)
 		}
 	}
@@ -128,9 +116,10 @@ func (self *TempfileFunction) Call(ctx context.Context,
 func (self TempfileFunction) Info(scope vfilter.Scope,
 	type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "tempfile",
-		Doc:     "Create a temporary file and write some data into it.",
-		ArgType: type_map.AddType(scope, &_TempfileRequest{}),
+		Name:     "tempfile",
+		Doc:      "Create a temporary file and write some data into it.",
+		ArgType:  type_map.AddType(scope, &_TempfileRequest{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_WRITE).Build(),
 	}
 }
 
@@ -201,9 +190,25 @@ func (self *TempdirFunction) Call(ctx context.Context,
 func (self TempdirFunction) Info(scope vfilter.Scope,
 	type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "tempdir",
-		Doc:     "Create a temporary directory. The directory will be removed when the query ends.",
-		ArgType: type_map.AddType(scope, &_TempdirRequest{}),
+		Name:     "tempdir",
+		Doc:      "Create a temporary directory. The directory will be removed when the query ends.",
+		ArgType:  type_map.AddType(scope, &_TempdirRequest{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_WRITE).Build(),
+	}
+}
+
+func RemoveFile(scope vfilter.Scope, filename string) {
+	scope.Log("tempfile: removing tempfile %v", filename)
+
+	// On windows especially we can not remove files that
+	// are opened by something else, so we keep trying for
+	// a while.
+	for i := 0; i < 100; i++ {
+		err := os.Remove(filename)
+		if err == nil {
+			break
+		}
+		time.Sleep(time.Second)
 	}
 }
 

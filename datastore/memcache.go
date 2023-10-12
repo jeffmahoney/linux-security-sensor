@@ -1,13 +1,13 @@
 package datastore
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"sort"
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
@@ -349,7 +350,7 @@ func (self *MemcacheDatastore) GetSubject(
 
 	defer Instrument("read", "MemcacheDatastore", urn)()
 
-	path := urn.AsClientPath()
+	path := urn.AsDatastoreFilename(config_obj)
 	bulk_data_any, err := self.data_cache.Get(path)
 	if err != nil {
 		// Second try the old DB without json. This supports
@@ -358,7 +359,7 @@ func (self *MemcacheDatastore) GetSubject(
 		// read old files.
 		if urn.Type() == api.PATH_TYPE_DATASTORE_JSON {
 			bulk_data_any, err = self.data_cache.Get(
-				urn.SetType(api.PATH_TYPE_DATASTORE_PROTO).AsClientPath())
+				urn.SetType(api.PATH_TYPE_DATASTORE_PROTO).AsDatastoreFilename(config_obj))
 		}
 
 		if err != nil {
@@ -391,9 +392,8 @@ func unmarshalData(serialized_content []byte,
 	}
 
 	if err != nil {
-		return errors.WithMessage(os.ErrNotExist,
-			fmt.Sprintf("While decoding %v: %v",
-				urn.AsClientPath(), err))
+		return fmt.Errorf("While decoding %v: %w",
+			urn.AsClientPath(), os.ErrNotExist)
 	}
 	return nil
 }
@@ -424,6 +424,15 @@ func (self *MemcacheDatastore) SetSubjectWithCompletion(
 	completion func()) error {
 
 	defer Instrument("write", "MemcacheDatastore", urn)()
+
+	// If we were called with utils.SyncCompleter it means we need to
+	// wait here until the transaction is flushed to disk.
+	if utils.CompareFuncs(completion, utils.SyncCompleter) {
+		var wg sync.WaitGroup
+		wg.Add(1)
+		defer wg.Wait()
+		completion = wg.Done
+	}
 
 	// Make sure to call the completer on all exit points
 	// (MemcacheDatastore is actually synchronous).
@@ -456,7 +465,7 @@ func (self *MemcacheDatastore) SetData(
 	config_obj *config_proto.Config,
 	urn api.DSPathSpec, data []byte) (err error) {
 
-	err = self.data_cache.Set(urn.AsClientPath(), &BulkData{
+	err = self.data_cache.Set(urn.AsDatastoreFilename(config_obj), &BulkData{
 		data: data,
 	})
 	if err != nil {
@@ -495,7 +504,7 @@ func (self *MemcacheDatastore) DeleteSubject(
 	urn api.DSPathSpec) error {
 	defer Instrument("delete", "MemcacheDatastore", urn)()
 
-	err := self.data_cache.Remove(urn.AsClientPath())
+	err := self.data_cache.Remove(urn.AsDatastoreFilename(config_obj))
 	if err != nil {
 		return err
 	}
@@ -570,6 +579,7 @@ func (self *MemcacheDatastore) Close() {
 	self.dir_cache.Flush()
 }
 
+// Clear the cache and drop the data on the floor.
 func (self *MemcacheDatastore) Clear() {
 	self.data_cache.Purge()
 	self.dir_cache.Purge()
@@ -579,7 +589,7 @@ func (self *MemcacheDatastore) Clear() {
 func (self *MemcacheDatastore) GetBuffer(
 	config_obj *config_proto.Config,
 	urn api.DSPathSpec) ([]byte, error) {
-	path := urn.AsClientPath()
+	path := urn.AsDatastoreFilename(config_obj)
 	bulk_data_any, err := self.data_cache.Get(path)
 	bulk_data, ok := bulk_data_any.(*BulkData)
 	if !ok {

@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -129,8 +129,9 @@ func (self JoinFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *v
 }
 
 type FilterFunctionArgs struct {
-	List  []string `vfilter:"required,field=list,doc=A list of items to filter"`
-	Regex []string `vfilter:"required,field=regex,doc=A regex to test each item"`
+	List      []vfilter.Any `vfilter:"required,field=list,doc=A list of items to filter"`
+	Regex     []string      `vfilter:"optional,field=regex,doc=A regex to test each item"`
+	Condition string        `vfilter:"optional,field=condition,doc=A VQL lambda to use to filter elements"`
 }
 type FilterFunction struct{}
 
@@ -154,12 +155,37 @@ func (self *FilterFunction) Call(ctx context.Context,
 		res = append(res, r)
 	}
 
-	result := []string{}
-	for _, item := range arg.List {
-		for _, regex := range res {
-			if regex.MatchString(item) {
-				result = append(result, item)
+	var lambda *vfilter.Lambda
+	if arg.Condition != "" {
+		lambda, err = vfilter.ParseLambda(arg.Condition)
+		if err != nil {
+			scope.Log("filter: Unable to compile lambda %s", arg.Condition)
+			return false
+		}
+	}
+
+	matcher := func(item vfilter.Any) bool {
+		str, ok := item.(string)
+		if ok {
+			for _, regex := range res {
+				if regex.MatchString(str) {
+					return true
+				}
 			}
+			return false
+		}
+
+		if lambda != nil {
+			return scope.Bool(lambda.Reduce(ctx, scope, []types.Any{item}))
+
+		}
+		return false
+	}
+
+	result := []types.Any{}
+	for _, item := range arg.List {
+		if matcher(item) {
+			result = append(result, item)
 		}
 	}
 
@@ -175,7 +201,7 @@ func (self FilterFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) 
 }
 
 type LenFunctionArgs struct {
-	List vfilter.Any `vfilter:"required,field=list,doc=A list of items too filter"`
+	List vfilter.Any `vfilter:"required,field=list,doc=A list of items to filter"`
 }
 type LenFunction struct{}
 
@@ -187,6 +213,14 @@ func (self *LenFunction) Call(ctx context.Context,
 	if err != nil {
 		scope.Log("len: %s", err.Error())
 		return &vfilter.Null{}
+	}
+
+	switch t := arg.List.(type) {
+	case types.LazyExpr:
+		arg.List = t.Reduce(ctx)
+
+	case types.Materializer:
+		arg.List = t.Materialize(ctx, scope)
 	}
 
 	slice := reflect.ValueOf(arg.List)

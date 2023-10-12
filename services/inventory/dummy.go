@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
+	"github.com/go-errors/errors"
 	"google.golang.org/protobuf/proto"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
@@ -23,12 +23,13 @@ import (
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql/networking"
 )
 
 type Dummy struct {
 	mu        sync.Mutex
 	binaries  *artifacts_proto.ThirdParty
-	Client    HTTPClient
+	Client    networking.HTTPClient
 	Clock     utils.Clock
 	filenames []string
 }
@@ -80,21 +81,33 @@ func (self *Dummy) Get() *artifacts_proto.ThirdParty {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
+	if self.binaries == nil {
+		self.binaries = &artifacts_proto.ThirdParty{}
+	}
+
 	return proto.Clone(self.binaries).(*artifacts_proto.ThirdParty)
 }
 
-func (self *Dummy) ProbeToolInfo(name string) (*artifacts_proto.Tool, error) {
+func (self *Dummy) ProbeToolInfo(
+	ctx context.Context, config_obj *config_proto.Config,
+	name, version string) (*artifacts_proto.Tool, error) {
 	for _, tool := range self.Get().Tools {
-		if tool.Name == name {
-			return tool, nil
+		if tool.Name != name {
+			continue
 		}
+		if version != "" && tool.Version != version {
+			continue
+		}
+
+		return tool, nil
 	}
 	return nil, errors.New("Not Found")
 }
 
 func (self *Dummy) GetToolInfo(
 	ctx context.Context,
-	config_obj *config_proto.Config, tool string) (*artifacts_proto.Tool, error) {
+	config_obj *config_proto.Config,
+	tool, version string) (*artifacts_proto.Tool, error) {
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
@@ -103,6 +116,12 @@ func (self *Dummy) GetToolInfo(
 	}
 
 	for _, item := range self.binaries.Tools {
+		// If a version is specified skip tools that are not the
+		// correct version.
+		if version != "" && (item.Name != tool || item.Version == version) {
+			continue
+		}
+
 		if item.Name == tool {
 			// Currently we require to know all tool's
 			// hashes. If the hash is missing then the
@@ -140,15 +159,15 @@ func (self *Dummy) materializeTool(
 		var err error
 		tool.Url, err = getGithubRelease(ctx, self.Client, config_obj, tool)
 		if err != nil {
-			return errors.Wrap(
-				err, "While resolving github release "+tool.GithubProject)
+			return fmt.Errorf("While resolving github release %v: %w",
+				tool.GithubProject, err)
 		}
 	}
 
 	// We have no idea where the file is.
 	if tool.Url == "" {
-		return errors.New(fmt.Sprintf(
-			"Tool %v has no url defined - upload it manually.", tool.Name))
+		return fmt.Errorf(
+			"Tool %v has no url defined - upload it manually.", tool.Name)
 	}
 
 	fd, err := self.getTempFile(config_obj, tool.Filename, tool.Url)
@@ -163,7 +182,7 @@ func (self *Dummy) materializeTool(
 	}
 
 	logger := logging.GetLogger(config_obj, &logging.GenericComponent)
-	logger.Info("Downloading tool <green>%v</> FROM <red>%v</>", tool.Name, tool.Url)
+	logger.Info("Downloading tool <green>%v</> FROM <cyan>%v</>", tool.Name, tool.Url)
 	request, err := http.NewRequestWithContext(ctx, "GET", tool.Url, nil)
 	if err != nil {
 		return err
@@ -176,8 +195,8 @@ func (self *Dummy) materializeTool(
 
 	// If the download failed, we can not store this tool.
 	if res.StatusCode != 200 {
-		return errors.New(fmt.Sprintf("Unable to download file from %v: %v",
-			tool.Url, res.Status))
+		return fmt.Errorf("Unable to download file from %v: %v",
+			tool.Url, res.Status)
 	}
 	sha_sum := sha256.New()
 
@@ -192,7 +211,7 @@ func (self *Dummy) materializeTool(
 	return nil
 }
 
-func getGithubRelease(ctx context.Context, Client HTTPClient,
+func getGithubRelease(ctx context.Context, Client networking.HTTPClient,
 	config_obj *config_proto.Config,
 	tool *artifacts_proto.Tool) (string, error) {
 
@@ -212,20 +231,20 @@ func getGithubRelease(ctx context.Context, Client HTTPClient,
 	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
-		return "", errors.New(fmt.Sprintf("Error: %v", res.Status))
+		return "", fmt.Errorf("Error: %v", res.Status)
 	}
 
 	response, err := ioutil.ReadAll(res.Body)
 	if err != nil {
-		return "", errors.Wrap(err,
-			"While make Github API call to "+url)
+		return "", fmt.Errorf(
+			"While make Github API call to %v: %w ", url, err)
 	}
 
 	api_obj := &githubReleasesAPI{}
 	err = json.Unmarshal(response, &api_obj)
 	if err != nil {
-		return "", errors.Wrap(err,
-			"While make Github API call to "+url)
+		return "", fmt.Errorf(
+			"While make Github API call to  %v: %w ", url, err)
 	}
 
 	release_re, err := regexp.Compile(tool.GithubAssetRegex)
@@ -244,11 +263,14 @@ func getGithubRelease(ctx context.Context, Client HTTPClient,
 	return "", errors.New("Release not found from github API " + url)
 }
 
-func (self *Dummy) AddTool(config_obj *config_proto.Config,
+func (self *Dummy) AddTool(
+	ctx context.Context, config_obj *config_proto.Config,
 	tool_request *artifacts_proto.Tool,
 	opts services.ToolOptions) error {
 	if opts.Upgrade {
-		existing_tool, err := self.ProbeToolInfo(tool_request.Name)
+		existing_tool, err := self.ProbeToolInfo(
+			ctx, config_obj, tool_request.Name,
+			tool_request.Version)
 		if err == nil {
 			// Ignore the request if the existing
 			// definition is better than the new one.
@@ -312,10 +334,10 @@ func (self *Dummy) RemoveTool(
 	return nil
 }
 
-func StartInventoryDummyService(
+func NewInventoryDummyService(
 	ctx context.Context,
 	wg *sync.WaitGroup,
-	config_obj *config_proto.Config) error {
+	config_obj *config_proto.Config) (services.Inventory, error) {
 
 	inventory_service := &Dummy{
 		Clock:    utils.RealClock{},
@@ -339,7 +361,6 @@ func StartInventoryDummyService(
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer services.RegisterInventory(nil)
 		defer inventory_service.Close(config_obj)
 
 		<-ctx.Done()
@@ -348,6 +369,11 @@ func StartInventoryDummyService(
 	logger := logging.GetLogger(config_obj, &logging.GenericComponent)
 	logger.Info("Installing <green>Dummy inventory_service</>. Will download tools to temp directory.")
 
-	services.RegisterInventory(inventory_service)
-	return nil
+	return inventory_service, nil
+}
+
+type DummyHTTPClient struct{}
+
+func (self DummyHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	return nil, errors.New("External tool access is disabled on this server. You can try to manually upload tools in the Tool Setup GUI")
 }

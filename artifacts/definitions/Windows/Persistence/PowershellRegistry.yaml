@@ -31,14 +31,16 @@ sources:
     query: |
         SELECT * from foreach(
         row={
-          SELECT Name, Directory as HomeDir from Artifact.Windows.Sys.Users()
-          WHERE Directory and Gid AND Name =~ userRegex
+          SELECT Name,
+                 expand(path=Directory) AS HomeDir
+          FROM Artifact.Windows.Sys.Users()
+          WHERE HomeDir and Gid AND Name =~ userRegex
         },
         query={
-          SELECT File.FullPath As FullPath,
+          SELECT File.OSPath As OSPath,
                  String.Offset AS Off,
                  String.HexData As Hex,
-                 upload(file=File.FullPath, accessor="file") AS Upload
+                 upload(file=File.FullPath, accessor="auto") AS Upload
               FROM yara(
               files=HomeDir + "\\ntuser.dat",
               rules=yaraRule, context=50)

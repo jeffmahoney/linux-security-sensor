@@ -43,12 +43,12 @@ package datastore
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"sync"
 	"time"
 
-	errors "github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -56,6 +56,7 @@ import (
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
@@ -101,10 +102,13 @@ const (
 
 // Mark a mutation to be written to the backing data store.
 type Mutation struct {
-	op   int
-	urn  api.DSPathSpec
-	wg   *sync.WaitGroup
-	data []byte
+	op  int
+	urn api.DSPathSpec
+
+	// The config object related to the org this call came from
+	org_config_obj *config_proto.Config
+	wg             *sync.WaitGroup
+	data           []byte
 
 	// Will run when committed to disk.
 	completion func()
@@ -117,6 +121,8 @@ type MemcacheFileDataStore struct {
 	writer chan *Mutation
 	ctx    context.Context
 	cancel func()
+
+	started bool
 }
 
 func (self *MemcacheFileDataStore) Stats() *MemcacheStats {
@@ -148,6 +154,20 @@ func (self *MemcacheFileDataStore) ExpirationPolicy(
 	return true
 }
 
+func (self *MemcacheFileDataStore) Flush() {
+	for {
+		select {
+		case mutation, ok := <-self.writer:
+			if !ok {
+				return
+			}
+			self.processMutation(mutation)
+		default:
+			return
+		}
+	}
+}
+
 // Starts the writer loop.
 func (self *MemcacheFileDataStore) StartWriter(
 	ctx context.Context, wg *sync.WaitGroup,
@@ -170,8 +190,11 @@ func (self *MemcacheFileDataStore) StartWriter(
 	if buffer_size < 0 {
 		buffer_size = 1000
 	}
+	self.mu.Lock()
 	self.writer = make(chan *Mutation, buffer_size)
 	self.ctx = ctx
+	self.started = true
+	self.mu.Unlock()
 
 	if writers == 0 {
 		writers = 100
@@ -185,46 +208,53 @@ func (self *MemcacheFileDataStore) StartWriter(
 		go func() {
 			defer wg.Done()
 
+			self.mu.Lock()
+			writer := self.writer
+			self.mu.Unlock()
+
 			for {
 				select {
 				case <-ctx.Done():
 					return
 
-				case mutation, ok := <-self.writer:
+				case mutation, ok := <-writer:
 					if !ok {
 						return
 					}
-
-					metricIdleWriters.Dec()
-					switch mutation.op {
-					case MUTATION_OP_SET_SUBJECT:
-						writeContentToFile(config_obj, mutation.urn, mutation.data)
-						self.invalidateDirCache(config_obj, mutation.urn)
-
-						// Call the completion function once we hit
-						// the directory datastore.
-						if mutation.completion != nil {
-							mutation.completion()
-						}
-
-					case MUTATION_OP_DEL_SUBJECT:
-						file_based_imp.DeleteSubject(config_obj, mutation.urn)
-						self.invalidateDirCache(config_obj, mutation.urn.Dir())
-
-						// Call the completion function once we hit
-						// the directory datastore.
-						if mutation.completion != nil {
-							mutation.completion()
-						}
-					}
-
-					metricIdleWriters.Inc()
-					if mutation.wg != nil {
-						mutation.wg.Done()
-					}
+					self.processMutation(mutation)
 				}
 			}
 		}()
+	}
+}
+
+func (self *MemcacheFileDataStore) processMutation(mutation *Mutation) {
+	metricIdleWriters.Dec()
+	switch mutation.op {
+	case MUTATION_OP_SET_SUBJECT:
+		writeContentToFile(mutation.org_config_obj, mutation.urn, mutation.data)
+		self.invalidateDirCache(mutation.org_config_obj, mutation.urn)
+
+		// Call the completion function once we hit
+		// the directory datastore.
+		if mutation.completion != nil {
+			mutation.completion()
+		}
+
+	case MUTATION_OP_DEL_SUBJECT:
+		file_based_imp.DeleteSubject(mutation.org_config_obj, mutation.urn)
+		self.invalidateDirCache(mutation.org_config_obj, mutation.urn.Dir())
+
+		// Call the completion function once we hit
+		// the directory datastore.
+		if mutation.completion != nil {
+			mutation.completion()
+		}
+	}
+
+	metricIdleWriters.Inc()
+	if mutation.wg != nil {
+		mutation.wg.Done()
 	}
 }
 
@@ -242,8 +272,7 @@ func (self *MemcacheFileDataStore) GetSubject(
 	if errors.Is(err, os.ErrNotExist) {
 		// The file is not in the cache, read it from the file system
 		// instead.
-		serialized_content, err := readContentFromFile(
-			config_obj, urn, true /* must exist */)
+		serialized_content, err := readContentFromFile(config_obj, urn)
 		if err != nil {
 			return err
 		}
@@ -307,6 +336,22 @@ func (self *MemcacheFileDataStore) SetSubjectWithCompletion(
 
 	// Send a SetSubject mutation to the writer loop.
 	var wg sync.WaitGroup
+	mutation := &Mutation{
+		op:             MUTATION_OP_SET_SUBJECT,
+		urn:            urn,
+		org_config_obj: config_obj,
+		wg:             &wg,
+		completion:     completion,
+		data:           serialized_content}
+
+	// If the call is synchronous we need to wait here until it is
+	// flushed to disk.
+	if utils.CompareFuncs(mutation.completion, utils.SyncCompleter) {
+		wg.Add(1)
+		defer wg.Wait()
+		mutation.completion = wg.Done
+	}
+
 	wg.Add(1)
 	select {
 	case <-self.ctx.Done():
@@ -317,12 +362,7 @@ func (self *MemcacheFileDataStore) SetSubjectWithCompletion(
 
 		// After we send this to the channel, the writer will
 		// complete.
-	case self.writer <- &Mutation{
-		op:         MUTATION_OP_SET_SUBJECT,
-		urn:        urn,
-		wg:         &wg,
-		completion: completion,
-		data:       serialized_content}:
+	case self.writer <- mutation:
 	}
 
 	// Config file switches off asynchronous writes, wait here for
@@ -402,8 +442,9 @@ func (self *MemcacheFileDataStore) DeleteSubject(
 
 		// When we complete make sure the cache is also invalidated to
 		// avoid racing with GetSubject().
-		completion: completion,
-		urn:        urn}:
+		completion:     completion,
+		urn:            urn,
+		org_config_obj: config_obj}:
 	}
 
 	if config_obj.Datastore.MemcacheWriteMutationBuffer < 0 {
@@ -443,8 +484,9 @@ func (self *MemcacheFileDataStore) DeleteSubjectWithCompletion(
 
 		// When we complete make sure the cache is also invalidated to
 		// avoid racing with GetSubject().
-		completion: __completion,
-		urn:        urn}:
+		completion:     __completion,
+		urn:            urn,
+		org_config_obj: config_obj}:
 	}
 
 	return nil
@@ -506,8 +548,7 @@ func (self *MemcacheFileDataStore) GetBuffer(
 		return bulk_data, err
 	}
 
-	bulk_data, err = readContentFromFile(
-		config_obj, urn, true /* must exist */)
+	bulk_data, err = readContentFromFile(config_obj, urn)
 	if err != nil {
 		return nil, err
 	}
@@ -539,11 +580,12 @@ func (self *MemcacheFileDataStore) SetBuffer(
 		return nil
 
 	case self.writer <- &Mutation{
-		op:         MUTATION_OP_SET_SUBJECT,
-		urn:        urn,
-		wg:         &wg,
-		data:       data,
-		completion: completion,
+		op:             MUTATION_OP_SET_SUBJECT,
+		urn:            urn,
+		org_config_obj: config_obj,
+		wg:             &wg,
+		data:           data,
+		completion:     completion,
 	}:
 	}
 
@@ -597,7 +639,6 @@ func get_file_dir_metadata(
 }
 
 func NewMemcacheFileDataStore(config_obj *config_proto.Config) *MemcacheFileDataStore {
-
 	data_max_size := 10000
 	if config_obj.Datastore != nil &&
 		config_obj.Datastore.MemcacheDatastoreMaxSize > 0 {
@@ -631,15 +672,26 @@ func StartMemcacheFileService(
 	ctx context.Context, wg *sync.WaitGroup,
 	config_obj *config_proto.Config) error {
 
-	_, err := GetDB(config_obj)
+	if config_obj.Datastore == nil {
+		return nil
+	}
+
+	db, err := GetDB(config_obj)
 	if err != nil {
 		return err
 	}
 
-	if memcache_file_imp != nil {
+	memcache_file_db, ok := db.(*MemcacheFileDataStore)
+	if !ok {
+		// If it not a MemcacheFileDataStore so we dont need to do
+		// anything to it.
+		return nil
+	}
+
+	if !memcache_file_db.started {
 		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
 		logger.Info("<green>Starting</> memcache service")
-		memcache_file_imp.StartWriter(ctx, wg, config_obj)
+		memcache_file_db.StartWriter(ctx, wg, config_obj)
 	}
 
 	return nil

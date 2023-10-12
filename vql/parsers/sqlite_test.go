@@ -1,6 +1,6 @@
 //+build cgo
 
-package parsers
+package parsers_test
 
 import (
 	"context"
@@ -20,9 +20,12 @@ import (
 	"www.velocidex.com/golang/velociraptor/file_store/test_utils"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/services"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
+	"www.velocidex.com/golang/velociraptor/vql/parsers"
 	vfilter "www.velocidex.com/golang/vfilter"
 
+	_ "www.velocidex.com/golang/velociraptor/accessors/file"
+	_ "www.velocidex.com/golang/velociraptor/accessors/ntfs"
 	_ "www.velocidex.com/golang/velociraptor/result_sets/timed"
 )
 
@@ -62,12 +65,12 @@ func (self *TestSuite) TestSQLite() {
 
 	builder := services.ScopeBuilder{
 		Config:     self.ConfigObj,
-		ACLManager: vql_subsystem.NullACLManager{},
+		ACLManager: acl_managers.NullACLManager{},
 		Logger:     log.New(log_buffer, "vql: ", 0),
 		Env:        ordereddict.NewDict(),
 	}
 
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(self.ConfigObj)
 	assert.NoError(self.T(), err)
 
 	scope := manager.BuildScope(builder)
@@ -79,7 +82,7 @@ func (self *TestSuite) TestSQLite() {
 	assert.NoError(self.T(), err)
 
 	result := ordereddict.NewDict()
-	plugin := _SQLitePlugin{}
+	plugin := parsers.SQLitePlugin{}
 
 	test_query := func(name, query string, args []interface{}) {
 		rows := []vfilter.Row{}

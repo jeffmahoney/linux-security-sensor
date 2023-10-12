@@ -34,8 +34,8 @@ sources:
       LET Key = "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WINEVT\\Channels\\*"
 
       SELECT Key.Mtime AS Mtime,
-             basename(path=Key.FullPath) AS ChannelName,
-             Key.FullPath AS _Key,
+             basename(path=Key.OSPath) AS ChannelName,
+             Key.OSPath AS _Key,
              OwningPublisher, Enabled
       FROM read_reg_key(globs=Key)
       WHERE ChannelName =~ ProviderRegex
@@ -49,19 +49,20 @@ sources:
       LET Publishers = "HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WINEVT\\Publishers\\*\\@"
 
       LET ProviderNames <= memoize(key="GUID", query={
-        SELECT basename(path=dirname(path=FullPath)) AS GUID,
+        SELECT OSPath.Components[-2] AS GUID,
                Data.value AS Name
         FROM glob(globs=Publishers, accessor="registry")
       })
 
       LET X = SELECT Mtime,
-                     basename(path=dirname(path=FullPath)) AS GUID,
+                     OSPath.Dirname.Basename AS GUID,
                      Data.value AS Enabled,
-                     dirname(path=FullPath) AS Key,
+                     OSPath.Dirname AS Key,
                      to_dict(item={
                         SELECT Name AS _key, Data.value AS _value
-                        FROM glob(root=dirname(path=FullPath),
-                                  globs="/*", accessor="registry")
+                        FROM glob(root=OSPath.Dirname,
+                                  globs="/*",
+                                  accessor="registry")
                      }) AS Content
         FROM glob(globs=Key, accessor="registry")
 

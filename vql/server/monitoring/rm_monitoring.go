@@ -6,14 +6,15 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 type RemoveClientMonitoringFunctionArgs struct {
-	Artifact string `vfilter:"required,field=artifact,doc=The name of the artifact to add"`
-	Label    string `vfilter:"optional,field=label,doc=Add this artifact to this label group (default all)"`
+	Artifact string `vfilter:"required,field=artifact,doc=The name of the artifact to remove from the event table"`
+	Label    string `vfilter:"optional,field=label,doc=Remove this artifact from this label group (default the 'all'  group)"`
 }
 
 type RemoveClientMonitoringFunction struct{}
@@ -23,7 +24,7 @@ func (self RemoveClientMonitoringFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
+	err := vql_subsystem.CheckAccess(scope, acls.COLLECT_CLIENT)
 	if err != nil {
 		scope.Log("rm_client_monitoring: %s", err)
 		return vfilter.Null{}
@@ -42,7 +43,12 @@ func (self RemoveClientMonitoringFunction) Call(
 		return vfilter.Null{}
 	}
 
-	event_config := services.ClientEventManager().GetClientMonitoringState()
+	client_event_manager, err := services.ClientEventManager(config_obj)
+	if err != nil {
+		scope.Log("rm_client_monitoring: %v", err)
+		return vfilter.Null{}
+	}
+	event_config := client_event_manager.GetClientMonitoringState()
 
 	label_config := getArtifactCollectorArgs(event_config, arg.Label)
 
@@ -51,7 +57,7 @@ func (self RemoveClientMonitoringFunction) Call(
 
 	// Actually set the table
 	principal := vql_subsystem.GetPrincipal(scope)
-	err = services.ClientEventManager().SetClientMonitoringState(
+	err = client_event_manager.SetClientMonitoringState(
 		ctx, config_obj, principal, event_config)
 	if err != nil {
 		scope.Log("rm_client_monitoring: %v", err)
@@ -63,9 +69,10 @@ func (self RemoveClientMonitoringFunction) Call(
 
 func (self RemoveClientMonitoringFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "rm_client_monitoring",
-		Doc:     "Remove an artifact from the client monitoring table.",
-		ArgType: type_map.AddType(scope, &AddClientMonitoringFunctionArgs{}),
+		Name:     "rm_client_monitoring",
+		Doc:      "Remove an artifact from the client monitoring table.",
+		ArgType:  type_map.AddType(scope, &AddClientMonitoringFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_CLIENT).Build(),
 	}
 }
 
@@ -80,7 +87,7 @@ func (self RemoveServerMonitoringFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
+	err := vql_subsystem.CheckAccess(scope, acls.COLLECT_SERVER)
 	if err != nil {
 		scope.Log("rm_server_monitoring: %s", err)
 		return vfilter.Null{}
@@ -99,17 +106,22 @@ func (self RemoveServerMonitoringFunction) Call(
 		return vfilter.Null{}
 	}
 
-	event_config := services.ServerEventManager.Get()
+	server_manager, err := services.GetServerEventManager(config_obj)
+	if err != nil {
+		scope.Log("rm_server_monitoring: server_manager not ready")
+		return vfilter.Null{}
+	}
+
+	event_config := server_manager.Get()
 
 	// First remove the current artifact if it is there already
 	removeArtifact(event_config, arg.Artifact)
 
 	// Actually set the table
 	principal := vql_subsystem.GetPrincipal(scope)
-	err = services.ServerEventManager.Update(
-		config_obj, principal, event_config)
+	err = server_manager.Update(ctx, config_obj, principal, event_config)
 	if err != nil {
-		scope.Log("rm_client_monitoring: %v", err)
+		scope.Log("rm_server_monitoring: %v", err)
 		return vfilter.Null{}
 	}
 
@@ -118,9 +130,10 @@ func (self RemoveServerMonitoringFunction) Call(
 
 func (self RemoveServerMonitoringFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "rm_server_monitoring",
-		Doc:     "Remove an artifact from the server monitoring table.",
-		ArgType: type_map.AddType(scope, &AddServerMonitoringFunctionArgs{}),
+		Name:     "rm_server_monitoring",
+		Doc:      "Remove an artifact from the server monitoring table.",
+		ArgType:  type_map.AddType(scope, &AddServerMonitoringFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_SERVER).Build(),
 	}
 }
 

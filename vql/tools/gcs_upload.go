@@ -12,22 +12,24 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"golang.org/x/net/context"
 	"google.golang.org/api/option"
-	"www.velocidex.com/golang/velociraptor/file_store/api"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/uploads"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 type GCSUploadArgs struct {
-	File        string `vfilter:"required,field=file,doc=The file to upload"`
-	Name        string `vfilter:"optional,field=name,doc=The name of the file that should be stored on the server"`
-	Accessor    string `vfilter:"optional,field=accessor,doc=The accessor to use"`
-	Bucket      string `vfilter:"required,field=bucket,doc=The bucket to upload to"`
-	Project     string `vfilter:"required,field=project,doc=The project to upload to"`
-	Credentials string `vfilter:"required,field=credentials,doc=The credentials to use"`
+	File        *accessors.OSPath `vfilter:"required,field=file,doc=The file to upload"`
+	Name        string            `vfilter:"optional,field=name,doc=The name of the file that should be stored on the server"`
+	Accessor    string            `vfilter:"optional,field=accessor,doc=The accessor to use"`
+	Bucket      string            `vfilter:"required,field=bucket,doc=The bucket to upload to"`
+	Project     string            `vfilter:"required,field=project,doc=The project to upload to"`
+	Credentials string            `vfilter:"required,field=credentials,doc=The credentials to use"`
 }
 
 type GCSUploadFunction struct{}
@@ -49,27 +51,27 @@ func (self *GCSUploadFunction) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
-	accessor, err := glob.GetAccessor(arg.Accessor, scope)
+	accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
-		scope.Log("upload_gcs: %v", err)
+		scope.Log("ERROR:upload_gcs: %v", err)
 		return vfilter.Null{}
 	}
 
-	file, err := accessor.Open(arg.File)
+	file, err := accessor.OpenWithOSPath(arg.File)
 	if err != nil {
-		scope.Log("upload_gcs: Unable to open %s: %s",
+		scope.Log("ERROR:upload_gcs: Unable to open %s: %s",
 			arg.File, err.Error())
 		return &vfilter.Null{}
 	}
 	defer file.Close()
 
 	if arg.Name == "" {
-		arg.Name = arg.File
+		arg.Name = arg.File.String()
 	}
 
-	stat, err := file.Stat()
+	stat, err := accessor.LstatWithOSPath(arg.File)
 	if err != nil {
-		scope.Log("upload_gcs: Unable to stat %s: %v",
+		scope.Log("ERROR:upload_gcs: Unable to stat %s: %v",
 			arg.File, err)
 	} else if !stat.IsDir() {
 		upload_response, err := upload_gcs(
@@ -77,7 +79,7 @@ func (self *GCSUploadFunction) Call(ctx context.Context,
 			arg.Bucket,
 			arg.Name, arg.Credentials)
 		if err != nil {
-			scope.Log("upload_gcs: %v", err)
+			scope.Log("ERROR:upload_gcs: %v", err)
 			return vfilter.Null{}
 		}
 		return upload_response
@@ -90,7 +92,7 @@ func upload_gcs(ctx context.Context, scope vfilter.Scope,
 	reader io.Reader,
 	projectID, bucket, name string,
 	credentials string) (
-	*api.UploadResponse, error) {
+	*uploads.UploadResponse, error) {
 
 	// Cache the bucket handle between invocations.
 	var bucket_handle *storage.BucketHandle
@@ -119,7 +121,7 @@ func upload_gcs(ctx context.Context, scope vfilter.Scope,
 	defer func() {
 		err := writer.Close()
 		if err != nil {
-			scope.Log("upload_gcs: ERROR writing to object: %v", err)
+			scope.Log("ERROR:upload_gcs: <red>ERROR writing to object: %v", err)
 		} else {
 			attr := writer.Attrs()
 			serialized, _ := json.Marshal(attr)
@@ -130,7 +132,7 @@ func upload_gcs(ctx context.Context, scope vfilter.Scope,
 			if string(attr.MD5) == string(md5_sum.Sum(nil)) {
 				report = "Hash checks out."
 			}
-			scope.Log("upload_gcs: GCS Calculated MD5: %016x %v",
+			scope.Log("ERROR: upload_gcs: <red>GCS Calculated MD5: %016x %v",
 				attr.MD5, report)
 		}
 	}()
@@ -142,12 +144,12 @@ func upload_gcs(ctx context.Context, scope vfilter.Scope,
 	n, err := utils.Copy(ctx, utils.NewTee(
 		writer, sha_sum, md5_sum, log_writer), reader)
 	if err != nil {
-		return &api.UploadResponse{
+		return &uploads.UploadResponse{
 			Error: err.Error(),
 		}, err
 	}
 
-	return &api.UploadResponse{
+	return &uploads.UploadResponse{
 		Path:   name,
 		Size:   uint64(n),
 		Sha256: hex.EncodeToString(sha_sum.Sum(nil)),
@@ -158,9 +160,10 @@ func upload_gcs(ctx context.Context, scope vfilter.Scope,
 func (self GCSUploadFunction) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "upload_gcs",
-		Doc:     "Upload files to GCS.",
-		ArgType: type_map.AddType(scope, &GCSUploadArgs{}),
+		Name:     "upload_gcs",
+		Doc:      "Upload files to GCS.",
+		ArgType:  type_map.AddType(scope, &GCSUploadArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

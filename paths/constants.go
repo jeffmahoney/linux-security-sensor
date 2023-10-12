@@ -27,11 +27,16 @@ var (
 	NOTEBOOK_ROOT = path_specs.NewSafeDatastorePath("notebooks").
 			SetType(api.PATH_TYPE_DATASTORE_JSON)
 
-	DOWNLOADS_ROOT = path_specs.NewSafeFilestorePath("downloads").
+	DOWNLOADS_ROOT = path_specs.NewUnsafeFilestorePath("downloads").
 			SetType(api.PATH_TYPE_FILESTORE_DOWNLOAD_ZIP)
 
-	CLIENTS_ROOT = path_specs.NewSafeDatastorePath("clients").
+	CLIENTS_ROOT = path_specs.NewUnsafeDatastorePath("clients").
 			SetType(api.PATH_TYPE_DATASTORE_PROTO)
+
+	// Stores a snapshot of all client records
+	CLIENTS_INFO_SNAPSHOT = path_specs.NewUnsafeFilestorePath(
+		"client_info", "snapshot").
+		SetType(api.PATH_TYPE_FILESTORE_JSON)
 
 	CONFIG_ROOT = path_specs.NewSafeDatastorePath("config").
 			SetType(api.PATH_TYPE_DATASTORE_JSON)
@@ -45,9 +50,15 @@ var (
 	ACL_ROOT = path_specs.NewUnsafeDatastorePath("acl").
 			SetType(api.PATH_TYPE_DATASTORE_JSON)
 
+	ORGS_ROOT = path_specs.NewSafeDatastorePath("orgs").
+			SetType(api.PATH_TYPE_DATASTORE_JSON)
+
 	// The public directory is exported without authentication and
 	// is used to distribute the client binaries.
 	PUBLIC_ROOT = path_specs.NewUnsafeFilestorePath("public").
+			SetType(api.PATH_TYPE_FILESTORE_ANY)
+
+	TEMP_ROOT = path_specs.NewUnsafeFilestorePath("temp").
 			SetType(api.PATH_TYPE_FILESTORE_ANY)
 
 	// Timelines

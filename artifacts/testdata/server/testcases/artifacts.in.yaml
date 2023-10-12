@@ -8,7 +8,7 @@ Queries:
   - SELECT collect_client(
         client_id='C.11a3013ccaXXXXX',
         artifacts='Windows.KapeFiles.Targets',
-        env=dict(Device ='C:', VSSAnalysis='Y', KapeTriage='Y')).request AS Flow
+        env=dict(Device ='C:', VSSAnalysisAge=2, KapeTriage='Y')).request AS Flow
     FROM scope()
 
   # Schedule using a new style spec decleration.
@@ -16,18 +16,18 @@ Queries:
         client_id='C.11a3013ccaXXXXX',
         artifacts='Windows.KapeFiles.Targets',
         spec=dict(`Windows.KapeFiles.Targets`=dict(
-            Device ='C:', VSSAnalysis='Y', KapeTriage='Y'))).request AS Flow
+            Device ='C:', VSSAnalysisAge=2, KapeTriage='Y'))).request AS Flow
     FROM scope()
 
 
   # Check that artifact_definitions work
-  - SELECT name FROM artifact_definitions(names='Windows.KapeFiles.Targets') ORDER BY name
+  - SELECT name FROM artifact_definitions(deps=TRUE, names='Windows.KapeFiles.Targets') ORDER BY name
 
   # Make sure we can return all names
   - SELECT name FROM artifact_definitions() WHERE name =~ 'Windows.KapeFiles.Targets'
 
   # Test the "fs" accessor
-  - SELECT FullPath FROM glob(
+  - SELECT OSPath FROM glob(
      globs="/clients/C.4f5e52adf0a337a9/collections/F.BN2HJCPOF5U7U/uploads/**",
      accessor="fs")
 

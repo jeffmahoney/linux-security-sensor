@@ -43,37 +43,39 @@ package services
 
 import (
 	"context"
-	"errors"
-	"sync"
+	"time"
 
+	"github.com/Velocidex/ordereddict"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
+	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	artifacts_proto "www.velocidex.com/golang/velociraptor/artifacts/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
+	"www.velocidex.com/golang/velociraptor/result_sets"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 )
 
-var (
-	launcher_mu sync.Mutex
-	g_launcher  Launcher = nil
+const (
+	// When the principal is set to this below we avoid audit logging
+	// the call.
+	NoAuditLogging = ""
+	DryRunOnly     = false
 )
 
-func GetLauncher() (Launcher, error) {
-	launcher_mu.Lock()
-	defer launcher_mu.Unlock()
-
-	if g_launcher == nil {
-		return nil, errors.New("Launcher not ready")
-	}
-
-	return g_launcher, nil
+type DeleteFlowResponse struct {
+	Type  string            `json:"type"`
+	Data  *ordereddict.Dict `json:"data"`
+	Error string            `json:"error"`
 }
 
-func RegisterLauncher(l Launcher) {
-	launcher_mu.Lock()
-	defer launcher_mu.Unlock()
+func GetLauncher(config_obj *config_proto.Config) (Launcher, error) {
+	org_manager, err := GetOrgManager()
+	if err != nil {
+		return nil, err
+	}
 
-	g_launcher = l
+	return org_manager.Services(config_obj.OrgId).Launcher()
 }
 
 type CompilerOptions struct {
@@ -85,11 +87,67 @@ type CompilerOptions struct {
 
 	// Ignore Missing Artifacts without raising an error.
 	IgnoreMissingArtifacts bool
+
+	LogBatchTime uint64
+}
+
+type FlowSummary struct {
+	FlowId    string   `json:"FlowId"`
+	Artifacts []string `json:"Artifacts"`
+	Created   uint64   `json:"Created"`
+	Creator   string   `json:"Creator"`
+}
+
+type FlowStorer interface {
+	WriteFlow(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		flow *flows_proto.ArtifactCollectorContext,
+		completion func()) error
+
+	WriteFlowIndex(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		flow *flows_proto.ArtifactCollectorContext) error
+
+	WriteTask(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id string,
+		msg *crypto_proto.VeloMessage) error
+
+	DeleteFlow(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id string, flow_id string, principal string,
+		really_do_it bool) ([]*DeleteFlowResponse, error)
+
+	LoadCollectionContext(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id, flow_id string) (*flows_proto.ArtifactCollectorContext, error)
+
+	ListFlows(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id string,
+		options result_sets.ResultSetOptions,
+		offset, length int64) ([]*FlowSummary, int64, error)
+
+	// Get the exact requests that were sent for this collection (for
+	// provenance).
+	GetFlowRequests(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id string, flow_id string,
+		offset uint64, count uint64) (*api_proto.ApiFlowRequestDetails, error)
 }
 
 type Launcher interface {
 	// Only used for tests to force a predictable flow id.
 	SetFlowIdForTests(flow_id string)
+
+	Storage() FlowStorer
 
 	// Check any declared tools exist and are available - possibly
 	// by downloading them.
@@ -100,7 +158,7 @@ type Launcher interface {
 
 	// Calculates the dependent artifacts
 	GetDependentArtifacts(
-		config_obj *config_proto.Config,
+		ctx context.Context, config_obj *config_proto.Config,
 		repository Repository,
 		names []string) ([]string, error)
 
@@ -127,6 +185,15 @@ type Launcher interface {
 		collector_request *flows_proto.ArtifactCollectorArgs) (
 		[]*actions_proto.VQLCollectorArgs, error)
 
+	// Take the compiled requests from above and schedule them on the
+	// client.
+	WriteArtifactCollectionRecord(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		collector_request *flows_proto.ArtifactCollectorArgs,
+		vql_collector_args []*actions_proto.VQLCollectorArgs,
+		completion func(task *crypto_proto.VeloMessage)) (string, error)
+
 	// Main entry point to launch an artifact collection.
 	ScheduleArtifactCollection(
 		ctx context.Context,
@@ -135,4 +202,35 @@ type Launcher interface {
 		repository Repository,
 		collector_request *flows_proto.ArtifactCollectorArgs,
 		completion func()) (string, error)
+
+	// The following methods are used to manage collections
+
+	// Get a list of collections summary from a client.
+	GetFlows(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id string,
+		options result_sets.ResultSetOptions,
+		offset, length int64) (*api_proto.ApiFlowResponse, error)
+
+	// Get the details of a flow - this has a lot more information
+	// than the previous method.
+	GetFlowDetails(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id string, flow_id string) (*api_proto.FlowDetails, error)
+
+	// Actively cancel the collection
+	CancelFlow(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		client_id, flow_id, principal string) (
+		res *api_proto.StartFlowResponse, err error)
+
+	DeleteEvents(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		principal, artifact, client_id string,
+		start_time, end_time time.Time,
+		really_do_it bool) ([]*DeleteFlowResponse, error)
 }

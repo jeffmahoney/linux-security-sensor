@@ -5,6 +5,8 @@ package assert
 
 import (
 	"fmt"
+	"strings"
+	"testing"
 
 	"github.com/alecthomas/assert"
 	"google.golang.org/protobuf/proto"
@@ -41,13 +43,49 @@ func Error(t TestingT, err error, msgAndArgs ...interface{}) {
 	assert.Error(t, err, msgAndArgs...)
 }
 
+func ErrorContains(
+	t testing.TB, err error, errString string, msgAndArgs ...interface{}) {
+	if err == nil && errString == "" {
+		return
+	}
+	t.Helper()
+	if err == nil {
+		t.Fatal(formatMsgAndArgs("Expected an error", msgAndArgs...))
+	}
+	if !strings.Contains(err.Error(), errString) {
+		msg := formatMsgAndArgs("Error message not as expected:", msgAndArgs...)
+		t.Fatalf("%s\n%s vs %s", msg, err.Error(), errString)
+	}
+}
+
+// Variation of https://github.com/alecthomas/assert
+func formatMsgAndArgs(dflt string, msgAndArgs ...interface{}) string {
+	if len(msgAndArgs) == 0 {
+		return dflt
+	}
+	return fmt.Sprintf(msgAndArgs[0].(string), msgAndArgs[1:]...)
+}
+
 func Regexp(t TestingT, expected, actual interface{}, msgAndArgs ...interface{}) {
 	assert.Regexp(t, expected, actual, msgAndArgs...)
 }
+
+func Contains(t TestingT, expected, actual interface{}, msgAndArgs ...interface{}) {
+	assert.Contains(t, expected, actual, msgAndArgs...)
+}
+
+func NotContains(t TestingT, expected, actual interface{}, msgAndArgs ...interface{}) {
+	assert.NotContains(t, expected, actual, msgAndArgs...)
+}
+
 func True(t TestingT, expected bool, msgAndArgs ...interface{}) {
 	assert.True(t, expected, msgAndArgs...)
 }
 
 func NotNil(t TestingT, expected interface{}, msgAndArgs ...interface{}) {
 	assert.NotNil(t, expected, msgAndArgs...)
+}
+
+func Nil(t TestingT, expected interface{}, msgAndArgs ...interface{}) {
+	assert.Nil(t, expected, msgAndArgs...)
 }

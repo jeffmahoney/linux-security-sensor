@@ -26,7 +26,7 @@ parameters:
   - name: FailureCommandRegex
     default: .
     type: regex
-    
+
 export: |
     LET Profile = '''
         [
@@ -53,7 +53,7 @@ export: |
         ]],
       ]
       '''
-      
+
 sources:
   - precondition:
       SELECT OS From info() where OS = 'windows'
@@ -64,17 +64,23 @@ sources:
             PathName, ServiceType, StartName as UserAccount,
             {
                 SELECT Mtime as Created
-                FROM stat(filename=servicesKeyGlob + Name, accessor='reg')
+                FROM stat(filename=servicesKeyGlob + Name, accessor='registry')
             } AS Created,
             {
-                SELECT expand(path=ServiceDll) FROM read_reg_key(globs=servicesKeyGlob + Name + "\\Parameters")
+                SELECT expand(path=ServiceDll) AS ServiceDll
+                FROM read_reg_key(globs=servicesKeyGlob + Name + "\\Parameters")
+                LIMIT 1
             } AS ServiceDll,
             {
                 SELECT FailureCommand FROM read_reg_key(globs=servicesKeyGlob + Name)
+                LIMIT 1
             } AS FailureCommand,
             {
-                SELECT 
-                    parse_binary(accessor='data',filename=FailureActions,profile=Profile,struct='ServiceFailureActions') as FailureActions
+                SELECT if(condition=FailureActions,
+                   then=parse_binary(accessor='data',
+                                     filename= FailureActions || " ",
+                                     profile=Profile,
+                                     struct='ServiceFailureActions')) as FailureActions
                 FROM read_reg_key(globs=servicesKeyGlob + Name)
             } AS FailureActions,
             expand(path=parse_string_with_regex(regex=
@@ -84,16 +90,16 @@ sources:
         WHERE Name =~ NameRegex
             AND DisplayName =~ DisplayNameRegex
             AND PathName =~ PathNameRegex
-            AND ServiceDll =~ ServiceDllRegex
-            AND FailureCommand =~ FailureCommandRegex
+            AND if(condition=ServiceDll, then=ServiceDll =~ ServiceDllRegex, else=TRUE)
+            AND if(condition=FailureCommand, then=FailureCommand =~ FailureCommandRegex, else=TRUE)
 
       SELECT *,
         if(condition=Calculate_hashes,
-            then=hash(path=AbsoluteExePath, accessor="file")) AS HashServiceExe,
+            then=hash(path=AbsoluteExePath, accessor="auto")) AS HashServiceExe,
                  if(condition=CertificateInfo,
-                    then=authenticode(filename=AbsoluteExePath)) AS CertinfoServiceExe,
+                    then=authenticode(filename=AbsoluteExePath || " ")) AS CertinfoServiceExe,
                  if(condition=Calculate_hashes,
-                    then=hash(path=ServiceDll,accessor="file")) AS HashServiceDll,
+                    then=hash(path=ServiceDll || " ",accessor="auto")) AS HashServiceDll,
                  if(condition=CertificateInfo,
-                    then=authenticode(filename=ServiceDll)) AS CertinfoServiceDll
+                    then=authenticode(filename=ServiceDll || " ")) AS CertinfoServiceDll
       FROM service

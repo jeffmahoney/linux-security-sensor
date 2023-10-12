@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Velocidex/yaml/v2"
 	"github.com/stretchr/testify/assert"
@@ -26,9 +27,16 @@ var (
 	mu        sync.Mutex
 	binary    string
 	extension string
+	cwd       string
 )
 
 func SetupTest(t *testing.T) (string, string) {
+	t.Parallel()
+
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+
 	mu.Lock()
 	defer mu.Unlock()
 
@@ -42,12 +50,14 @@ func SetupTest(t *testing.T) (string, string) {
 
 	// Search for a valid binary to run.
 	binaries, err := filepath.Glob(
-		"../output/velociraptor*" + constants.VERSION + "-" + runtime.GOOS +
-			"-" + runtime.GOARCH + extension)
+		filepath.Join(cwd, "..", "output",
+			"velociraptor*"+constants.VERSION+"-"+runtime.GOOS+
+				"-"+runtime.GOARCH+extension))
 	assert.NoError(t, err)
 
 	if len(binaries) == 0 {
-		binaries, _ = filepath.Glob("../output/velociraptor*" + extension)
+		binaries, _ = filepath.Glob(
+			filepath.Join(cwd, "..", "output", "velociraptor*"+extension))
 	}
 
 	binary = binaries[0]
@@ -100,9 +110,11 @@ func TestAutoexec(t *testing.T) {
 
 	// Repack the config in the binary.
 	cmd := exec.Command(binary,
-		"config", "repack", config_file.Name(), exe.Name())
+		"config", "repack", config_file.Name(), exe.Name(), "-v")
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
+
+	os.Chmod(exe.Name(), 0755)
 
 	// Run the repacked binary with no args - it should run the
 	// `artifacts list` command.
@@ -125,6 +137,107 @@ func TestAutoexec(t *testing.T) {
 	require.Contains(t, string(out), "MySpecialInterface")
 }
 
+const sleepDefinitions = `
+autoexec:
+  artifact_definitions:
+  - name: Sleep
+    sources:
+    - query: SELECT sleep(time=100) FROM scope()
+`
+
+func TestTimeout(t *testing.T) {
+	binary, _ := SetupTest(t)
+
+	// A temp file for the config.
+	config_file, err := ioutil.TempFile("", "config")
+	assert.NoError(t, err)
+
+	defer os.Remove(config_file.Name())
+	config_file.Write([]byte(sleepDefinitions))
+	config_file.Close()
+
+	// Repack the config in the binary.
+	cmd := exec.Command(binary,
+		"--config", config_file.Name(),
+		"artifacts", "collect", "Sleep", "-v", "--timeout", "0.1")
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Regexp(t, "Starting collection of Sleep", string(out))
+
+	// Make sure the collection timed out.
+	assert.Regexp(t, "Timeout Error: Collection timed out after", string(out))
+}
+
+func TestProgressTimeout(t *testing.T) {
+	binary, _ := SetupTest(t)
+
+	// A temp file for the config.
+	config_file, err := ioutil.TempFile("", "config")
+	assert.NoError(t, err)
+
+	defer os.Remove(config_file.Name())
+	config_file.Write([]byte(sleepDefinitions))
+	config_file.Close()
+
+	// Repack the config in the binary.
+	start := time.Now()
+	cmd := exec.Command(binary,
+		"--config", config_file.Name(),
+		"artifacts", "collect", "Sleep", "-v", "--progress_timeout", "0.1")
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Regexp(t, "Starting collection of Sleep", string(out))
+
+	// Make sure the collection timed out and dumped the goroutines.
+	assert.Regexp(t, "Goroutine dump: goroutine profile", string(out))
+	assert.Regexp(t, "Mutex dump:", string(out))
+
+	// Make sure the query was cancelled quickly without running the
+	// full length of the sleep.
+	fmt.Printf("Now is %v started at %v\n", time.Now(), start)
+	assert.Less(t, int(time.Now().Unix()-start.Unix()), int(20))
+}
+
+const cpulimitDefinitions = `
+autoexec:
+  artifact_definitions:
+  - name: GoHard
+    sources:
+    - query: |
+        SELECT * FROM foreach(
+          row={ SELECT * FROM range(start=0, end=100000, step=1) },
+          query={
+              SELECT * FROM range(start=0, end=100000, step=1)
+              WHERE FALSE
+          }, workers=20)
+`
+
+func TestCPULimit(t *testing.T) {
+	binary, _ := SetupTest(t)
+
+	// A temp file for the config.
+	config_file, err := ioutil.TempFile("", "config")
+	assert.NoError(t, err)
+
+	defer os.Remove(config_file.Name())
+	config_file.Write([]byte(cpulimitDefinitions))
+	config_file.Close()
+
+	// Run the test with cpu limiting. For this test we timeout
+	// immediately but you can increase the timeout manually to
+	// observe the cpu limiting in action.
+	cmd := exec.Command(binary,
+		"--config", config_file.Name(),
+		"artifacts", "collect", "GoHard",
+		"-v", "--cpu_limit", "5", "--timeout", "0.1")
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+	assert.Regexp(t, "Starting collection of GoHard", string(out))
+
+	// Make sure the collection timed out and dumped the goroutines.
+	assert.Regexp(t, "Will throttle query to 5 percent of", string(out))
+}
+
 func TestBuildDeb(t *testing.T) {
 	binary, _ := SetupTest(t)
 
@@ -143,13 +256,7 @@ func TestBuildDeb(t *testing.T) {
 	config_file.Write(out)
 	config_file.Close()
 
-	// Create a tempfile for the binary executable.
-	binary_file, err := ioutil.TempFile("", "binary")
-	assert.NoError(t, err)
-
-	defer os.Remove(binary_file.Name())
-	binary_file.Write([]byte("\x7f\x45\x4c\x46XXXXXXXXXX"))
-	binary_file.Close()
+	binary_file, _ := filepath.Abs("../artifacts/testdata/files/test.elf")
 
 	output_file, err := ioutil.TempFile("", "output*.deb")
 	assert.NoError(t, err)
@@ -158,10 +265,10 @@ func TestBuildDeb(t *testing.T) {
 
 	cmd = exec.Command(
 		binary, "--config", config_file.Name(),
-		"debian", "client", "--binary", binary_file.Name(),
+		"debian", "client", "--binary", binary_file,
 		"--output", output_file.Name())
-	_, err = cmd.Output()
-	require.NoError(t, err)
+	out, err = cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
 
 	// Make sure the file is written
 	fd, err := os.Open(output_file.Name())
@@ -180,10 +287,10 @@ func TestBuildDeb(t *testing.T) {
 
 	cmd = exec.Command(
 		binary, "--config", config_file.Name(),
-		"debian", "server", "--binary", binary_file.Name(),
+		"debian", "server", "--binary", binary_file,
 		"--output", output_file.Name())
-	_, err = cmd.Output()
-	require.NoError(t, err)
+	out, err = cmd.Output()
+	require.NoError(t, err, string(out))
 
 	// Make sure the file is written
 	fd, err = os.Open(output_file.Name())
@@ -207,7 +314,7 @@ func TestGenerateConfigWithMerge(t *testing.T) {
 		binary, "config", "generate", "--merge",
 		`{"Client": {"nonce": "Foo", "writeback_linux": "some_location"}}`)
 	out, err := cmd.Output()
-	require.NoError(t, err)
+	require.NoError(t, err, string(out))
 
 	// Write the config to the tmp file
 	config_file_content := out
@@ -229,7 +336,7 @@ func TestGenerateConfigWithMerge(t *testing.T) {
 		"VELOCIRAPTOR_CONFIG=",
 	)
 	out, err = cmd.Output()
-	require.Error(t, err)
+	require.Error(t, err, string(out))
 
 	// Specify the config on the commandline - should load correctly
 	cmd = exec.Command(binary, "config", "show", "--config", config_file.Name())
@@ -237,7 +344,7 @@ func TestGenerateConfigWithMerge(t *testing.T) {
 		"VELOCIRAPTOR_CONFIG=",
 	)
 	out, err = cmd.Output()
-	require.NoError(t, err)
+	require.NoError(t, err, string(out))
 	require.Contains(t, string(out), "Foo")
 
 	// Specify the config in the environment
@@ -268,7 +375,9 @@ func TestGenerateConfigWithMerge(t *testing.T) {
 	// Repack the config in the binary.
 	cmd = exec.Command(binary, "config", "repack", config_file.Name(), exe.Name())
 	out, err = cmd.CombinedOutput()
-	require.NoError(t, err)
+	require.NoError(t, err, string(out))
+
+	os.Chmod(exe.Name(), 0755)
 
 	// Run the repacked binary with invalid environ - config
 	// should come from embedded.
@@ -340,14 +449,17 @@ func TestShowConfigWithMergePatch(t *testing.T) {
 	// replaces the Nonce With Foo, then adds another server to the
 	// urls: Merges are done first, then patches.
 	cmd := exec.Command(
-		binary, "config", "show", "--config", config_file.Name(),
+		binary, "config", "show", "--config", config_file.Name(), "-v",
 		"--merge",
 		`{"Client": {"nonce": "Foo", "server_urls": ["https://192.168.1.11:8000/"]}}`,
 		"--patch",
 		`[{"op": "add", "path": "/Client/server_urls/0", "value": "https://SomeServer/"}]`,
 	)
 	out, err := cmd.Output()
-	require.NoError(t, err)
+	if err != nil {
+		fmt.Println(string(err.(*exec.ExitError).Stderr))
+	}
+	require.NoError(t, err, string(out))
 
 	// Try to load it now.
 	new_config := &config_proto.Config{}
@@ -359,4 +471,8 @@ func TestShowConfigWithMergePatch(t *testing.T) {
 	require.Equal(t, 2, len(new_config.Client.ServerUrls))
 	require.Equal(t, "https://SomeServer/", new_config.Client.ServerUrls[0])
 	require.Equal(t, "https://192.168.1.11:8000/", new_config.Client.ServerUrls[1])
+}
+
+func init() {
+	cwd, _ = os.Getwd()
 }

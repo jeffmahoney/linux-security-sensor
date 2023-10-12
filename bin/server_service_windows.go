@@ -1,8 +1,8 @@
 // +build windows
 
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -29,7 +29,7 @@ import (
 
 	"context"
 
-	errors "github.com/pkg/errors"
+	errors "github.com/go-errors/errors"
 	"golang.org/x/sys/windows/svc"
 	"golang.org/x/sys/windows/svc/debug"
 	"golang.org/x/sys/windows/svc/eventlog"
@@ -38,6 +38,7 @@ import (
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/startup"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
@@ -67,6 +68,8 @@ var (
 )
 
 func doInstallServerService(config_obj *config_proto.Config) (err error) {
+	logging.DisableLogging()
+
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -80,7 +83,7 @@ func doInstallServerService(config_obj *config_proto.Config) (err error) {
 	pres, err := checkServiceExists(service_name)
 	if err != nil {
 		logger.Info("checkServiceExists: %v", err)
-		return errors.WithStack(err)
+		return errors.Wrap(err, 0)
 	}
 	if pres {
 		// We have to stop the service first, or we can not overwrite the file.
@@ -96,20 +99,20 @@ func doInstallServerService(config_obj *config_proto.Config) (err error) {
 
 	// Try to copy the executable to the target_path.
 	err = utils.CopyFile(ctx, executable, target_path, 0755)
-	if err != nil && os.IsNotExist(errors.Cause(err)) {
+	if err != nil && errors.Is(err, os.ErrNotExist) {
 		dirname := filepath.Dir(target_path)
 		logger.Info("Attempting to create intermediate directory %s.",
 			dirname)
 		err = os.MkdirAll(dirname, 0700)
 		if err != nil {
 			logger.Info("MkdirAll %s: %v", dirname, err)
-			return errors.Wrap(err, "Create intermediate directories")
+			return fmt.Errorf("Create intermediate directories: %w", err)
 		}
 		err = utils.CopyFile(ctx, executable, target_path, 0755)
 	}
 	if err != nil {
 		logger.Info("Cant copy binary to destination %s: %v", target_path, err)
-		return errors.Wrap(err, "Cant copy binary into destination dir.")
+		return fmt.Errorf("Cant copy binary into destination dir: %w", err)
 	}
 
 	logger.Info("Copied binary to %s", target_path)
@@ -136,18 +139,18 @@ func doInstallServerService(config_obj *config_proto.Config) (err error) {
 	pres, err = checkServiceExists(service_name)
 	if err != nil {
 		logger.Info("checkServiceExists: %v", err)
-		return errors.WithStack(err)
+		return errors.Wrap(err, 0)
 	}
 	if pres {
 		err = removeServiceServerService(service_name)
 		if err != nil {
-			errors.Wrap(err, "Remove old service")
+			fmt.Errorf("Remove old service: %w", err)
 		}
 	}
 
 	err = installServiceServerService(config_obj, target_path, logger)
 	if err != nil {
-		return errors.Wrap(err, "Install service")
+		return fmt.Errorf("Install service: %w", err)
 	}
 
 	logger.Info("Installed service %s", service_name)
@@ -205,6 +208,16 @@ func installServiceServerService(
 		return err
 	}
 	defer s.Close()
+
+	// Set the service to autostart
+	err = s.SetRecoveryActions([]mgr.RecoveryAction{
+		{Type: mgr.ServiceRestart, Delay: time.Second * 60},
+		{Type: mgr.ServiceRestart, Delay: time.Second * 60},
+		{Type: mgr.ServiceRestart, Delay: time.Second * 60},
+	}, 60)
+	if err != nil {
+		logger.Info("SetRecoveryActions() failed: %s", err)
+	}
 
 	// Try to create an event source but dont sweat it if it does
 	// not work.
@@ -271,7 +284,7 @@ func removeServiceServerService(name string) error {
 	defer m.Disconnect()
 	s, err := m.OpenService(name)
 	if err != nil {
-		return errors.New(fmt.Sprintf("service %s is not installed", name))
+		return fmt.Errorf("service %s is not installed: %w", name, err)
 	}
 	defer s.Close()
 	err = s.Delete()
@@ -280,12 +293,14 @@ func removeServiceServerService(name string) error {
 	}
 	err = eventlog.Remove(name)
 	if err != nil {
-		return errors.New(fmt.Sprintf("RemoveEventLogSource() failed: %s", err))
+		return fmt.Errorf("RemoveEventLogSource() failed: %w", err)
 	}
 	return nil
 }
 
 func doRemoveServerService() {
+	logging.DisableLogging()
+
 	config_obj, err := makeDefaultConfigLoader().WithRequiredFrontend().LoadAndValidate()
 	kingpin.FatalIfError(err, "Unable to load config file")
 
@@ -453,20 +468,22 @@ func NewVelociraptorServerService(name string) (
 				continue
 			}
 
+			if config_obj.Services == nil {
+				config_obj.Services = services.AllServerServicesSpec()
+			}
+
 			ctx, cancel := install_sig_handler()
 			defer cancel()
 
-			sm := services.NewServiceManager(ctx, config_obj)
+			// Now start the frontend services
+			sm, err := startup.StartFrontendServices(ctx, config_obj)
+			if err != nil {
+				elog.Info(1, fmt.Sprintf("starting frontend: %v", err))
+				return
+			}
 			defer sm.Close()
 
 			elog.Info(1, fmt.Sprintf("%s service started", name))
-			server, err := startFrontend(sm)
-			if err != nil {
-				elog.Info(1, fmt.Sprintf("%s service error", err))
-				return
-			}
-			defer server.Close()
-
 			// Wait here until everything is done.
 			sm.Wg.Wait()
 

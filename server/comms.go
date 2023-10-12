@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -21,17 +21,19 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"html"
 	"io"
 	"io/ioutil"
 	"math/rand"
 	"net/http"
-	"strings"
+	"net/url"
 	"sync/atomic"
 	"time"
 
 	"www.velocidex.com/golang/velociraptor/crypto"
 	"www.velocidex.com/golang/velociraptor/file_store"
-	"www.velocidex.com/golang/velociraptor/file_store/accessors"
+	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/utils"
 
@@ -48,6 +50,8 @@ import (
 )
 
 var (
+	packetTooLargeError = errors.New("Packet too large!")
+
 	currentConnections = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "client_comms_current_connections",
 		Help: "Number of currently connected clients.",
@@ -129,17 +133,28 @@ func PrepareFrontendMux(
 	base := config_obj.Frontend.BasePath
 	router.Handle(base+"/healthz", healthz(server_obj))
 	router.Handle(base+"/server.pem", server_pem(config_obj))
-	router.Handle(base+"/control", RecordHTTPStats(control(server_obj)))
-	router.Handle(base+"/reader", RecordHTTPStats(reader(config_obj, server_obj)))
+
+	// DEPRECATED: These are the old handler names - not great
+	// but here for backwards compatibility.
+	router.Handle(base+"/control",
+		RecordHTTPStats(receive_client_messages(config_obj, server_obj)))
+	router.Handle(base+"/reader",
+		RecordHTTPStats(send_client_messages(server_obj)))
+
+	// Send a message to the server.
+	router.Handle(base+"/send_messages",
+		RecordHTTPStats(receive_client_messages(config_obj, server_obj)))
+
+	// Receive new messages from the server.
+	router.Handle(base+"/receive_messages",
+		RecordHTTPStats(send_client_messages(server_obj)))
 
 	// Publicly accessible part of the filestore. NOTE: this
 	// does not have to be a physical directory - it is served
 	// from the filestore.
 	router.Handle(base+"/public/", GetLoggingHandler(config_obj, "/public")(
-		http.StripPrefix(base, forceMime(http.FileServer(
-			accessors.NewFileSystem(config_obj,
-				file_store.GetFileStore(config_obj),
-				"/public/"))))))
+		http.StripPrefix(base,
+			downloadPublic(config_obj, []string{"public"}))))
 
 	return nil
 }
@@ -224,18 +239,23 @@ func readWithLimits(
 	}
 	receiveBytesCounter.Add(float64(n))
 
-	logger := logging.GetLogger(server_obj.config, &logging.FrontendComponent)
+	if uint64(n) >= max_upload_size*2 {
+		server_obj.Error("Size exceeded when reading body from %v",
+			req.RemoteAddr)
+
+		return nil, packetTooLargeError
+	}
 
 	message_info, err := server_obj.Decrypt(ctx, buffer.Bytes())
 	if err != nil {
-		logger.Debug("Unable to decrypt body from %v: %+v "+
+		server_obj.Debug("Unable to decrypt body from %v: %+v "+
 			"(%v out of max %v)", req.RemoteAddr, err, n, max_upload_size*2)
 
 		receiveDecryptionErrors.Inc()
 		return nil, errors.New("Unable to decrypt")
 	}
-	message_info.RemoteAddr = utils.RemoteAddr(req, server_obj.config.Frontend.GetProxyHeader())
-	logger.Debug("Received a post of length %v from %v (%v)",
+	message_info.RemoteAddr = utils.RemoteAddr(req, config_obj.Frontend.GetProxyHeader())
+	server_obj.Debug("Received a post of length %v from %v (%v)",
 		n, message_info.RemoteAddr, message_info.Source)
 
 	return message_info, nil
@@ -244,11 +264,11 @@ func readWithLimits(
 // This handler is used to receive messages from the client to the
 // server. These connections are short lived - the client will just
 // post its message and then disconnect.
-func control(server_obj *Server) http.Handler {
+func receive_client_messages(
+	config_obj *config_proto.Config, server_obj *Server) http.Handler {
 	pad := &crypto_proto.ClientCommunication{}
 	pad.Padding = append(pad.Padding, 0)
 	serialized_pad, _ := proto.Marshal(pad)
-	logger := logging.GetLogger(server_obj.config, &logging.FrontendComponent)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		flusher, ok := w.(http.Flusher)
@@ -313,9 +333,21 @@ func control(server_obj *Server) http.Handler {
 		}()
 
 		// Read the payload from the client.
-		message_info, err := readWithLimits(
-			ctx, server_obj.config, server_obj, req)
+		message_info, err := readWithLimits(ctx, config_obj, server_obj, req)
 		if err != nil {
+			// Drop the packet on the floor to release it from the
+			// client's queue. If the client sends a very large packet
+			// it will be truncated by the above limit, and will not
+			// be possible to decrypt it. By dropping it on the floor
+			// we release it from the client's queue - otherwise it
+			// will just retransmit the same thing again and the
+			// packet will be stuck.
+			if err == packetTooLargeError {
+				w.WriteHeader(http.StatusOK)
+				flusher.Flush()
+				return
+			}
+
 			// Just plain reject with a 403.
 			http.Error(w, "", http.StatusForbidden)
 			return
@@ -325,7 +357,7 @@ func control(server_obj *Server) http.Handler {
 		// - currently only enrolment requests.
 		if !message_info.Authenticated {
 			err := server_obj.ProcessUnauthenticatedMessages(
-				req.Context(), message_info)
+				req.Context(), config_obj, message_info)
 			if err == nil {
 				// We need to indicate to the client
 				// to start the enrolment
@@ -335,14 +367,13 @@ func control(server_obj *Server) http.Handler {
 				// indicate this by providing it with
 				// an HTTP error code.
 				enrollmentCounter.Inc()
-				logger.Debug("Please Enrol (%v)", message_info.Source)
+				server_obj.Debug("Please Enrol (%v)", message_info.Source)
 				http.Error(
 					w,
 					"Please Enrol",
 					http.StatusNotAcceptable)
 			} else {
-				server_obj.Error("Unable to process", err)
-				logger.Debug("Unable to process (%v)", message_info.Source)
+				server_obj.Debug("Unable to process (%v)", message_info.Source)
 				http.Error(w, "", http.StatusServiceUnavailable)
 			}
 			return
@@ -363,13 +394,31 @@ func control(server_obj *Server) http.Handler {
 		go func() {
 			defer close(sync)
 
-			response, _, err := server_obj.Process(ctx, message_info,
+			// Process the request with a different context - if the
+			// client disconnects quickly the request context will be
+			// cancelled and aborted, but we do not want this to
+			// interrupt actually processing the message.
+			subctx, cancel := context.WithTimeout(context.Background(),
+				60*time.Second)
+			defer cancel()
+
+			response, _, err := server_obj.Process(subctx, message_info,
 				false, // drain_requests_for_client
 			)
 			if err != nil {
 				server_obj.Error("Error: %v", err)
-			} else {
-				sync <- response
+				return
+			}
+
+			// Wait here for the code below to read from the sync
+			// channel so they can send the results back. If the
+			// client disconnected and the code below has exited we
+			// block here for up to 3 seconds before cancelling the
+			// request anyway (and not sending reply to the client).
+			select {
+			case <-subctx.Done():
+			case sync <- response:
+			case <-time.After(3 * time.Second):
 			}
 		}()
 
@@ -407,11 +456,10 @@ func control(server_obj *Server) http.Handler {
 // connection will persist up to Client.MaxPoll so we always have a
 // channel to the client. This allows us to send the client jobs
 // immediately with low latency.
-func reader(config_obj *config_proto.Config, server_obj *Server) http.Handler {
+func send_client_messages(server_obj *Server) http.Handler {
 	pad := &crypto_proto.ClientCommunication{}
 	pad.Padding = append(pad.Padding, 0)
 	serialized_pad, _ := proto.Marshal(pad)
-	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
 
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		ctx := req.Context()
@@ -430,7 +478,7 @@ func reader(config_obj *config_proto.Config, server_obj *Server) http.Handler {
 		body, err := ioutil.ReadAll(
 			io.LimitReader(req.Body, constants.MAX_MEMORY))
 		if err != nil {
-			server_obj.Error("Unable to read body", err)
+			server_obj.Error("Unable to read body: %v", err)
 			http.Error(w, "", http.StatusServiceUnavailable)
 			return
 		}
@@ -451,11 +499,25 @@ func reader(config_obj *config_proto.Config, server_obj *Server) http.Handler {
 			return
 		}
 
+		// Recover the org for this client
+		org_manager, err := services.GetOrgManager()
+		if err != nil {
+			http.Error(w, "", http.StatusServiceUnavailable)
+			return
+		}
+
+		org_config_obj, err := org_manager.GetOrgConfig(message_info.OrgId)
+		if err != nil {
+			server_obj.Info("reader: Unknown org ID %v", message_info.OrgId)
+			http.Error(w, "", http.StatusServiceUnavailable)
+			return
+		}
+
 		// Get a notification for this client from the pool -
 		// Must be before the Process() call to prevent race.
 		source := message_info.Source
 
-		client_info_manager, err := services.GetClientInfoManager()
+		client_info_manager, err := services.GetClientInfoManager(org_config_obj)
 		if err != nil {
 			http.Error(w, "", http.StatusServiceUnavailable)
 			return
@@ -463,20 +525,20 @@ func reader(config_obj *config_proto.Config, server_obj *Server) http.Handler {
 
 		// If client is not known, make it enrol. This can happen for
 		// example, when the client was just deleted, but we still
-		// have ciphers cached to it - the client is not know but we
+		// have ciphers cached to it - the client is not known but we
 		// can still verify the comms as authenticated. NOTE: this
 		// check should be very quick since it is just a lookup in the
 		// client info manager's LRU.
-		_, err = client_info_manager.Get(source)
+		_, err = client_info_manager.Get(ctx, source)
 		if err != nil {
-			journal, err := services.GetJournal()
+			journal, err := services.GetJournal(org_config_obj)
 			if err != nil {
 				http.Error(w, "", http.StatusServiceUnavailable)
 				return
 			}
 
-			// This should triggen an enrollment flow.
-			err = journal.PushRowsToArtifact(config_obj,
+			// This should trigger an enrollment flow.
+			err = journal.PushRowsToArtifact(ctx, org_config_obj,
 				[]*ordereddict.Dict{
 					ordereddict.NewDict().
 						Set("ClientId", source)},
@@ -490,13 +552,23 @@ func reader(config_obj *config_proto.Config, server_obj *Server) http.Handler {
 			return
 		}
 
-		notifier := services.GetNotifier()
-		if notifier == nil {
+		notifier, err := services.GetNotifier(org_config_obj)
+		if err != nil {
 			http.Error(w, "Shutting down", http.StatusServiceUnavailable)
 			return
 		}
 
+		// Check for conflicting clients
 		if notifier.IsClientDirectlyConnected(source) {
+
+			// Send a message that there is a client conflict.
+			journal, err := services.GetJournal(org_config_obj)
+			if err == nil {
+				journal.PushRowsToArtifactAsync(ctx, org_config_obj,
+					ordereddict.NewDict().Set("ClientId", source),
+					"Server.Internal.ClientConflict")
+			}
+
 			http.Error(w, "Another Client connection exists. "+
 				"Only a single instance of the client is "+
 				"allowed to connect at the same time.",
@@ -515,7 +587,7 @@ func reader(config_obj *config_proto.Config, server_obj *Server) http.Handler {
 		// close the connection and expect the client to
 		// reconnect again. We add a bit of jitter to ensure
 		// clients do not get synchronized.
-		wait := time.Duration(config_obj.Client.MaxPoll+
+		wait := time.Duration(org_config_obj.Client.MaxPoll+
 			uint64(rand.Intn(30))) * time.Second
 
 		deadline := time.After(wait)
@@ -557,7 +629,7 @@ func reader(config_obj *config_proto.Config, server_obj *Server) http.Handler {
 
 			case quit := <-notification:
 				if quit {
-					logger.Info("reader: quit.")
+					server_obj.Debug("reader: quit.")
 					return
 				}
 				response, _, err := server_obj.Process(
@@ -574,7 +646,7 @@ func reader(config_obj *config_proto.Config, server_obj *Server) http.Handler {
 				// and finish the request off.
 				n, err := w.Write(response)
 				if err != nil || n < len(serialized_pad) {
-					logger.Debug("reader: Error %v", err)
+					server_obj.Debug("reader: Error %v", err)
 				}
 
 				flusher.Flush()
@@ -585,7 +657,7 @@ func reader(config_obj *config_proto.Config, server_obj *Server) http.Handler {
 				// send it. The client will reconnect immediately.
 				_, err := w.Write(serialized_pad)
 				if err != nil {
-					logger.Info("reader: Error %v", err)
+					server_obj.Debug("reader: Error %v", err)
 					return
 				}
 
@@ -597,7 +669,7 @@ func reader(config_obj *config_proto.Config, server_obj *Server) http.Handler {
 			case <-time.After(10 * time.Second):
 				_, err := w.Write(serialized_pad)
 				if err != nil {
-					logger.Info("reader: Error %v", err)
+					server_obj.Debug("reader: Error %v", err)
 					return
 				}
 
@@ -654,18 +726,42 @@ func GetLoggingHandler(config_obj *config_proto.Config,
 	}
 }
 
-// Force mime type to binary stream.
-func forceMime(parent http.Handler) http.Handler {
+func downloadPublic(
+	config_obj *config_proto.Config, prefix []string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Prevent directory listings.
-		if strings.HasSuffix(r.URL.Path, "/") {
-			http.NotFound(w, r)
+		path_spec := paths.FSPathSpecFromClientPath(r.URL.Path)
+		components := path_spec.Components()
+
+		// make sure the prefix is correct
+		for i, p := range prefix {
+			if len(components) <= i || p != components[i] {
+				returnError(w, 404, "Not Found")
+				return
+			}
+		}
+
+		file_store_factory := file_store.GetFileStore(config_obj)
+		fd, err := file_store_factory.ReadFile(path_spec)
+		if err != nil {
+			returnError(w, 404, err.Error())
 			return
 		}
 
+		// From here on we already sent the headers and we can
+		// not really report an error to the client.
+		w.Header().Set("Content-Disposition", "attachment; filename="+
+			url.PathEscape(path_spec.Base())+api.GetExtensionForFilestore(path_spec))
+
 		w.Header().Set("Content-Type", "binary/octet-stream")
-		parent.ServeHTTP(w, r)
+		w.WriteHeader(200)
+
+		utils.Copy(r.Context(), w, fd)
 	})
+}
+
+func returnError(w http.ResponseWriter, code int, message string) {
+	w.WriteHeader(code)
+	_, _ = w.Write([]byte(html.EscapeString(message)))
 }
 
 // Calculate QPS

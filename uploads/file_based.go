@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -31,7 +31,7 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/vfilter"
 )
@@ -72,30 +72,35 @@ func (self *FileBasedUploader) sanitize_path(path string) string {
 func (self *FileBasedUploader) Upload(
 	ctx context.Context,
 	scope vfilter.Scope,
-	filename string,
+	filename *accessors.OSPath,
 	accessor string,
-	store_as_name string,
+	store_as_name *accessors.OSPath,
 	expected_size int64,
 	mtime time.Time,
 	atime time.Time,
 	ctime time.Time,
 	btime time.Time,
-	reader io.Reader) (
-	*api.UploadResponse, error) {
+	reader io.Reader) (*UploadResponse, error) {
 
 	if self.UploadDir == "" {
 		scope.Log("UploadDir is not set")
 		return nil, errors.New("UploadDir not set")
 	}
 
-	if store_as_name == "" {
+	if store_as_name == nil {
 		store_as_name = filename
 	}
 
-	file_path := self.sanitize_path(store_as_name)
+	cached, pres, closer := DeduplicateUploads(scope, store_as_name)
+	defer closer()
+	if pres {
+		return cached, nil
+	}
+
+	file_path := self.sanitize_path(store_as_name.String())
 	err := os.MkdirAll(filepath.Dir(file_path), 0700)
 	if err != nil {
-		scope.Log("Can not create dir: %s(%s) %s", store_as_name,
+		scope.Log("Can not create dir: %s(%s) %s", store_as_name.String(),
 			file_path, err.Error())
 		return nil, err
 	}
@@ -104,6 +109,7 @@ func (self *FileBasedUploader) Upload(
 	result, err := self.maybeCollectSparseFile(
 		ctx, reader, store_as_name, file_path)
 	if err == nil {
+		CacheUploadResult(scope, store_as_name, result)
 		return result, nil
 	}
 
@@ -145,21 +151,29 @@ func (self *FileBasedUploader) Upload(
 	}
 
 	// It is not an error if we cant set the timestamps - best effort.
-	_ = setFileTimestamps(file_path, mtime, atime, ctime)
+	err = setFileTimestamps(file_path, mtime, atime, ctime)
+	if err != nil {
+		scope.Log("FileBasedUploader: %v", err)
+	}
 
 	scope.Log("Uploaded %v (%v bytes)", file_path, offset)
-	return &api.UploadResponse{
-		Path:   file_path,
-		Size:   uint64(offset),
-		Sha256: hex.EncodeToString(sha_sum.Sum(nil)),
-		Md5:    hex.EncodeToString(md5_sum.Sum(nil)),
-	}, nil
+	result = &UploadResponse{
+		Path:       file_path,
+		Components: store_as_name.Components,
+		Size:       uint64(offset),
+		Sha256:     hex.EncodeToString(sha_sum.Sum(nil)),
+		Md5:        hex.EncodeToString(md5_sum.Sum(nil)),
+	}
+
+	CacheUploadResult(scope, store_as_name, result)
+	return result, nil
 }
 
 func (self *FileBasedUploader) maybeCollectSparseFile(
 	ctx context.Context,
-	reader io.Reader, store_as_name, sanitized_name string) (
-	*api.UploadResponse, error) {
+	reader io.Reader,
+	store_as_name *accessors.OSPath,
+	sanitized_name string) (*UploadResponse, error) {
 
 	// Can the reader produce ranges?
 	range_reader, ok := reader.(RangeReader)
@@ -167,7 +181,8 @@ func (self *FileBasedUploader) maybeCollectSparseFile(
 		return nil, errors.New("Not supported")
 	}
 
-	writer, err := os.OpenFile(sanitized_name, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0700)
+	writer, err := os.OpenFile(sanitized_name,
+		os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0700)
 	if err != nil {
 		return nil, err
 	}
@@ -208,7 +223,7 @@ func (self *FileBasedUploader) maybeCollectSparseFile(
 		n, err := utils.CopyN(ctx, utils.NewTee(writer, sha_sum, md5_sum),
 			range_reader, rng.Length)
 		if err != nil {
-			return &api.UploadResponse{
+			return &UploadResponse{
 				Error: err.Error(),
 			}, err
 		}
@@ -226,7 +241,7 @@ func (self *FileBasedUploader) maybeCollectSparseFile(
 
 		serialized, err := utils.DictsToJson(index, nil)
 		if err != nil {
-			return &api.UploadResponse{
+			return &UploadResponse{
 				Error: err.Error(),
 			}, err
 		}
@@ -237,10 +252,11 @@ func (self *FileBasedUploader) maybeCollectSparseFile(
 
 	}
 
-	return &api.UploadResponse{
-		Path:   sanitized_name,
-		Size:   uint64(count),
-		Sha256: hex.EncodeToString(sha_sum.Sum(nil)),
-		Md5:    hex.EncodeToString(md5_sum.Sum(nil)),
+	return &UploadResponse{
+		Path:       sanitized_name,
+		Components: store_as_name.Components,
+		Size:       uint64(count),
+		Sha256:     hex.EncodeToString(sha_sum.Sum(nil)),
+		Md5:        hex.EncodeToString(md5_sum.Sum(nil)),
 	}, nil
 }

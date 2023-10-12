@@ -10,6 +10,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -70,6 +71,7 @@ func (self *DeleteNotebookPlugin) Call(ctx context.Context,
 
 		// Indiscriminately delete all the client's datastore files.
 		err = datastore.Walk(config_obj, db, notebook_path_manager.DSDirectory(),
+			datastore.WalkWithoutDirectories,
 			func(filename api.DSPathSpec) error {
 				select {
 				case <-ctx.Done():
@@ -94,6 +96,14 @@ func (self *DeleteNotebookPlugin) Call(ctx context.Context,
 			scope.Log("notebook_delete: %s", err.Error())
 			return
 		}
+
+		// Remove the empty directories
+		err = datastore.Walk(config_obj, db, notebook_path_manager.DSDirectory(),
+			datastore.WalkWithDirectories,
+			func(filename api.DSPathSpec) error {
+				db.DeleteSubject(config_obj, filename)
+				return nil
+			})
 
 		// Delete the filestore files.
 		err = api.Walk(file_store_factory, notebook_path_manager.Directory(),
@@ -130,9 +140,10 @@ func (self *DeleteNotebookPlugin) Call(ctx context.Context,
 func (self DeleteNotebookPlugin) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "notebook_delete",
-		Doc:     "Delete a notebook with all its cells. ",
-		ArgType: type_map.AddType(scope, &DeleteNotebookArgs{}),
+		Name:     "notebook_delete",
+		Doc:      "Delete a notebook with all its cells. ",
+		ArgType:  type_map.AddType(scope, &DeleteNotebookArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.SERVER_ADMIN).Build(),
 	}
 }
 

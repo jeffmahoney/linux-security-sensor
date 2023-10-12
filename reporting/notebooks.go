@@ -9,18 +9,22 @@ import (
 	"io"
 	"io/ioutil"
 	"net/url"
+	"os"
 	"regexp"
-	"strings"
+	"sync"
+	"time"
 
 	"github.com/Velocidex/yaml/v2"
-	"github.com/alexmullins/zip"
-	"github.com/pkg/errors"
+	"github.com/go-errors/errors"
+	"www.velocidex.com/golang/velociraptor/accessors"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store"
+	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/utils"
@@ -166,6 +170,7 @@ pre {
 func ExportNotebookToZip(
 	ctx context.Context,
 	config_obj *config_proto.Config,
+	wg *sync.WaitGroup,
 	notebook_path_manager *paths.NotebookPathManager) error {
 
 	db, err := datastore.GetDB(config_obj)
@@ -198,67 +203,132 @@ func ExportNotebookToZip(
 	}
 
 	file_store_factory := file_store.GetFileStore(config_obj)
-	fd, err := file_store_factory.WriteFile(notebook_path_manager.ZipExport())
+	output_filename := notebook_path_manager.ZipExport()
+	fd, err := file_store_factory.WriteFile(output_filename)
 	if err != nil {
 		return err
 	}
-	defer fd.Close()
 
 	err = fd.Truncate()
 	if err != nil {
 		return err
 	}
 
-	// Do these first to ensure errors are returned if the zip file
-	// is not writable.
-	zip_writer := zip.NewWriter(fd)
-	defer zip_writer.Close()
+	// Create a new ZipContainer to write on. The container will close
+	// the underlying writer.
+	zip_writer, err := NewContainerFromWriter(
+		config_obj, fd, "", DEFAULT_COMPRESSION, NO_METADATA)
+	if err != nil {
+		return err
+	}
 
-	cell_copier := func(notebook_id, cell_id string) {
-		path_manager := paths.NewNotebookPathManager(notebook_id)
-		exported_path_manager := paths.NewNotebookExportPathManager(
-			notebook_id)
+	// zip_writer now owns fd and will close it when it closes below.
 
-		children, err := file_store_factory.ListDirectory(
-			path_manager.CellDirectory(cell_id))
+	// Report the progress as we write the container.
+	progress_reporter := NewProgressReporter(config_obj,
+		notebook_path_manager.PathStats(output_filename),
+		output_filename, zip_writer)
+
+	exported_path_manager := NewNotebookExportPathManager(notebook.NotebookId)
+
+	cell_copier := func(cell_id string) {
+		cell_path_manager := notebook_path_manager.Cell(cell_id)
+
+		// Copy cell contents
+		err = copyUploads(ctx, config_obj,
+			cell_path_manager.Directory(),
+			exported_path_manager.CellDirectory(cell_id),
+			zip_writer, file_store_factory)
+		if err != nil {
+			logger := logging.GetLogger(config_obj, &logging.GUIComponent)
+			logger.Info("ExportNotebookToZip Erorr: %v\n", err)
+		}
+
+		// Now copy the uploads
+		err = copyUploads(ctx, config_obj,
+			cell_path_manager.UploadsDir(),
+			exported_path_manager.CellUploadRoot(cell_id),
+			zip_writer, file_store_factory)
+		if err != nil {
+			logger := logging.GetLogger(config_obj, &logging.GUIComponent)
+			logger.Info("ExportNotebookToZip Erorr: %v\n", err)
+		}
+	}
+
+	wg.Add(1)
+
+	// Write the bulk of the data asyncronously.
+	go func() {
+		defer wg.Done()
+		defer progress_reporter.Close()
+
+		// Will also close the underlying fd.
+		defer zip_writer.Close()
+
+		for _, cell := range notebook.CellMetadata {
+			cell_copier(cell.CellId)
+		}
+
+		// Copy the attachments - Attachmentrs may not exist if there
+		// are none in the notebook - so this is not an error.
+		// Attachments are added to the notebook when the user pastes
+		// them into it (e.g. an image)
+		err = copyUploads(ctx, config_obj,
+			notebook_path_manager.AttachmentDirectory(),
+			exported_path_manager.UploadRoot(),
+			zip_writer, file_store_factory)
+		if err != nil {
+			logger := logging.GetLogger(config_obj, &logging.GUIComponent)
+			logger.Info("ExportNotebookToZip Erorr: %v\n", err)
+		}
+
+		f, err := zip_writer.Create("Notebook.yaml", time.Time{})
 		if err != nil {
 			return
 		}
+		defer f.Close()
 
-		for _, child := range children {
-			out_filename := exported_path_manager.CellItem(
-				cell_id, child.Name())
+		_, err = f.Write(serialized)
+	}()
 
-			// In Zip files, members should have no leading /
-			zip_out_filename := strings.TrimPrefix(
-				out_filename.AsClientPath(), "/")
-			out_fd, err := zip_writer.Create(zip_out_filename)
-			if err != nil {
-				continue
+	return nil
+}
+
+func copyUploads(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	src api.FSPathSpec,
+	dest *accessors.OSPath,
+	zip_writer *Container,
+	file_store_factory api.FileStore) error {
+
+	return api.Walk(file_store_factory, src,
+		func(filename api.FSPathSpec, info os.FileInfo) error {
+			src_depth := len(src.Components())
+			if len(filename.Components()) <= src_depth {
+				return nil
 			}
 
-			fd, err := file_store_factory.ReadFile(
-				path_manager.Cell(cell_id).Item(child.Name()))
+			out_filename := dest.Append(filename.Components()[src_depth:]...)
+
+			out_fd, err := zip_writer.Create(
+				out_filename.String()+
+					api.GetExtensionForFilestore(filename),
+				time.Time{})
 			if err != nil {
-				continue
+				return nil
+			}
+			defer out_fd.Close()
+
+			fd, err := file_store_factory.ReadFile(filename)
+			if err != nil {
+				return nil
 			}
 			defer fd.Close()
 
-			_, _ = utils.Copy(ctx, out_fd, fd)
-		}
-	}
-
-	for _, cell := range notebook.CellMetadata {
-		cell_copier(notebook.NotebookId, cell.CellId)
-	}
-
-	f, err := zip_writer.Create("Notebook.yaml")
-	if err != nil {
-		fd.Close()
-		return err
-	}
-	_, err = f.Write(serialized)
-	return err
+			_, err = utils.Copy(ctx, out_fd, fd)
+			return err
+		})
 }
 
 func ExportNotebookToHTML(

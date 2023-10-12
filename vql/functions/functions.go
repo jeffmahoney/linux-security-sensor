@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -20,6 +20,7 @@ package functions
 import (
 	"bytes"
 	"context"
+	"encoding/ascii85"
 	"encoding/base64"
 	"encoding/binary"
 	"strconv"
@@ -66,6 +67,35 @@ func (self _Base64Decode) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *
 	}
 }
 
+type _Base85Decode struct{}
+
+func (self _Base85Decode) Call(
+	ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+	arg := &_Base64DecodeArgs{}
+	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
+	if err != nil {
+		scope.Log("base85decode: %s", err.Error())
+		return vfilter.Null{}
+	}
+
+	dest := make([]byte, len(arg.String))
+	src := strings.TrimSuffix(strings.TrimPrefix(arg.String, "<~"), "~>")
+	n, _, err := ascii85.Decode(dest, []byte(src), true)
+	if err != nil {
+		scope.Log("base85decode: %v %v", n, err)
+	}
+	return string(dest[:n])
+}
+
+func (self _Base85Decode) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+	return &vfilter.FunctionInfo{
+		Name:    "base85decode",
+		ArgType: type_map.AddType(scope, &_Base64DecodeArgs{}),
+	}
+}
+
 type _Base64EncodeArgs struct {
 	String string `vfilter:"required,field=string,doc=A string to decode"`
 }
@@ -96,7 +126,7 @@ func (self _Base64Encode) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *
 }
 
 type _ToLowerArgs struct {
-	String string `vfilter:"required,field=string,doc=A string to lower"`
+	String string `vfilter:"required,field=string,doc=The string to process"`
 }
 
 type _ToLower struct{}
@@ -118,6 +148,7 @@ func (self _ToLower) Call(
 func (self _ToLower) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "lowcase",
+		Doc:     "Returns the lowercase version of a string.",
 		ArgType: type_map.AddType(scope, &_ToLowerArgs{}),
 	}
 }
@@ -141,6 +172,7 @@ func (self _ToUpper) Call(
 func (self _ToUpper) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
 		Name:    "upcase",
+		Doc:     "Returns the uppercase version of a string.",
 		ArgType: type_map.AddType(scope, &_ToLowerArgs{}),
 	}
 }
@@ -385,9 +417,14 @@ func (self _GetFunction) Call(
 	return result
 }
 
+// Allow anything to be settable.
+type Setter interface {
+	Set(key string, value interface{})
+}
+
 type _SetFunctionArgs struct {
-	Item  vfilter.Any `vfilter:"required,field=item,docs=A dict to set"`
-	Field string      `vfilter:"required,field=field,docs=The field to set"`
+	Item  vfilter.Any `vfilter:"required,field=item,doc=A dict to set"`
+	Field string      `vfilter:"required,field=field,doc=The field to set"`
 	Value vfilter.Any `vfilter:"required,field=value"`
 }
 
@@ -427,6 +464,14 @@ func (self _SetFunction) Call(
 		t.Set(arg.Field, arg.Value)
 		return t
 
+	case map[string]interface{}:
+		t[arg.Field] = arg.Value
+		return t
+
+	case Setter:
+		t.Set(arg.Field, arg.Value)
+		return t
+
 	default:
 		scope.Log("set: Item type %T not supported. set() expects a dict", result)
 		return types.Null{}
@@ -435,6 +480,7 @@ func (self _SetFunction) Call(
 
 func init() {
 	vql_subsystem.RegisterFunction(&_Base64Decode{})
+	vql_subsystem.RegisterFunction(&_Base85Decode{})
 	vql_subsystem.RegisterFunction(&_Base64Encode{})
 	vql_subsystem.RegisterFunction(&_Scope{})
 	vql_subsystem.RegisterFunction(&_SetFunction{})

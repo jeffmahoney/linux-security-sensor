@@ -42,7 +42,12 @@ package hunt_dispatcher
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base32"
+	"encoding/binary"
+	"errors"
 	"fmt"
+	"path"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -63,6 +68,7 @@ import (
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/services/journal"
 	"www.velocidex.com/golang/velociraptor/utils"
+	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 )
 
 var (
@@ -101,7 +107,7 @@ type HuntDispatcher struct {
 
 	// Set to true for the master's hunt dispatcher. On the master
 	// node the dispatcher has more responsibility.
-	i_am_master bool
+	I_am_master bool
 }
 
 func (self *HuntDispatcher) GetLastTimestamp() uint64 {
@@ -115,8 +121,11 @@ func (self *HuntDispatcher) participateAllConnectedClients(
 	ctx context.Context,
 	config_obj *config_proto.Config, hunt_id string) error {
 
-	notifier := services.GetNotifier()
-	journal, err := services.GetJournal()
+	notifier, err := services.GetNotifier(config_obj)
+	if err != nil {
+		return err
+	}
+	journal, err := services.GetJournal(config_obj)
 	if err != nil {
 		return err
 	}
@@ -127,7 +136,7 @@ func (self *HuntDispatcher) participateAllConnectedClients(
 		}
 
 		// Notify the hunt manager about the new client
-		journal.PushRowsToArtifactAsync(config_obj,
+		journal.PushRowsToArtifactAsync(ctx, config_obj,
 			ordereddict.NewDict().
 				Set("HuntId", hunt_id).
 				Set("ClientId", c),
@@ -182,7 +191,7 @@ func (self *HuntDispatcher) ProcessUpdate(
 	}
 
 	// On the master we also write it to storage.
-	if self.i_am_master {
+	if self.I_am_master {
 		hunt_path_manager := paths.NewHuntPathManager(hunt_obj.HuntId)
 		db, err := datastore.GetDB(config_obj)
 		if err != nil {
@@ -214,10 +223,15 @@ func (self *HuntDispatcher) ApplyFuncOnHunts(
 	cb func(hunt *api_proto.Hunt) error) error {
 
 	// Take a snapshot of the hunts list.
+	var hunts []*api_proto.Hunt
+
 	self.mu.Lock()
-	hunts := self.getHunts()
+	for _, h := range self.getHunts() {
+		hunts = append(hunts, proto.Clone(h).(*api_proto.Hunt))
+	}
 	self.mu.Unlock()
 
+	// Read only copy for callback
 	for _, hunt := range hunts {
 		err := cb(hunt)
 		if err != nil {
@@ -230,14 +244,23 @@ func (self *HuntDispatcher) ApplyFuncOnHunts(
 
 func (self *HuntDispatcher) GetHunt(hunt_id string) (*api_proto.Hunt, bool) {
 	self.mu.Lock()
-	defer self.mu.Unlock()
-
 	hunt_obj, pres := self.hunts[hunt_id]
-	if pres {
-		return proto.Clone(hunt_obj.Hunt).(*api_proto.Hunt), true
+	if !pres || hunt_obj == nil {
+		self.mu.Unlock()
+		return nil, false
 	}
 
-	return nil, false
+	// Make a copy of the hunt object so we can update it safely
+	hunt := proto.Clone(hunt_obj.Hunt).(*api_proto.Hunt)
+	self.mu.Unlock()
+
+	if hunt.Stats == nil {
+		hunt.Stats = &api_proto.HuntStats{}
+	}
+
+	hunt.Stats.AvailableDownloads, _ = availableHuntDownloadFiles(
+		self.config_obj, hunt_id)
+	return hunt, true
 }
 
 // This is called by the local server to mutate the hunt
@@ -250,14 +273,14 @@ func (self *HuntDispatcher) GetHunt(hunt_id string) (*api_proto.Hunt, bool) {
 // Therefore, writers may write mutations and expect they take an
 // unspecified time to appear in the hunt details.
 func (self *HuntDispatcher) MutateHunt(
-	config_obj *config_proto.Config,
+	ctx context.Context, config_obj *config_proto.Config,
 	mutation *api_proto.HuntMutation) error {
-	journal, err := services.GetJournal()
+	journal, err := services.GetJournal(config_obj)
 	if err != nil {
 		return err
 	}
 
-	journal.PushRowsToArtifactAsync(config_obj,
+	journal.PushRowsToArtifactAsync(ctx, config_obj,
 		ordereddict.NewDict().
 			Set("hunt_id", mutation.HuntId).
 			Set("mutation", mutation),
@@ -268,13 +291,13 @@ func (self *HuntDispatcher) MutateHunt(
 
 // Modify the hunt object under lock and also inform all other
 // dispatchers about the new state.
-func (self *HuntDispatcher) ModifyHunt(
-	hunt_id string,
+func (self *HuntDispatcher) ModifyHuntObject(
+	ctx context.Context, hunt_id string,
 	cb func(hunt *api_proto.Hunt) services.HuntModificationAction) services.HuntModificationAction {
 
 	logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
 
-	if !self.i_am_master {
+	if !self.I_am_master {
 		// This is really a critical error.
 		logger.Error("Unable to modify hunts on a minion node. Please use MutateHunt()")
 		return services.HuntUnmodified
@@ -283,6 +306,7 @@ func (self *HuntDispatcher) ModifyHunt(
 	self.mu.Lock()
 	hunt_obj, pres := self.hunts[hunt_id]
 	if !pres {
+		self.mu.Unlock()
 		return services.HuntUnmodified
 	}
 
@@ -303,11 +327,11 @@ func (self *HuntDispatcher) ModifyHunt(
 		self.mu.Unlock()
 
 		// Relay the new update to all other hunt dispatchers.
-		journal, err := services.GetJournal()
+		journal, err := services.GetJournal(self.config_obj)
 		if err == nil {
 			// Make sure these are pushed out ASAP to the other
 			// dispatchers.
-			journal.PushRowsToArtifact(self.config_obj,
+			journal.PushRowsToArtifact(ctx, self.config_obj,
 				[]*ordereddict.Dict{
 					ordereddict.NewDict().
 						Set("HuntId", hunt_id).
@@ -325,11 +349,11 @@ func (self *HuntDispatcher) ModifyHunt(
 		self.mu.Unlock()
 
 		// Relay the new update to all other hunt dispatchers.
-		journal, err := services.GetJournal()
+		journal, err := services.GetJournal(self.config_obj)
 		if err == nil {
 			// Make sure these are pushed out ASAP to the other
 			// dispatchers.
-			journal.PushRowsToArtifact(self.config_obj,
+			journal.PushRowsToArtifact(ctx, self.config_obj,
 				[]*ordereddict.Dict{
 					ordereddict.NewDict().
 						Set("HuntId", hunt_id).
@@ -376,9 +400,31 @@ func (self *HuntDispatcher) Close(config_obj *config_proto.Config) {
 	atomic.SwapUint64(&self.last_timestamp, 0)
 }
 
+func (self *HuntDispatcher) checkForExpiry(
+	ctx context.Context, config_obj *config_proto.Config) {
+	if self.I_am_master {
+		// Check if the hunt is expired and adjust its state if so
+		now := uint64(time.Now().UnixNano() / 1000)
+
+		self.ApplyFuncOnHunts(func(hunt_obj *api_proto.Hunt) error {
+			if now > hunt_obj.Expires {
+				self.MutateHunt(ctx, config_obj,
+					&api_proto.HuntMutation{
+						HuntId: hunt_obj.HuntId,
+						Stats:  &api_proto.HuntStats{Stopped: true},
+					})
+			}
+			return nil
+		})
+	}
+}
+
 // Check for new hunts from the datastore. The master frontend will
 // also flush updated hunt records to the datastore.
-func (self *HuntDispatcher) Refresh(config_obj *config_proto.Config) error {
+func (self *HuntDispatcher) Refresh(
+	ctx context.Context, config_obj *config_proto.Config) error {
+	self.checkForExpiry(ctx, config_obj)
+
 	// Now read all the data again from the data store.
 	db, err := datastore.GetDB(config_obj)
 	if err != nil {
@@ -398,11 +444,8 @@ func (self *HuntDispatcher) Refresh(config_obj *config_proto.Config) error {
 			continue
 		}
 
-		requests = append(requests, &datastore.MultiGetSubjectRequest{
-			Path:    paths.NewHuntPathManager(hunt_id).Path(),
-			Message: &api_proto.Hunt{},
-			Data:    hunt_id,
-		})
+		requests = append(requests, datastore.NewMultiGetSubjectRequest(
+			&api_proto.Hunt{}, paths.NewHuntPathManager(hunt_id).Path(), hunt_id))
 	}
 
 	err = datastore.MultiGetSubject(config_obj, requests)
@@ -416,7 +459,8 @@ func (self *HuntDispatcher) Refresh(config_obj *config_proto.Config) error {
 
 	for _, request := range requests {
 		hunt_id := request.Data.(string)
-		hunt_obj, ok := request.Message.(*api_proto.Hunt)
+		message := request.Message()
+		hunt_obj, ok := message.(*api_proto.Hunt)
 		if !ok {
 			continue
 		}
@@ -429,7 +473,7 @@ func (self *HuntDispatcher) Refresh(config_obj *config_proto.Config) error {
 		if pres && old_hunt_obj.Version >= hunt_obj.Version {
 			// The in memory copy is newer than the stored version,
 			// Master node will synchronize
-			if self.i_am_master {
+			if self.I_am_master {
 				db.SetSubjectWithCompletion(
 					config_obj, request.Path, old_hunt_obj, nil)
 			}
@@ -445,27 +489,154 @@ func (self *HuntDispatcher) Refresh(config_obj *config_proto.Config) error {
 
 		self.hunts[hunt_id] = &HuntRecord{Hunt: hunt_obj}
 	}
+
 	return nil
 }
 
-func StartHuntDispatcher(
+func (self *HuntDispatcher) CreateHunt(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	acl_manager vql_subsystem.ACLManager,
+	hunt *api_proto.Hunt) (string, error) {
+	db, err := datastore.GetDB(config_obj)
+	if err != nil {
+		return "", err
+	}
+
+	if hunt.Stats == nil {
+		hunt.Stats = &api_proto.HuntStats{}
+	}
+
+	if hunt.HuntId == "" {
+		hunt.HuntId = GetNewHuntId()
+	}
+
+	if hunt.StartRequest == nil || hunt.StartRequest.Artifacts == nil {
+		return "", errors.New("No artifacts to collect.")
+	}
+
+	hunt.CreateTime = uint64(utils.GetTime().Now().UTC().UnixNano() / 1000)
+	if hunt.Expires == 0 {
+		default_expiry := config_obj.Defaults.HuntExpiryHours
+		if default_expiry == 0 {
+			default_expiry = 7 * 24
+		}
+		hunt.Expires = uint64(utils.GetTime().Now().Add(
+			time.Duration(default_expiry)*time.Hour).
+			UTC().UnixNano() / 1000)
+	}
+
+	if hunt.Expires < hunt.CreateTime {
+		return "", errors.New("Hunt expiry is in the past!")
+	}
+
+	// Set the artifacts information in the hunt object itself.
+	hunt.Artifacts = hunt.StartRequest.Artifacts
+	hunt.ArtifactSources = []string{}
+	for _, artifact := range hunt.StartRequest.Artifacts {
+		for _, source := range GetArtifactSources(ctx, config_obj, artifact) {
+			hunt.ArtifactSources = append(
+				hunt.ArtifactSources, path.Join(artifact, source))
+		}
+	}
+
+	manager, err := services.GetRepositoryManager(config_obj)
+	if err != nil {
+		return "", err
+	}
+
+	repository, err := manager.GetGlobalRepository(config_obj)
+	if err != nil {
+		return "", err
+	}
+
+	// Compile the start request and store it in the hunt. We will
+	// use this compiled version to launch all other flows from
+	// this hunt rather than re-compile the artifact each
+	// time. This ensures that if the artifact definition is
+	// changed after this point, the hunt will continue to
+	// schedule consistent VQL on the clients.
+	launcher, err := services.GetLauncher(config_obj)
+	if err != nil {
+		return "", err
+	}
+
+	compiled, err := launcher.CompileCollectorArgs(
+		ctx, config_obj, acl_manager, repository,
+		services.CompilerOptions{
+			ObfuscateNames: true,
+		},
+		hunt.StartRequest)
+	if err != nil {
+		return "", err
+	}
+
+	// Set the collection ID already on the hunt request - all flows
+	// from this hunt will have the same flow id.
+	hunt.StartRequest.FlowId = utils.CreateFlowIdFromHuntId(hunt.HuntId)
+	hunt.StartRequest.CompiledCollectorArgs = append(
+		hunt.StartRequest.CompiledCollectorArgs, compiled...)
+	hunt.StartRequest.Creator = hunt.Creator
+
+	// We allow our caller to determine if hunts are created in
+	// the running state or the paused state.
+	if hunt.State == api_proto.Hunt_UNSET {
+		hunt.State = api_proto.Hunt_PAUSED
+
+		// IF we are creating the hunt in the running state
+		// set it started.
+	} else if hunt.State == api_proto.Hunt_RUNNING {
+		hunt.StartTime = hunt.CreateTime
+	}
+
+	row := ordereddict.NewDict().
+		Set("Timestamp", time.Now().UTC().Unix()).
+		Set("Hunt", hunt)
+
+	journal, err := services.GetJournal(config_obj)
+	if err != nil {
+		return "", err
+	}
+
+	err = journal.PushRowsToArtifact(ctx, config_obj,
+		[]*ordereddict.Dict{row}, "System.Hunt.Creation",
+		"server", hunt.HuntId)
+	if err != nil {
+		return "", err
+	}
+
+	hunt_path_manager := paths.NewHuntPathManager(hunt.HuntId)
+	err = db.SetSubject(config_obj, hunt_path_manager.Path(), hunt)
+	if err != nil {
+		return "", err
+	}
+
+	// Trigger a refresh of the hunt dispatcher. This guarantees
+	// that fresh data will be read in subsequent ListHunt()
+	// calls.
+	hunt_dispatcher, err := services.GetHuntDispatcher(config_obj)
+	if err != nil {
+		return "", err
+	}
+	return hunt.HuntId, hunt_dispatcher.Refresh(ctx, config_obj)
+}
+
+func NewHuntDispatcher(
 	ctx context.Context,
 	wg *sync.WaitGroup,
-	config_obj *config_proto.Config) error {
+	config_obj *config_proto.Config) (services.IHuntDispatcher, error) {
 
 	service := &HuntDispatcher{
 		config_obj:  config_obj,
 		hunts:       make(map[string]*HuntRecord),
 		uuid:        utils.GetGUID(),
-		i_am_master: services.IsMaster(config_obj),
+		I_am_master: services.IsMaster(config_obj),
 	}
-	services.RegisterHuntDispatcher(service)
 
 	// flush the hunts every 10 seconds.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		defer services.RegisterHuntDispatcher(nil)
 
 		// On the client we register a dummy dispatcher since
 		// there is nothing to sync from.
@@ -474,7 +645,8 @@ func StartHuntDispatcher(
 		}
 
 		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-		logger.Info("<green>Starting</> Hunt Dispatcher Service.")
+		logger.Info("<green>Starting</> Hunt Dispatcher Service for %v.",
+			services.GetOrgName(config_obj))
 
 		for {
 			select {
@@ -484,7 +656,7 @@ func StartHuntDispatcher(
 
 			case <-time.After(10 * time.Second):
 				// Re-read the hunts from the data store.
-				err := service.Refresh(config_obj)
+				err := service.Refresh(ctx, config_obj)
 				if err != nil {
 					logger.Error("Unable to sync hunts: %v", err)
 				}
@@ -494,14 +666,39 @@ func StartHuntDispatcher(
 
 	// Try to refresh the hunts table the first time. If we cant
 	// we will just keep trying anyway later.
-	err := service.Refresh(config_obj)
+	err := service.Refresh(ctx, config_obj)
 	if err != nil {
 		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
 		logger.Error("Unable to Refresh hunt dispatcher: %v", err)
 	}
 
-	return journal.WatchQueueWithCB(ctx, config_obj, wg,
-		"Server.Internal.HuntUpdate", service.ProcessUpdate)
+	return service, journal.WatchQueueWithCB(ctx, config_obj, wg,
+		"Server.Internal.HuntUpdate", "HuntDispatcher",
+		service.ProcessUpdate)
+}
+
+var (
+	NextHuntIdForTests string
+)
+
+func SetHuntIdForTests(id string) {
+	NextHuntIdForTests = id
+}
+
+func GetNewHuntId() string {
+	if NextHuntIdForTests != "" {
+		result := NextHuntIdForTests
+		NextHuntIdForTests = ""
+		return result
+	}
+
+	buf := make([]byte, 8)
+	_, _ = rand.Read(buf)
+
+	binary.BigEndian.PutUint32(buf, uint32(time.Now().Unix()))
+	result := base32.HexEncoding.EncodeToString(buf)[:13]
+
+	return constants.HUNT_PREFIX + result
 }
 
 func init() {

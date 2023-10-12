@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -19,179 +19,208 @@ package responder
 
 import (
 	"context"
-	"fmt"
 	"runtime/debug"
 	"sync"
-	"time"
 
 	"google.golang.org/protobuf/proto"
-	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	constants "www.velocidex.com/golang/velociraptor/constants"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
-var (
-	inc_mu     sync.Mutex
-	last_value uint64
-)
-
-// Response ID used to be incremental but now artifacts are collected
-// in parallel each collection needs to advance the response id
-// forward. We therefore remember the last id and ensure response id
-// is monotonically incremental but time based.
-func getIncValue() uint64 {
-	inc_mu.Lock()
-	defer inc_mu.Unlock()
-
-	value := uint64(time.Now().UnixNano())
-	if value <= last_value {
-		value = last_value + 1
-	}
-	last_value = value
-	return last_value
-}
-
-type Responder struct {
+// The Responder tracks a single query with the flow.
+type FlowResponder struct {
 	output chan *crypto_proto.VeloMessage
 
-	sync.Mutex
-	request    *crypto_proto.VeloMessage
-	logger     *logging.LogContext
-	start_time int64
+	// Context and cancellation point for the query that is attached
+	// to this responder.
+	ctx        context.Context
+	cancel     func()
+	wg         *sync.WaitGroup
+	config_obj *config_proto.Config
 
-	// The name of the query we are currently running.
-	Artifact string
+	mu     sync.Mutex
+	logger *logging.LogContext
+
+	// The status contains information about the execution of the
+	// query.
+	status crypto_proto.VeloStatus
+
+	// Our parent context that is shared between all queries from the
+	// same collection.
+	flow_context *FlowContext
 }
 
-// NewResponder returns a new Responder.
-func NewResponder(
+// A Responder manages responses for a single query. A collection (or
+// flow) usually contains several queries in different requests so
+// there will be several responders.
+func newFlowResponder(
+	ctx context.Context,
 	config_obj *config_proto.Config,
-	request *crypto_proto.VeloMessage,
-	output chan *crypto_proto.VeloMessage) *Responder {
-	result := &Responder{
-		request:    request,
-		output:     output,
-		logger:     logging.GetLogger(config_obj, &logging.ClientComponent),
-		start_time: time.Now().UnixNano(),
+	wg *sync.WaitGroup,
+	output chan *crypto_proto.VeloMessage,
+	owner *FlowContext) *FlowResponder {
+
+	sub_ctx, cancel := context.WithCancel(ctx)
+	result := &FlowResponder{
+		ctx:          sub_ctx,
+		cancel:       cancel,
+		wg:           wg,
+		config_obj:   config_obj,
+		flow_context: owner,
+		output:       output,
+		status: crypto_proto.VeloStatus{
+			Status:      crypto_proto.VeloStatus_PROGRESS,
+			FirstActive: uint64(utils.GetTime().Now().UnixNano() / 1000),
+		},
 	}
 	return result
 }
 
-func (self *Responder) Copy() *Responder {
-	return &Responder{
-		request:    self.request,
-		output:     self.output,
-		logger:     self.logger,
-		start_time: time.Now().UnixNano(),
-	}
+func (self *FlowResponder) Close() {
+	self.cancel()
+	self.wg.Done()
 }
 
-func (self *Responder) AddResponse(
-	ctx context.Context, message *crypto_proto.VeloMessage) {
-	self.Lock()
-	output := self.output
-	self.Unlock()
+func (self *FlowResponder) FlowContext() *FlowContext {
+	self.mu.Lock()
+	defer self.mu.Unlock()
 
-	message.QueryId = self.request.QueryId
-	message.SessionId = self.request.SessionId
-	message.Urgent = self.request.Urgent
-	message.ResponseId = getIncValue()
-	if message.RequestId == 0 {
-		message.RequestId = self.request.RequestId
+	return self.flow_context
+}
+
+func (self *FlowResponder) NextUploadId() int64 {
+	return self.flow_context.NextUploadId()
+}
+
+func (self *FlowResponder) IsComplete() bool {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return self.status.Status != crypto_proto.VeloStatus_PROGRESS
+}
+
+func (self *FlowResponder) GetStatus() *crypto_proto.VeloStatus {
+	self.mu.Lock()
+	status := proto.Clone(&self.status).(*crypto_proto.VeloStatus)
+	self.mu.Unlock()
+
+	status.LastActive = uint64(utils.GetTime().Now().UnixNano() / 1000)
+
+	// Duration is in milli seconds
+	status.Duration = int64(status.LastActive-status.FirstActive) * 1000
+
+	return status
+}
+
+// Gets called on each response to update the query status
+func (self *FlowResponder) updateStats(message *crypto_proto.VeloMessage) {
+	if message.LogMessage != nil {
+		self.status.LogRows += int64(message.LogMessage.NumberOfRows)
+		return
 	}
-	message.TaskId = self.request.TaskId
 
-	if output != nil {
-		select {
-		case <-ctx.Done():
-			break
+	if message.FileBuffer != nil {
+		self.status.UploadedBytes += int64(message.FileBuffer.DataLength)
 
-		case output <- message:
+		// if this is the first FileBuffer update, we increment the
+		// number of files uploaded and set the expected length.
+		if message.FileBuffer.Offset == 0 {
+			self.status.UploadedFiles++
+			self.status.ExpectedUploadedBytes += int64(message.FileBuffer.Size)
 		}
 	}
+
+	if message.VQLResponse != nil {
+		self.status.ResultRows += int64(message.VQLResponse.TotalRows)
+
+		addNameWithResponse(&self.status.NamesWithResponse,
+			message.VQLResponse.Query.Name)
+	}
 }
 
-func (self *Responder) RaiseError(ctx context.Context, message string) {
-	self.AddResponse(ctx, &crypto_proto.VeloMessage{
-		Status: &crypto_proto.GrrStatus{
-			Backtrace:    string(debug.Stack()),
-			ErrorMessage: message,
-			Status:       crypto_proto.GrrStatus_GENERIC_ERROR,
-			Duration:     time.Now().UnixNano() - self.start_time,
-		}})
-}
+// Called from VQL to send a response back to the server.
+func (self *FlowResponder) AddResponse(message *crypto_proto.VeloMessage) {
+	self.mu.Lock()
+	output := self.output
+	self.updateStats(message)
+	self.mu.Unlock()
 
-func (self *Responder) Return(ctx context.Context) {
-	self.AddResponse(ctx, &crypto_proto.VeloMessage{
-		Status: &crypto_proto.GrrStatus{
-			Status:   crypto_proto.GrrStatus_OK,
-			Duration: time.Now().UnixNano() - self.start_time,
-		}})
-}
-
-// Send a log message to the server.
-func (self *Responder) Log(ctx context.Context, format string, v ...interface{}) {
-	self.AddResponse(ctx, &crypto_proto.VeloMessage{
-		RequestId: constants.LOG_SINK,
-		LogMessage: &crypto_proto.LogMessage{
-			Message:   fmt.Sprintf(format, v...),
-			Timestamp: uint64(time.Now().UTC().UnixNano() / 1000),
-			Artifact:  self.Artifact,
-		}})
-}
-
-func (self *Responder) SessionId() string {
-	return self.request.SessionId
-}
-
-// If a message was received from an old client we convert it into the
-// proper form.
-func NormalizeVeloMessageForBackwardCompatibility(msg *crypto_proto.VeloMessage) error {
-	if msg.UpdateEventTable != nil ||
-		msg.VQLClientAction != nil ||
-		msg.Cancel != nil ||
-		msg.UpdateForeman != nil ||
-		msg.Status != nil ||
-		msg.ForemanCheckin != nil ||
-		msg.FileBuffer != nil ||
-		msg.CSR != nil ||
-		msg.VQLResponse != nil ||
-		msg.LogMessage != nil {
-		return nil
+	// Check flow limits. Must be done without a lock on the responder.
+	if message.FileBuffer != nil {
+		err := self.flow_context.ChargeBytes(
+			uint64(message.FileBuffer.DataLength))
+		if err != nil {
+			// If we exceeded the limits cancel the entire
+			// collection.
+			self.RaiseError(self.ctx, err.Error())
+			self.flow_context.Cancel()
+		}
 	}
 
-	switch msg.ArgsRdfName {
-	case "":
-		return nil
+	if message.VQLResponse != nil {
+		err := self.flow_context.ChargeRows(message.VQLResponse.TotalRows)
+		if err != nil {
+			self.RaiseError(self.ctx, err.Error())
+			self.flow_context.Cancel()
+		}
+	}
 
-	// Messages from client to server here.
-	case "GrrStatus":
-		msg.Status = &crypto_proto.GrrStatus{}
-		return proto.Unmarshal(msg.Args, msg.Status)
+	message.SessionId = self.flow_context.SessionId()
 
-	case "ForemanCheckin":
-		msg.ForemanCheckin = &actions_proto.ForemanCheckin{}
-		return proto.Unmarshal(msg.Args, msg.ForemanCheckin)
+	select {
+	case <-self.ctx.Done():
+		break
 
-	case "FileBuffer":
-		msg.FileBuffer = &actions_proto.FileBuffer{}
-		return proto.Unmarshal(msg.Args, msg.FileBuffer)
+	case output <- message:
+	}
+}
 
-	case "Certificate":
-		msg.CSR = &crypto_proto.Certificate{}
-		return proto.Unmarshal(msg.Args, msg.CSR)
+func (self *FlowResponder) RaiseError(ctx context.Context, message string) {
+	// Mark the query as having an error.
+	self.mu.Lock()
+	defer self.mu.Unlock()
 
-	case "VQLResponse":
-		msg.VQLResponse = &actions_proto.VQLResponse{}
-		return proto.Unmarshal(msg.Args, msg.VQLResponse)
+	if self.status.Status == crypto_proto.VeloStatus_PROGRESS {
+		self.status.Status = crypto_proto.VeloStatus_GENERIC_ERROR
+		self.status.ErrorMessage = message
+		self.status.Backtrace = string(debug.Stack())
+	}
+}
 
-	case "LogMessage":
-		msg.LogMessage = &crypto_proto.LogMessage{}
-		return proto.Unmarshal(msg.Args, msg.LogMessage)
+func (self *FlowResponder) Return(ctx context.Context) {
+	// Mark the query as being successful
+	self.mu.Lock()
+	defer self.mu.Unlock()
 
-	default:
-		panic("Unable to handle message " + msg.String())
+	if self.status.Status == crypto_proto.VeloStatus_PROGRESS {
+		self.status.Status = crypto_proto.VeloStatus_OK
+	}
+}
+
+// Send a log message to the server. We do not actually send the log
+// right away, but queue it locally and combine with other log
+// messages for self.flushLogMessages() to send.
+func (self *FlowResponder) Log(ctx context.Context, level string, msg string) {
+	// We dont need to hold the lock because we are just delegating to
+	// the flow context.
+	self.flow_context.AddLogMessage(ctx, level, msg)
+
+	// Capture the first message at error level.
+	// FIXME: Support server provided error regex patterns
+	if level == logging.ERROR {
+		self.RaiseError(ctx, msg)
+	}
+
+	self.mu.Lock()
+	self.status.LogRows++
+	self.mu.Unlock()
+}
+
+// This is expected to be small so a linear search is ok
+func addNameWithResponse(array *[]string, name string) {
+	if name != "" && !utils.InString(*array, name) {
+		*array = append(*array, name)
 	}
 }

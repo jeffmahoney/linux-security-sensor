@@ -84,6 +84,17 @@ func (self *MemcacheFileWriter) _Size() (int64, error) {
 	return self.size, nil
 }
 
+// Just call the delegate immediately so this update hits the disk.
+func (self *MemcacheFileWriter) Update(data []byte, offset int64) error {
+	writer, err := self.delegate.WriteFile(self.filename)
+	if err != nil {
+		return err
+	}
+	defer writer.Close()
+
+	return writer.Update(data, offset)
+}
+
 func (self *MemcacheFileWriter) Write(data []byte) (int, error) {
 	defer api.Instrument("write", "MemcacheFileWriter", nil)()
 	self.mu.Lock()
@@ -117,13 +128,12 @@ func (self *MemcacheFileWriter) Truncate() error {
 // usually give the same writer.
 func (self *MemcacheFileWriter) Close() error {
 	self.mu.Lock()
-	defer self.mu.Unlock()
-
 	self.closed = true
 
 	// Convert all utils.SyncCompleter calls to sync waits on return
 	// from Close(). The writer pool will release us when done.
 	wg := sync.WaitGroup{}
+	sync_call := false
 	for idx, c := range self.completions {
 		if utils.CompareFuncs(c, utils.SyncCompleter) {
 			wg.Add(1)
@@ -131,7 +141,17 @@ func (self *MemcacheFileWriter) Close() error {
 			// Wait for the flusher to close us.
 			defer wg.Wait()
 			self.completions[idx] = wg.Done
+			sync_call = true
 		}
+	}
+
+	// Release the lock before we wait for the flusher.
+	self.mu.Unlock()
+
+	// If any of the calls were synchronous do not wait - just write
+	// them now.
+	if sync_call {
+		return self.Flush()
 	}
 
 	return nil
@@ -157,6 +177,7 @@ func (self *MemcacheFileWriter) _Flush() error {
 			for _, c := range self.completions {
 				c()
 			}
+			self.completions = nil
 		}
 	}()
 

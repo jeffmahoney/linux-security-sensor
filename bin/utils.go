@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -29,10 +29,12 @@ import (
 	humanize "github.com/dustin/go-humanize"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	logging "www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vfilter "www.velocidex.com/golang/vfilter"
 )
 
-func InstallSignalHandler(scope vfilter.Scope) context.Context {
+func InstallSignalHandler(
+	top_ctx context.Context, scope vfilter.Scope) (context.Context, func()) {
 
 	// Wait for signal. When signal is received we shut down the
 	// server.
@@ -42,20 +44,27 @@ func InstallSignalHandler(scope vfilter.Scope) context.Context {
 		syscall.SIGTERM,
 		syscall.SIGQUIT)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	go func() {
-		// Wait for the signal on this channel.
-		<-quit
-		scope.Log("Shutting down due to interrupt.")
+	if top_ctx == nil {
+		top_ctx = context.Background()
+	}
 
-		scope.Close()
-		// Only cancel the context once the scope is fully
-		// destroyed. This ensures all the destructors have
-		// enougb time to finish when we exit the program
-		cancel()
+	subctx, cancel := context.WithCancel(top_ctx)
+	go func() {
+		select {
+		// Wait for the signal on this channel.
+		case <-quit:
+			scope.Log("Shutting down due to interrupt.")
+
+			scope.Close()
+			// Only cancel the context once the scope is fully
+			// destroyed. This ensures all the destructors have
+			// enougb time to finish when we exit the program
+			cancel()
+		case <-subctx.Done():
+		}
 	}()
 
-	return ctx
+	return subctx, cancel
 }
 
 // Turns os.Stdout into into file_store.WriteSeekCloser
@@ -101,25 +110,29 @@ func (wc WriteCounter) PrintProgress() {
 	fmt.Printf("\rDownloading %s ... %s complete", wc.name, humanize.Bytes(wc.Total))
 }
 
-var (
-	// Set to true when the client gracefully exits.
-	exiting = false
-)
-
 // This is only called when there is something very wrong! If the
 // executor loop somehow exits due to panic or a bug we will not be
 // able to communicate with the endpoint. We have to hard exit here to
 // ensure the process can be restarted. This is a last resort!
-func on_error(config_obj *config_proto.Config) {
+func on_error(ctx context.Context, config_obj *config_proto.Config) {
+	select {
+
 	// It's ok we are supposed to exit.
-	if exiting {
+	case <-ctx.Done():
 		return
+
+	default:
+		// Log the error.
+		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
+		logger.Error("Exiting hard due to bug or KillKillKill! This should not happen!")
+		r := recover()
+		if r != nil {
+			utils.Debug(r)
+		}
+		utils.PrintStack()
+
+		os.Exit(-1)
 	}
-
-	logger := logging.GetLogger(config_obj, &logging.ClientComponent)
-	logger.Error("Exiting hard due to bug or KillKillKill! This should not happen!")
-
-	os.Exit(-1)
 }
 
 func install_sig_handler() (context.Context, context.CancelFunc) {
@@ -135,7 +148,6 @@ func install_sig_handler() (context.Context, context.CancelFunc) {
 		select {
 		case <-quit:
 			// Ordered shutdown now.
-			exiting = true
 			cancel()
 
 		case <-ctx.Done():
@@ -144,5 +156,13 @@ func install_sig_handler() (context.Context, context.CancelFunc) {
 	}()
 
 	return ctx, cancel
+}
 
+func isConfigSpecified(argv []string) bool {
+	for _, a := range argv {
+		if a == "--config" {
+			return true
+		}
+	}
+	return false
 }

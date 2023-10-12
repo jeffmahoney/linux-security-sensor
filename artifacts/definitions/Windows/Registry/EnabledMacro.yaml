@@ -20,7 +20,10 @@ sources:
  - query: |
         LET UserProfiles = Select Name as Username,
             {
-                SELECT FullPath FROM glob(globs=expand(path=Directory) + "//NTUSER.DAT", accessor="file")
+                SELECT OSPath FROM glob(
+                  root=expand(path=Directory),
+                  globs="/NTUSER.DAT",
+                  accessor="auto")
             } as NTUser,
             expand(path=Directory) as Directory
         FROM Artifact.Windows.Sys.Users()
@@ -34,13 +37,12 @@ sources:
             SELECT Name as Document,
               Username,
               NTUser as Userhive,
-              dirname(path=url(parse=FullPath).fragment) as Key,
+              OSPath.Dirname AS Key,
               Mtime AS LastModified
             FROM glob(
-              globs=url(scheme="file",
-                path=NTUser,
-                fragment=KeyGlob).String,
+              globs=KeyGlob,
+              root=pathspec(DelegatePath=NTUser),
               accessor="raw_reg")
-            WHERE Data.type = "REG_BINARY"
+            WHERE Data.type =~ "BINARY"
               and encode(string=Data.value, type="hex") =~ "ffffff7f$"
           })

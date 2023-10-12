@@ -1,32 +1,13 @@
-/*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
-
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
-
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
-
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
-*/
 package repository
 
-// This allows to run an artifact as a plugin.
 import (
 	"context"
+	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"sync"
 
 	"github.com/Velocidex/ordereddict"
-	errors "github.com/pkg/errors"
 	"www.velocidex.com/golang/velociraptor/actions"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	"www.velocidex.com/golang/velociraptor/artifacts"
@@ -35,8 +16,8 @@ import (
 	"www.velocidex.com/golang/velociraptor/constants"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/types"
 )
@@ -46,70 +27,56 @@ const (
 )
 
 type ArtifactRepositoryPlugin struct {
-	repository *Repository
-	children   map[string]vfilter.PluginGeneratorInterface
 	prefix     []string
-	leaf       *artifacts_proto.Artifact
-	mock       []vfilter.Row
-	wg         *sync.WaitGroup
+	repository services.Repository
+	config_obj *config_proto.Config
+
+	mocks map[string][]vfilter.Row
 }
 
-func (self *ArtifactRepositoryPlugin) SetMock(mock []vfilter.Row) {
-	self.mock = mock
+func (self *ArtifactRepositoryPlugin) SetMock(
+	artifact string, mock []vfilter.Row) {
+	self.mocks[artifact] = mock
 }
 
-func (self *ArtifactRepositoryPlugin) Print() string {
-	var children []string
-	for childname := range self.children {
-		children = append(children, childname)
+func (self *ArtifactRepositoryPlugin) Name() string {
+	return strings.Join(self.prefix, ".")
+}
+
+func (self *ArtifactRepositoryPlugin) Info(
+	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
+	return &vfilter.PluginInfo{
+		Name: self.Name(),
+		Doc:  "A pseudo plugin for accessing the artifacts repository from VQL.",
 	}
-
-	sort.Strings(children)
-	result := fmt.Sprintf("prefix '%v', Children %v, Leaf %v\n",
-		self.prefix, children, self.leaf != nil)
-	for _, child := range children {
-		v := self.children[child]
-		result += v.(*ArtifactRepositoryPlugin).Print()
-	}
-	return result
 }
 
-// Define vfilter.PluginGeneratorInterface
 func (self *ArtifactRepositoryPlugin) Call(
 	ctx context.Context,
 	scope vfilter.Scope,
 	args *ordereddict.Dict) <-chan vfilter.Row {
 	output_chan := make(chan vfilter.Row)
 
-	self.wg.Add(1)
 	go func() {
-		defer self.wg.Done()
 		defer close(output_chan)
 
-		config_obj, ok := vql_subsystem.GetServerConfig(scope)
-		if !ok {
-			config_obj = &config_proto.Config{}
-		}
+		var artifact *artifacts_proto.Artifact = nil
 
-		// If the ctx is done do nothing.
-		if self.mock != nil {
-			for _, row := range self.mock {
+		artifact_name := strings.Join(self.prefix, ".")
+
+		// Support mocking the artifacts
+		mocks, pres := self.mocks[artifact_name]
+		if pres {
+			for _, row := range mocks {
 				select {
 				case <-ctx.Done():
 					return
 				case output_chan <- row:
 				}
 			}
-
 			return
 		}
 
-		if self.leaf == nil {
-			scope.Log("Artifact %s not found", strings.Join(self.prefix, "."))
-			return
-		}
-
-		artifact_name := self.leaf.Name
 		v, pres := args.Get("source")
 		if pres {
 			lazy_v, ok := v.(types.LazyExpr)
@@ -123,12 +90,24 @@ func (self *ArtifactRepositoryPlugin) Call(
 				return
 			}
 
-			artifact_name = self.leaf.Name + "/" + source
+			artifact_name_with_source := artifact_name + "/" + source
 
-			_, pres = self.repository.Get(config_obj, artifact_name)
+			artifact, pres = self.repository.Get(ctx,
+				self.config_obj, artifact_name_with_source)
 			if !pres {
 				scope.Log("Source %v not found in artifact %v",
-					source, self.leaf.Name)
+					source, artifact_name)
+				return
+			}
+
+			artifact_name = artifact_name_with_source
+
+		} else {
+
+			artifact, pres = self.repository.Get(
+				ctx, self.config_obj, artifact_name)
+			if !pres {
+				scope.Log("Artifact %v not found", artifact_name)
 				return
 			}
 		}
@@ -142,17 +121,17 @@ func (self *ArtifactRepositoryPlugin) Call(
 
 		acl_manager, ok := artifacts.GetACLManager(scope)
 		if !ok {
-			acl_manager = vql_subsystem.NullACLManager{}
+			acl_manager = acl_managers.NullACLManager{}
 		}
 
-		launcher, err := services.GetLauncher()
+		launcher, err := services.GetLauncher(self.config_obj)
 		if err != nil {
 			scope.Log("Launcher not available")
 			return
 		}
 
 		requests, err := launcher.CompileCollectorArgs(
-			ctx, config_obj, acl_manager, self.repository,
+			ctx, self.config_obj, acl_manager, self.repository,
 			services.CompilerOptions{
 				DisablePrecondition: !precondition,
 			},
@@ -171,12 +150,11 @@ func (self *ArtifactRepositoryPlugin) Call(
 
 		for _, request := range requests {
 			eval_request := func(
-				request *actions_proto.VQLCollectorArgs, scope types.Scope) {
-				defer wg.Done()
+				request *actions_proto.VQLCollectorArgs,
+				scope types.Scope) {
 
 				// We create a child scope for evaluating the artifact.
-				child_scope, err := self.copyScope(
-					scope, self.leaf.Name)
+				child_scope, err := self.copyScope(scope, artifact_name)
 				if err != nil {
 					scope.Log("Error: %v", err)
 					return
@@ -197,7 +175,7 @@ func (self *ArtifactRepositoryPlugin) Call(
 
 					_, pres := env.Get(k)
 					if !pres {
-						scope.Log(fmt.Sprintf(
+						child_scope.Log(fmt.Sprintf(
 							"Unknown parameter %s provided to artifact %v",
 							k, strings.Join(self.prefix, ".")))
 						return
@@ -215,14 +193,14 @@ func (self *ArtifactRepositoryPlugin) Call(
 				// Add the scope args
 				child_scope.AppendVars(env)
 
-				ok, err := actions.CheckPreconditions(ctx, scope, request)
+				ok, err := actions.CheckPreconditions(ctx, child_scope, request)
 				if err != nil {
-					scope.Log("While evaluating preconditions: %v", err)
+					child_scope.Log("While evaluating preconditions: %v", err)
 					return
 				}
 
 				if !ok {
-					scope.Log("Skipping query due to preconditions")
+					child_scope.Log("Skipping query due to preconditions")
 					return
 				}
 
@@ -230,7 +208,7 @@ func (self *ArtifactRepositoryPlugin) Call(
 					query_log := actions.QueryLog.AddQuery(query.VQL)
 					vql, err := vfilter.Parse(query.VQL)
 					if err != nil {
-						scope.Log("Artifact %s invalid: %s",
+						child_scope.Log("Artifact %s invalid: %s",
 							strings.Join(self.prefix, "."),
 							err.Error())
 						query_log.Close()
@@ -254,11 +232,15 @@ func (self *ArtifactRepositoryPlugin) Call(
 				}
 			}
 
-			if isEventArtifact(self.leaf) {
+			if isEventArtifact(artifact) {
 				wg.Add(1)
-				go eval_request(request, scope)
+				go func(request *actions_proto.VQLCollectorArgs,
+					scope types.Scope) {
+					defer wg.Done()
+
+					eval_request(request, scope)
+				}(request, scope)
 			} else {
-				wg.Add(1)
 				eval_request(request, scope)
 			}
 		}
@@ -289,6 +271,7 @@ func (self *ArtifactRepositoryPlugin) copyScope(
 		constants.SCOPE_SERVER_CONFIG,
 		constants.SCOPE_THROTTLE,
 		constants.SCOPE_ROOT,
+		constants.SCOPE_RESPONDER,
 		constants.SCOPE_UPLOADER} {
 		value, pres := scope.Resolve(field)
 		if pres {
@@ -318,22 +301,19 @@ func (self *ArtifactRepositoryPlugin) copyScope(
 	result.ClearContext()
 	result.AppendVars(env)
 
+	// Copy critical context variables
+	for _, field := range []string{
+		constants.SCOPE_RESPONDER_CONTEXT,
+	} {
+		value, pres := scope.GetContext(field)
+		if pres {
+			result.SetContext(field, value)
+		}
+	}
+
 	return result, nil
 }
 
-func (self *ArtifactRepositoryPlugin) Name() string {
-	return strings.Join(self.prefix, ".")
-}
-
-func (self *ArtifactRepositoryPlugin) Info(
-	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
-	return &vfilter.PluginInfo{
-		Name: self.Name(),
-		Doc:  "A pseudo plugin for accessing the artifacts repository from VQL.",
-	}
-}
-
-// Define Associative protocol.
 type _ArtifactRepositoryPluginAssociativeProtocol struct{}
 
 func _getArtifactRepositoryPlugin(a vfilter.Any) *ArtifactRepositoryPlugin {
@@ -367,15 +347,7 @@ func (self _ArtifactRepositoryPluginAssociativeProtocol) Applicable(
 
 func (self _ArtifactRepositoryPluginAssociativeProtocol) GetMembers(
 	scope vfilter.Scope, a vfilter.Any) []string {
-	var result []string
-
-	value := _getArtifactRepositoryPlugin(a)
-	if value != nil {
-		for k := range value.children {
-			result = append(result, k)
-		}
-	}
-	return result
+	return nil
 }
 
 func (self _ArtifactRepositoryPluginAssociativeProtocol) Associative(
@@ -386,70 +358,25 @@ func (self _ArtifactRepositoryPluginAssociativeProtocol) Associative(
 		return nil, false
 	}
 
-	key, _ := b.(string)
-	child, pres := value.children[key]
-	return child, pres
+	key, pres := b.(string)
+	if !pres {
+		return nil, false
+	}
+
+	prefix := make([]string, 0, len(value.prefix)+1)
+	for _, i := range value.prefix {
+		prefix = append(prefix, i)
+	}
+
+	return &ArtifactRepositoryPlugin{
+		prefix:     append(prefix, key),
+		repository: value.repository,
+		config_obj: value.config_obj,
+		mocks:      value.mocks,
+	}, true
 }
 
-func NewArtifactRepositoryPlugin(
-	wg *sync.WaitGroup,
-	repository *Repository) vfilter.PluginGeneratorInterface {
-	repository.mu.Lock()
-	defer repository.mu.Unlock()
-
-	if repository.artifact_plugin != nil {
-		return repository.artifact_plugin
-	}
-
-	name_listing := repository.list()
-
-	// This sorting is needed to ensure that longer artifact names
-	// come before shorter ones. This ensures that we create the
-	// tree depth first.
-	sort.Sort(sort.Reverse(sort.StringSlice(name_listing)))
-
-	// Cache it for next time and return it.
-	repository.artifact_plugin = _NewArtifactRepositoryPlugin(
-		repository, wg, name_listing, nil)
-
-	return repository.artifact_plugin
-}
-
-func _NewArtifactRepositoryPlugin(
-	repository *Repository,
-	wg *sync.WaitGroup,
-	name_listing []string,
-	prefix []string) vfilter.PluginGeneratorInterface {
-
-	result := &ArtifactRepositoryPlugin{
-		repository: repository,
-		wg:         wg,
-		children:   make(map[string]vfilter.PluginGeneratorInterface),
-		prefix:     prefix,
-	}
-
-	for _, name := range name_listing {
-		components := strings.Split(name, ".")
-		if len(components) < len(prefix) ||
-			!utils.SlicesEqual(components[:len(prefix)], prefix) {
-			continue
-		}
-
-		components = components[len(prefix):]
-
-		// We are at a leaf node.
-		if len(components) == 0 {
-			artifact, _ := repository.get(name)
-			result.leaf = artifact
-			return result
-		}
-
-		_, pres := result.children[components[0]]
-		if !pres {
-			result.children[components[0]] = _NewArtifactRepositoryPlugin(
-				repository, wg, name_listing, append(prefix, components[0]))
-		}
-	}
-
-	return result
+func init() {
+	vql_subsystem.RegisterProtocol(
+		&_ArtifactRepositoryPluginAssociativeProtocol{})
 }

@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -26,15 +26,17 @@ import (
 	"testing"
 	"time"
 
-	errors "github.com/pkg/errors"
+	"github.com/go-errors/errors"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/time/rate"
 	"www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	crypto_test "www.velocidex.com/golang/velociraptor/crypto/testing"
 	"www.velocidex.com/golang/velociraptor/executor"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/responder"
 	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/velociraptor/vtesting"
 )
@@ -45,9 +47,28 @@ type MockHTTPConnector struct {
 	received  []string
 	connected bool
 	t         *testing.T
+
+	config_obj *config_proto.Config
 }
 
-func (self *MockHTTPConnector) GetCurrentUrl(handler string) string { return "http://URL/" + handler }
+func (self *MockHTTPConnector) GetCurrentUrl(handler string) string {
+	return "http://URL/" + handler
+}
+
+func (self *MockHTTPConnector) SetConnected(c bool) {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	self.connected = c
+}
+
+func (self *MockHTTPConnector) Connected() bool {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return self.connected
+}
+
 func (self *MockHTTPConnector) Post(ctx context.Context,
 	name, handler string, data []byte, urgent bool) (*bytes.Buffer, error) {
 	self.mu.Lock()
@@ -58,6 +79,7 @@ func (self *MockHTTPConnector) Post(ctx context.Context,
 		return nil, errors.New("Unavailable")
 	}
 
+	// Decreasse the wg when the message arrives.
 	defer self.wg.Done()
 
 	manager := crypto_test.NullCryptoManager{}
@@ -65,26 +87,27 @@ func (self *MockHTTPConnector) Post(ctx context.Context,
 	message_info, err := manager.Decrypt(data)
 	require.NoError(self.t, err)
 
-	message_info.IterateJobs(context.Background(),
-		func(ctx context.Context, item *crypto_proto.VeloMessage) {
+	message_info.IterateJobs(context.Background(), self.config_obj,
+		func(ctx context.Context, item *crypto_proto.VeloMessage) error {
 			self.received = append(self.received, item.Name)
+			return nil
 		})
 
 	return &bytes.Buffer{}, nil
 }
-func (self *MockHTTPConnector) ReKeyNextServer()   {}
-func (self *MockHTTPConnector) ServerName() string { return "VelociraptorServer" }
 
-// Try to send the message immediately. If we get through we increase the wg.
+func (self *MockHTTPConnector) ReKeyNextServer(ctx context.Context) {}
+
+func (self *MockHTTPConnector) ServerName() string {
+	return "VelociraptorServer"
+}
+
+// Try to send the message immediately.
 func CanSendToExecutor(
-	wg *sync.WaitGroup,
 	exec *executor.ClientExecutor,
 	msg *crypto_proto.VeloMessage) bool {
 	select {
 	case exec.Outbound <- msg:
-		// Add to the wg a task - this will be subtracted when
-		// the final post is made.
-		wg.Add(1)
 		return true
 
 	case <-time.After(500 * time.Millisecond):
@@ -93,11 +116,15 @@ func CanSendToExecutor(
 }
 
 func testRingBuffer(
+	ctx context.Context,
 	rb IRingBuffer,
 	config_obj *config_proto.Config,
 	message string,
 	t *testing.T) {
+
 	t.Parallel()
+
+	wg := &sync.WaitGroup{}
 
 	manager := &crypto_test.NullCryptoManager{}
 	exe := &executor.ClientExecutor{
@@ -107,21 +134,30 @@ func testRingBuffer(
 	logger := logging.GetLogger(config_obj, &logging.ClientComponent)
 
 	// Set global timeout on the test.
-	ctx, _ := context.WithTimeout(context.Background(), 10*time.Second)
+	subctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer func() {
+		cancel()
+		wg.Wait()
+	}()
 
-	wg := &sync.WaitGroup{}
+	// We use this to wait for messages to be delivered to the mock
+	mock_wg := &sync.WaitGroup{}
 
-	connector := &MockHTTPConnector{wg: wg, t: t}
+	connector := &MockHTTPConnector{
+		config_obj: config_obj,
+		wg:         mock_wg,
+		t:          t}
 
 	// The connector is not connected initially.
-	connector.connected = false
+	connector.SetConnected(false)
 
 	sender, err := NewSender(
 		config_obj, connector, manager, exe, rb, nil, /* enroller */
-		logger, "Sender", "control", nil, &utils.RealClock{})
+		logger, "Sender", rate.NewLimiter(rate.Inf, 0),
+		"control", nil, &utils.RealClock{})
 	assert.NoError(t, err)
 
-	sender.Start(ctx)
+	sender.Start(subctx, wg)
 
 	// This message results in a 14 byte message enqueued. The
 	// RingBuffer is allowed to go over the size slightly but will
@@ -133,11 +169,12 @@ func testRingBuffer(
 	}
 
 	// The first message will be enqueued.
-	assert.Equal(t, CanSendToExecutor(wg, exe, msg), true)
+	mock_wg.Add(1) // Wait for it to be finally delivered
+	assert.Equal(t, CanSendToExecutor(exe, msg), true)
 
 	// These messages can not be sent since there is no room in
 	// the buffer.
-	assert.Equal(t, CanSendToExecutor(wg, exe, msg), false)
+	assert.Equal(t, CanSendToExecutor(exe, msg), false)
 
 	// Nothing is received yet since the connector is
 	// disconnected.
@@ -145,30 +182,28 @@ func testRingBuffer(
 
 	// The ring buffer is holding 14 bytes since none were
 	// successfully sent yet.
-	vtesting.WaitUntil(5*time.Second, t, func() bool {
-		return sender.ring_buffer.AvailableBytes() == uint64(14)
+	vtesting.WaitUntil(10*time.Second, t, func() bool {
+		return sender.ring_buffer.TotalSize() == uint64(14)
 	})
 
 	// Turn the connector on - now sending will be successful. We
 	// need to wait for the communicator to retry sending.
-	connector.mu.Lock()
-	connector.connected = true
-	connector.mu.Unlock()
+	connector.SetConnected(true)
 
 	// Wait until the messages are delivered.
-	wg.Wait()
+	mock_wg.Wait()
 
 	// There is one message received
 	assert.Equal(t, len(connector.received), 1)
 
 	// Wait for the messages to be committed in the ring buffer.
-	time.Sleep(500 * time.Millisecond)
-
-	// The ring buffer is now truncated to 0.
-	assert.Equal(t, sender.ring_buffer.AvailableBytes(), uint64(0))
+	vtesting.WaitUntil(time.Second, t, func() bool {
+		// The ring buffer is now truncated to 0.
+		return sender.ring_buffer.TotalSize() == 0
+	})
 
 	// We can send more messages.
-	assert.Equal(t, CanSendToExecutor(wg, exe, msg), true)
+	assert.Equal(t, CanSendToExecutor(exe, msg), true)
 }
 
 func TestSender(t *testing.T) {
@@ -177,15 +212,18 @@ func TestSender(t *testing.T) {
 	config_obj.Client.MaxPoll = 1
 	config_obj.Client.MaxPollStd = 1
 
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
 	// Make the ring buffer 10 bytes - this is enough for one
 	// message but no more.
-	rb := NewRingBuffer(config_obj, 10)
-	testRingBuffer(rb, config_obj, "0123456789", t)
+	flow_manager := responder.NewFlowManager(ctx, config_obj)
+	rb := NewRingBuffer(config_obj, flow_manager, 10)
+	testRingBuffer(ctx, rb, config_obj, "0123456789", t)
 }
 
 func TestSenderWithFileBuffer(t *testing.T) {
 	config_obj := config.GetDefaultConfig()
-
 	tmpfile, err := ioutil.TempFile("", "test")
 	require.NoError(t, err)
 	defer os.Remove(tmpfile.Name())
@@ -203,8 +241,12 @@ func TestSenderWithFileBuffer(t *testing.T) {
 
 	logger := logging.GetLogger(config_obj, &logging.ClientComponent)
 
-	rb, err := NewFileBasedRingBuffer(config_obj, logger)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	flow_manager := responder.NewFlowManager(ctx, config_obj)
+	rb, err := NewFileBasedRingBuffer(ctx, config_obj, flow_manager, logger)
 	require.NoError(t, err)
 
-	testRingBuffer(rb, config_obj, "0123456789", t)
+	testRingBuffer(ctx, rb, config_obj, "0123456789", t)
 }

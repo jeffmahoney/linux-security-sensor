@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -26,6 +26,8 @@
 package api
 
 import (
+	"bytes"
+	"fmt"
 	"html"
 	"io"
 	"io/ioutil"
@@ -37,34 +39,37 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	errors "github.com/go-errors/errors"
 	"github.com/gorilla/schema"
-	errors "github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+
 	context "golang.org/x/net/context"
+	"www.velocidex.com/golang/velociraptor/acls"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
+	"www.velocidex.com/golang/velociraptor/api/authenticators"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	"www.velocidex.com/golang/velociraptor/api/tables"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/csv"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/flows"
-	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/json"
-	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/paths/artifacts"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/uploads"
 	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 )
 
+const BUFSIZE = 1 * 1024 * 1024
+
 var (
 	pool = sync.Pool{
 		New: func() interface{} {
-			return make([]byte, 32*1024)
+			return make([]byte, BUFSIZE)
 		},
 	}
 )
@@ -75,64 +80,91 @@ func returnError(w http.ResponseWriter, code int, message string) {
 }
 
 type vfsFileDownloadRequest struct {
-	ClientId   string   `schema:"client_id"`
-	VfsPath    string   `schema:"vfs_path"`
-	Components []string `schema:"components[]"`
-	Offset     int64    `schema:"offset"`
-	Length     int      `schema:"length"`
-	Encoding   string   `schema:"encoding"`
+	ClientId string `schema:"client_id"`
+
+	// This is the path within the client VFS in the usual client path
+	// notation - this is what is seen in the uploads table. We use
+	// this field to determine the download attachment name.
+	VfsPath string `schema:"vfs_path"`
+
+	// This is the file store path to fetch.
+	FSComponents []string `schema:"fs_components[]"`
+	Offset       int64    `schema:"offset"`
+	Length       int      `schema:"length"`
+	OrgId        string   `schema:"org_id"`
+
+	// The caller can specify we detect the mime type. Only a few
+	// types are supported.
+	DetectMime bool `schema:"detect_mime"`
+
+	// If set we pad the file out.
+	Padding bool `schema:"padding"`
 }
 
 // URL format: /api/v1/DownloadVFSFile
 
 // This URL allows the caller to download **any** member of the
 // filestore (providing they have at least read permissions).
-func vfsFileDownloadHandler(
-	config_obj *config_proto.Config) http.Handler {
+func vfsFileDownloadHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		request := vfsFileDownloadRequest{}
 		decoder := schema.NewDecoder()
+		decoder.IgnoreUnknownKeys(true)
+
 		err := decoder.Decode(&request, r.URL.Query())
+		if err != nil {
+			returnError(w, 403, "Error "+err.Error())
+			return
+		}
+
+		org_id := request.OrgId
+		if org_id == "" {
+			org_id = authenticators.GetOrgIdFromRequest(r)
+		}
+		org_manager, err := services.GetOrgManager()
 		if err != nil {
 			returnError(w, 404, err.Error())
 			return
 		}
 
+		org_config_obj, err := org_manager.GetOrgConfig(org_id)
+		if err != nil {
+			returnError(w, 404, err.Error())
+			return
+		}
+
+		// Where to read from the file store
 		var path_spec api.FSPathSpec
+
+		// The filename for the attachment header.
+		var filename string
+
 		client_path_manager := paths.NewClientPathManager(request.ClientId)
 
-		// Uploads table has direct vfs paths
-		if request.VfsPath != "" {
+		// Newer API calls pass the filestore components directly
+		if len(request.FSComponents) > 0 {
+			path_spec = path_specs.NewUnsafeFilestorePath(request.FSComponents...).
+				SetType(api.PATH_TYPE_FILESTORE_ANY)
+
+			filename = utils.Base(request.VfsPath)
+
+			// Uploads table has direct vfs paths
+		} else if request.VfsPath != "" {
 			path_spec, err = client_path_manager.GetUploadsFileFromVFSPath(
 				request.VfsPath)
 			if err != nil {
 				returnError(w, 404, err.Error())
 				return
 			}
+			filename = path_spec.Base()
 
 		} else {
-			db, err := datastore.GetDB(config_obj)
-			if err != nil {
-				returnError(w, 404, err.Error())
-				return
-			}
-
-			info_path_spec := client_path_manager.VFSDownloadInfoPath(
-				request.Components)
-			download_info := &flows_proto.VFSDownloadInfo{}
-
-			err = db.GetSubject(config_obj, info_path_spec, download_info)
-			if err != nil {
-				returnError(w, 404, err.Error())
-				return
-			}
-			path_spec = path_specs.NewUnsafeFilestorePath(
-				download_info.Components...).
-				SetType(api.PATH_TYPE_FILESTORE_ANY)
-
+			// Just reject the request
+			returnError(w, 404, "")
+			return
 		}
 
-		file, err := file_store.GetFileStore(config_obj).ReadFile(path_spec)
+		file, err := file_store.GetFileStore(org_config_obj).ReadFile(path_spec)
 		if err != nil {
 			returnError(w, 404, err.Error())
 			return
@@ -144,56 +176,103 @@ func vfsFileDownloadHandler(
 			return
 		}
 
-		var reader_at io.ReaderAt = &utils.ReaderAtter{Reader: file}
+		// We need to figure out the total size of the upload to set
+		// in the Content Length header. There are three
+		// possibilities:
+		// 1. The file is not sparse
+		// 2. The file is sparse and we are not padding.
+		// 3. The file is sparse and we are padding it.
+		var reader_at io.ReaderAt = utils.MakeReaderAtter(file)
+		var total_size int
 
-		index, err := getIndex(config_obj, path_spec)
+		index, err := getIndex(org_config_obj, path_spec)
 
 		// If the file is sparse, we use the sparse reader.
-		if err == nil && len(index.Ranges) > 0 {
+		if err == nil && request.Padding && len(index.Ranges) > 0 {
+			if !uploads.ShouldPadFile(org_config_obj, index) {
+				returnError(w, 400, "Sparse file is too sparse - unable to pad")
+				return
+			}
+
 			reader_at = &utils.RangedReader{
 				ReaderAt: reader_at,
 				Index:    index,
 			}
+
+			total_size = calculateTotalSizeWithPadding(index)
+		} else {
+			total_size = calculateTotalReaderSize(file)
 		}
+
+		emitContentLength(w, int(request.Offset), int(request.Length), total_size)
 
 		offset := request.Offset
 
-		// From here on we sent the headers and we can not
-		// really report an error to the client.
-		filename := strings.Replace(path_spec.Base(), "\"", "_", -1)
-		w.Header().Set("Content-Disposition", "attachment; filename="+
-			url.PathEscape(filename))
-		w.Header().Set("Content-Type", "binary/octet-stream")
-		w.WriteHeader(200)
-
+		// Read the first buffer now so we can report errors
 		length_sent := 0
-		buf := pool.Get().([]byte)
-		defer pool.Put(buf)
+		headers_sent := false
+
+		// Only allow limited size buffers to be requested by the user.
+		var buf []byte
+		if request.Length == 0 || request.Length >= BUFSIZE {
+			buf = pool.Get().([]byte)
+			defer pool.Put(buf)
+
+		} else {
+			buf = make([]byte, request.Length)
+		}
 
 		for {
-			n, _ := reader_at.ReadAt(buf, offset)
-			if n > 0 {
-				if request.Length != 0 {
-					length_to_send := request.Length - length_sent
-					if n > length_to_send {
-						n = length_to_send
-					}
+			n, err := reader_at.ReadAt(buf, offset)
+			if err != nil && err != io.EOF {
+				// Only send errors if the headers have not yet been
+				// sent.
+				if !headers_sent {
+					returnError(w, 500, err.Error())
+					headers_sent = true
 				}
-				if n == 0 {
-					return
-				}
-
-				_, err := w.Write(buf[:n])
-				if err != nil {
-					return
-				}
-				length_sent += n
-				offset += int64(n)
-			} else {
 				return
 			}
+			if request.Length != 0 {
+				length_to_send := request.Length - length_sent
+				if n > length_to_send {
+					n = length_to_send
+				}
+			}
+			if n <= 0 {
+				return
+			}
+
+			// Write an ok status which includes the attachment name
+			// but only if no other data was sent.
+			if !headers_sent {
+				w.Header().Set("Content-Disposition", "attachment; "+
+					sanitizeFilenameForAttachment(filename))
+				w.Header().Set("Content-Type",
+					detectMime(buf[:n], request.DetectMime))
+				w.WriteHeader(200)
+				headers_sent = true
+			}
+
+			written, err := w.Write(buf[:n])
+			if err != nil {
+				return
+			}
+
+			length_sent += written
+			offset += int64(n)
 		}
 	})
+}
+
+func detectMime(buffer []byte, detect_mime bool) string {
+	if detect_mime && len(buffer) > 8 {
+		if 0 == bytes.Compare(
+			[]byte("\x89\x50\x4E\x47\x0D\x0A\x1A\x0A"), buffer[:8]) {
+			return "image/png"
+		}
+	}
+	return "binary/octet-stream"
 }
 
 func getRows(
@@ -206,7 +285,7 @@ func getRows(
 
 	// We want an event table.
 	if request.Type == "CLIENT_EVENT" || request.Type == "SERVER_EVENT" {
-		path_manager, err := artifacts.NewArtifactPathManager(
+		path_manager, err := artifacts.NewArtifactPathManager(ctx,
 			config_obj, request.ClientId, request.FlowId,
 			request.Artifact)
 		if err != nil {
@@ -224,7 +303,7 @@ func getRows(
 		return rs_reader.Rows(ctx), rs_reader.Close, log_path, err
 
 	} else {
-		log_path, err := getPathSpec(config_obj, request)
+		log_path, err := tables.GetPathSpec(ctx, config_obj, request)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -240,6 +319,7 @@ func getRows(
 // exporting we need to replicate this transformation, otherwise the
 // results can be surprising.
 func getTransformer(
+	ctx context.Context,
 	config_obj *config_proto.Config,
 	in *api_proto.GetTableRequest) func(row *ordereddict.Dict) *ordereddict.Dict {
 	if in.HuntId != "" && in.Type == "clients" {
@@ -247,14 +327,15 @@ func getTransformer(
 			client_id := utils.GetString(row, "ClientId")
 			flow_id := utils.GetString(row, "FlowId")
 
-			flow, err := flows.LoadCollectionContext(config_obj, client_id, flow_id)
+			flow, err := flows.LoadCollectionContext(
+				ctx, config_obj, client_id, flow_id)
 			if err != nil {
-				flow = flows.NewCollectionContext(config_obj)
+				flow = flows.NewCollectionContext(ctx, config_obj)
 			}
 
 			return ordereddict.NewDict().
 				Set("ClientId", client_id).
-				Set("Hostname", services.GetHostname(client_id)).
+				Set("Hostname", services.GetHostname(ctx, config_obj, client_id)).
 				Set("FlowId", flow_id).
 				Set("StartedTime", time.Unix(utils.GetInt64(row, "Timestamp"), 0)).
 				Set("State", flow.State.String()).
@@ -268,11 +349,88 @@ func getTransformer(
 	return func(row *ordereddict.Dict) *ordereddict.Dict { return row }
 }
 
+func downloadFileStore(prefix []string) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path_spec := paths.FSPathSpecFromClientPath(r.URL.Path)
+		components := path_spec.Components()
+
+		// make sure the prefix is correct
+		for i, p := range prefix {
+			if len(components) <= i || p != components[i] {
+				returnError(w, 404, "Not Found")
+				return
+			}
+		}
+
+		org_id := authenticators.GetOrgIdFromRequest(r)
+		org_manager, err := services.GetOrgManager()
+		if err != nil {
+			returnError(w, 404, err.Error())
+			return
+		}
+
+		org_config_obj, err := org_manager.GetOrgConfig(org_id)
+		if err != nil {
+			returnError(w, 404, err.Error())
+			return
+		}
+
+		file_store_factory := file_store.GetFileStore(org_config_obj)
+		fd, err := file_store_factory.ReadFile(path_spec)
+		if err != nil {
+			returnError(w, 404, err.Error())
+			return
+		}
+
+		// From here on we already sent the headers and we can
+		// not really report an error to the client.
+		w.Header().Set("Content-Disposition", "attachment; "+
+			sanitizePathspecForAttachment(path_spec))
+
+		w.Header().Set("Content-Type", "binary/octet-stream")
+		w.WriteHeader(200)
+
+		utils.Copy(r.Context(), w, fd)
+	})
+}
+
+// Allowed chars in non extended names
+const allowedChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!#$&+-.^_`|~@'=()[]{}0123456789 "
+
+func sanitizePathspecForAttachment(path_spec api.FSPathSpec) string {
+	// https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Disposition
+	// >  The string following filename should always be put into quotes;
+	base_filename := path_spec.Base() + api.GetExtensionForFilestore(path_spec)
+	return sanitizeFilenameForAttachment(base_filename)
+}
+
+func sanitizeFilenameForAttachment(base_filename string) string {
+	// If the base filename contains path separator we use the last one
+	if strings.Contains(base_filename, "/") {
+		parts := strings.Split(base_filename, "/")
+		base_filename = parts[len(parts)-1]
+	}
+
+	base_filename_ascii := []byte{}
+	for _, c := range base_filename {
+		if strings.Contains(allowedChars, string(c)) {
+			base_filename_ascii = append(base_filename_ascii, byte(c))
+		} else {
+			base_filename_ascii = append(base_filename_ascii, '_')
+		}
+	}
+
+	return fmt.Sprintf("filename*=utf-8''\"%s\"; filename=\"%s\" ",
+		url.PathEscape(base_filename), url.PathEscape(string(base_filename_ascii)))
+}
+
 // Download the table as specified by the v1/GetTable API.
-func downloadTable(config_obj *config_proto.Config) http.Handler {
+func downloadTable() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		request := &api_proto.GetTableRequest{}
 		decoder := schema.NewDecoder()
+		decoder.IgnoreUnknownKeys(true)
+
 		decoder.SetAliasTag("json")
 		err := decoder.Decode(request, r.URL.Query())
 		if err != nil {
@@ -280,15 +438,27 @@ func downloadTable(config_obj *config_proto.Config) http.Handler {
 			return
 		}
 
+		org_manager, err := services.GetOrgManager()
+		if err != nil {
+			returnError(w, 404, err.Error())
+			return
+		}
+
+		org_config_obj, err := org_manager.GetOrgConfig(request.OrgId)
+		if err != nil {
+			returnError(w, 404, err.Error())
+			return
+		}
+
 		row_chan, closer, log_path, err := getRows(
-			r.Context(), config_obj, request)
+			r.Context(), org_config_obj, request)
 		if err != nil {
 			returnError(w, 400, "Invalid request")
 			return
 		}
 		defer closer()
 
-		transform := getTransformer(config_obj, request)
+		transform := getTransformer(r.Context(), org_config_obj, request)
 
 		download_name := request.DownloadFilename
 		if download_name == "" {
@@ -296,14 +466,23 @@ func downloadTable(config_obj *config_proto.Config) http.Handler {
 		}
 
 		// Log an audit event.
-		userinfo := GetUserInfo(r.Context(), config_obj)
+		user_record := GetUserInfo(r.Context(), org_config_obj)
+		principal := user_record.Name
 
 		// This should never happen!
-		if userinfo.Name == "" {
-			returnError(w, 500, "Unauthenticated access.")
+		if principal == "" {
+			returnError(w, 403, "Unauthenticated access.")
 			return
 		}
 
+		permissions := acls.READ_RESULTS
+		perm, err := services.CheckAccess(org_config_obj, principal, permissions)
+		if !perm || err != nil {
+			returnError(w, 403, "Unauthenticated access.")
+			return
+		}
+
+		opts := json.GetJsonOptsForTimezone(request.Timezone)
 		switch request.DownloadFormat {
 		case "csv":
 			download_name = strings.TrimSuffix(download_name, ".json")
@@ -311,20 +490,21 @@ func downloadTable(config_obj *config_proto.Config) http.Handler {
 
 			// From here on we already sent the headers and we can
 			// not really report an error to the client.
-			w.Header().Set("Content-Disposition", "attachment; filename="+
-				url.PathEscape(download_name))
+			w.Header().Set("Content-Disposition", "attachment; "+
+				sanitizeFilenameForAttachment(download_name))
 			w.Header().Set("Content-Type", "binary/octet-stream")
 			w.WriteHeader(200)
 
-			logger := logging.GetLogger(config_obj, &logging.Audit)
-			logger.WithFields(logrus.Fields{
-				"user":    userinfo.Name,
-				"request": request,
-				"remote":  r.RemoteAddr,
-			}).Info("DownloadTable")
+			services.LogAudit(r.Context(),
+				org_config_obj, principal, "DownloadTable",
+				ordereddict.NewDict().
+					Set("request", request).
+					Set("remote", r.RemoteAddr))
 
 			scope := vql_subsystem.MakeScope()
-			csv_writer := csv.GetCSVAppender(scope, w, true /* write_headers */)
+			csv_writer := csv.GetCSVAppender(
+				org_config_obj, scope, w,
+				csv.WriteHeaders, opts)
 			for row := range row_chan {
 				csv_writer.Write(
 					filterColumns(request.Columns, transform(row)))
@@ -339,21 +519,21 @@ func downloadTable(config_obj *config_proto.Config) http.Handler {
 
 			// From here on we already sent the headers and we can
 			// not really report an error to the client.
-			w.Header().Set("Content-Disposition", "attachment; filename="+
-				url.PathEscape(download_name))
+			w.Header().Set("Content-Disposition", "attachment; "+
+				sanitizeFilenameForAttachment(download_name))
 			w.Header().Set("Content-Type", "binary/octet-stream")
 			w.WriteHeader(200)
 
-			logger := logging.GetLogger(config_obj, &logging.Audit)
-			logger.WithFields(logrus.Fields{
-				"user":    userinfo.Name,
-				"request": request,
-				"remote":  r.RemoteAddr,
-			}).Info("DownloadTable")
+			services.LogAudit(r.Context(),
+				org_config_obj, principal, "DownloadTable",
+				ordereddict.NewDict().
+					Set("request", request).
+					Set("remote", r.RemoteAddr))
 
 			for row := range row_chan {
-				serialized, err := json.Marshal(
-					filterColumns(request.Columns, transform(row)))
+				serialized, err := json.MarshalWithOptions(
+					filterColumns(request.Columns, transform(row)),
+					json.GetJsonOptsForTimezone(request.Timezone))
 				if err != nil {
 					return
 				}
@@ -377,7 +557,7 @@ func vfsGetBuffer(
 	}
 	defer file.Close()
 
-	var reader_at io.ReaderAt = &utils.ReaderAtter{Reader: file}
+	var reader_at io.ReaderAt = utils.MakeReaderAtter(file)
 
 	result := &api_proto.VFSFileBuffer{
 		Data: make([]byte, length),
@@ -395,8 +575,9 @@ func vfsGetBuffer(
 	}
 
 	n, err := reader_at.ReadAt(result.Data, int64(offset))
-	if err != nil && errors.Is(err, os.ErrNotExist) &&
-		errors.Cause(err) != io.ErrUnexpectedEOF {
+	if err != nil &&
+		errors.Is(err, os.ErrNotExist) &&
+		!errors.Is(err, io.ErrUnexpectedEOF) {
 		return nil, err
 	}
 
@@ -441,4 +622,44 @@ func filterColumns(columns []string, row *ordereddict.Dict) *ordereddict.Dict {
 		new_row.Set(column, value)
 	}
 	return new_row
+}
+
+func calculateTotalSizeWithPadding(index *actions_proto.Index) int {
+	size := 0
+	for _, r := range index.Ranges {
+		size += int(r.Length)
+	}
+	return size
+}
+
+func calculateTotalReaderSize(reader api.FileReader) int {
+	stat, err := reader.Stat()
+	if err == nil {
+		return int(stat.Size())
+	}
+	return 0
+}
+
+func emitContentLength(w http.ResponseWriter, offset int, req_length int, size int) {
+	// Size is not known or 0, do not send a Content Length
+	if size == 0 || offset > size {
+		return
+	}
+
+	// How much data is available to read in the file.
+	available := size - offset
+
+	// If the user asked for less data than is available, then we will
+	// return less, otherwise we only return how much data is
+	// available.
+	if req_length > BUFSIZE {
+		req_length = BUFSIZE
+	}
+
+	// req_length of 0 means download the entire file without byte ranges.
+	if req_length > 0 && req_length < available {
+		available = req_length
+	}
+
+	w.Header().Set("Content-Length", fmt.Sprintf("%v", available))
 }

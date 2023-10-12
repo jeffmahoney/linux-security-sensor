@@ -15,9 +15,9 @@ import (
 	"time"
 
 	"github.com/Depado/bfchroma"
-	"github.com/Masterminds/sprig"
+	"github.com/Masterminds/sprig/v3"
 	"github.com/Velocidex/ordereddict"
-	"github.com/pkg/errors"
+	"github.com/go-errors/errors"
 
 	chroma_html "github.com/alecthomas/chroma/formatters/html"
 	"github.com/microcosm-cc/bluemonday"
@@ -55,7 +55,7 @@ type GuiTemplateEngine struct {
 	*BaseTemplateEngine
 	tmpl         *template.Template
 	ctx          context.Context
-	log_writer   *logWriter
+	log_writer   *notebooCellLogger
 	path_manager *paths.NotebookCellPathManager
 	Data         map[string]*actions_proto.VQLResponse
 	Progress     utils.ProgressReporter
@@ -166,7 +166,7 @@ func (self *GuiTemplateEngine) Expand(values ...interface{}) interface{} {
 }
 
 func (self *GuiTemplateEngine) Import(artifact, name string) interface{} {
-	definition, pres := self.BaseTemplateEngine.Repository.Get(
+	definition, pres := self.BaseTemplateEngine.Repository.Get(self.ctx,
 		self.config_obj, artifact)
 	if !pres {
 		self.Error("Unknown artifact %v", artifact)
@@ -213,6 +213,7 @@ func (self *GuiTemplateEngine) Table(values ...interface{}) interface{} {
 		for _, item := range t {
 			options := item.Params()
 			options.Set("TableOptions", table_options)
+			options.Set("Version", time.Now().Unix())
 
 			result += fmt.Sprintf(
 				`<div class="panel"><grr-csv-viewer base-url="'v1/GetTable'" `+
@@ -277,6 +278,7 @@ func (self *GuiTemplateEngine) genericChart(
 		for _, item := range t {
 			params := item.Params()
 			params.MergeFrom(options)
+			params.Set("Version", time.Now().Unix())
 
 			result += fmt.Sprintf(
 				`<div class="panel"><%s base-url="'v1/GetTable'" `+
@@ -453,6 +455,8 @@ func (self *GuiTemplateEngine) getMultiLineQuery(query string) (string, error) {
 }
 
 func (self *GuiTemplateEngine) Query(queries ...string) interface{} {
+	defer utils.CheckForPanic("Evaluating Query")
+
 	if self.path_manager == nil {
 		return self.queryRows(queries...)
 	}
@@ -466,7 +470,7 @@ func (self *GuiTemplateEngine) Query(queries ...string) interface{} {
 		}
 
 		// Specifically trap the empty string.
-		if whitespace_regexp.MatchString(query) {
+		if IsEmptyQuery(query) {
 			self.Error("Please specify a query to run")
 			return nil
 		}
@@ -478,73 +482,10 @@ func (self *GuiTemplateEngine) Query(queries ...string) interface{} {
 		}
 
 		for _, vql := range multi_vql {
-			// Replace the previously calculated json file.
-			opts := vql_subsystem.EncOptsFromScope(self.Scope)
-
-			// Ignore LET queries but still run them.
-			if vql.Let != "" {
-				for range vql.Eval(self.ctx, self.Scope) {
-				}
-				continue
-			}
-
-			path := self.path_manager.NewQueryStorage()
-			result = append(result, path)
-
-			file_store_factory := file_store.GetFileStore(self.config_obj)
-
-			rs_writer, err := result_sets.NewResultSetWriter(
-				file_store_factory, path.Path(),
-				opts, utils.BackgroundWriter,
-				result_sets.TruncateMode)
+			result, err = self.RunQuery(vql, result)
 			if err != nil {
 				self.Error("Error: %v\n", err)
 				return nil
-			}
-
-			// We must ensure results are visible immediately because
-			// the GUI will need to refresh the cell content as soon
-			// as we complete.
-			rs_writer.SetSync()
-
-			defer rs_writer.Close()
-
-			rs_writer.Flush()
-
-			row_idx := 0
-			next_progress := time.Now().Add(4 * time.Second)
-			eval_chan := vql.Eval(self.ctx, self.Scope)
-
-			defer self.Progress.Report("Completed query")
-
-		do_query:
-			for {
-				select {
-				case <-self.ctx.Done():
-					return result
-
-				case row, ok := <-eval_chan:
-					if !ok {
-						break do_query
-					}
-					row_idx++
-					rs_writer.Write(vfilter.RowToDict(self.ctx, self.Scope, row))
-
-					if self.Progress != nil && (row_idx%100 == 0 ||
-						time.Now().After(next_progress)) {
-						rs_writer.Flush()
-						self.Progress.Report(fmt.Sprintf(
-							"Total Rows %v", row_idx))
-						next_progress = time.Now().Add(4 * time.Second)
-					}
-
-					// Report progress even if no row is emitted
-				case <-time.After(4 * time.Second):
-					rs_writer.Flush()
-					self.Progress.Report(fmt.Sprintf(
-						"Total Rows %v", row_idx))
-					next_progress = time.Now().Add(4 * time.Second)
-				}
 			}
 		}
 	}
@@ -598,6 +539,17 @@ func (self *GuiTemplateEngine) Messages() []string {
 	return self.log_writer.Messages()
 }
 
+func (self *GuiTemplateEngine) MoreMessages() bool {
+	return self.log_writer.MoreMessages()
+}
+
+func (self *GuiTemplateEngine) Close() {
+	if self.log_writer != nil {
+		self.log_writer.Flush()
+	}
+	self.BaseTemplateEngine.Close()
+}
+
 type logWriter struct {
 	mu       sync.Mutex
 	messages []string
@@ -633,13 +585,25 @@ func NewGuiTemplateEngine(
 	artifact_name string) (
 	*GuiTemplateEngine, error) {
 
+	uploader := &NotebookUploader{
+		config_obj:                 config_obj,
+		notebook_cell_path_manager: notebook_cell_path_manager,
+	}
+
 	base_engine, err := newBaseTemplateEngine(
-		config_obj, scope, acl_manager, repository, artifact_name)
+		ctx, config_obj, scope, acl_manager,
+		uploader, repository, artifact_name)
 	if err != nil {
 		return nil, err
 	}
 
-	log_writer := &logWriter{}
+	// Write logs to this result set.
+	log_writer, err := newNotebookCellLogger(
+		config_obj, notebook_cell_path_manager.Logs())
+	if err != nil {
+		return nil, err
+	}
+
 	base_engine.Scope.SetLogger(log.New(log_writer, "", 0))
 	template_engine := &GuiTemplateEngine{
 		BaseTemplateEngine: base_engine,
@@ -671,6 +635,8 @@ func NewBlueMondayPolicy() *bluemonday.Policy {
 	p := bluemonday.UGCPolicy()
 
 	p.AllowStandardURLs()
+	// DATA urls are useful for markdown cells
+	p.AllowURLSchemes("http", "https", "data")
 
 	// Directives for the GUI.
 	p.AllowAttrs("value", "params").OnElements("grr-csv-viewer")
@@ -695,4 +661,85 @@ func NewBlueMondayPolicy() *bluemonday.Policy {
 	p.AllowAttrs("class").OnElements("a")
 
 	return p
+}
+
+func (self *GuiTemplateEngine) RunQuery(vql *vfilter.VQL,
+	result []*paths.NotebookCellQuery) ([]*paths.NotebookCellQuery, error) {
+	if result == nil {
+		result = []*paths.NotebookCellQuery{}
+	}
+	opts := vql_subsystem.EncOptsFromScope(self.Scope)
+
+	// Ignore LET queries but still run them.
+	if vql.Let != "" {
+		for range vql.Eval(self.ctx, self.Scope) {
+		}
+		return result, nil
+	}
+
+	path := self.path_manager.NewQueryStorage()
+	result = append(result, path)
+
+	file_store_factory := file_store.GetFileStore(self.config_obj)
+	rs_writer, err := result_sets.NewResultSetWriter(
+		file_store_factory, path.Path(),
+		opts, utils.SyncCompleter,
+		result_sets.TruncateMode)
+	if err != nil {
+		self.Error("Error: %v\n", err)
+		return result, nil
+	}
+
+	// We must ensure results are visible immediately because
+	// the GUI will need to refresh the cell content as soon
+	// as we complete.
+	rs_writer.SetSync()
+
+	defer rs_writer.Close()
+
+	rs_writer.Flush()
+
+	row_idx := 0
+	next_progress := time.Now().Add(4 * time.Second)
+	eval_chan := vql.Eval(self.ctx, self.Scope)
+
+	if self.Progress != nil {
+		defer self.Progress.Report("Completed query")
+	}
+
+	for {
+		select {
+		case <-self.ctx.Done():
+			return result, nil
+
+		case row, ok := <-eval_chan:
+			if !ok {
+				return result, nil
+			}
+			row_idx++
+			rs_writer.Write(vfilter.RowToDict(self.ctx, self.Scope, row))
+
+			if self.Progress != nil && (row_idx%100 == 0 ||
+				time.Now().After(next_progress)) {
+				rs_writer.Flush()
+				self.Progress.Report(fmt.Sprintf(
+					"Total Rows %v", row_idx))
+				next_progress = time.Now().Add(4 * time.Second)
+			}
+
+		// Report progress even if no row is emitted
+		case <-time.After(4 * time.Second):
+			rs_writer.Flush()
+			if self.Progress != nil {
+				self.Progress.Report(fmt.Sprintf(
+					"Total Rows %v", row_idx))
+			}
+			next_progress = time.Now().Add(4 * time.Second)
+
+		}
+	}
+}
+
+func IsEmptyQuery(query string) bool {
+	return whitespace_regexp.MatchString(query)
 }

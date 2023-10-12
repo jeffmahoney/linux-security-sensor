@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -18,6 +18,7 @@
 package crypto
 
 import (
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 )
 
@@ -25,11 +26,11 @@ type ICryptoManager interface {
 	GetCSR() ([]byte, error)
 	Encrypt(compressed_message_lists [][]byte,
 		compression crypto_proto.PackedMessageList_CompressionType,
-		destination string) ([]byte, error)
+		nonce, destination string) ([]byte, error)
 	Decrypt(cipher_text []byte) (*MessageInfo, error)
 }
 
 type IClientCryptoManager interface {
 	ICryptoManager
-	AddCertificate(certificate_pem []byte) (string, error)
+	AddCertificate(config_obj *config_proto.Config, certificate_pem []byte) (string, error)
 }

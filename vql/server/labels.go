@@ -1,8 +1,8 @@
 // +build server_vql
 
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -25,6 +25,7 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -61,7 +62,7 @@ func (self *AddLabels) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
-	labeler := services.GetLabeler()
+	labeler := services.GetLabeler(config_obj)
 	for _, label := range arg.Labels {
 		if label == "" {
 			continue
@@ -69,13 +70,13 @@ func (self *AddLabels) Call(ctx context.Context,
 
 		switch arg.Op {
 		case "set":
-			err = labeler.SetClientLabel(config_obj, arg.ClientId, label)
+			err = labeler.SetClientLabel(ctx, config_obj, arg.ClientId, label)
 
 		case "remove":
-			err = labeler.RemoveClientLabel(config_obj, arg.ClientId, label)
+			err = labeler.RemoveClientLabel(ctx, config_obj, arg.ClientId, label)
 
 		case "check":
-			if !labeler.IsLabelSet(config_obj, arg.ClientId, label) {
+			if !labeler.IsLabelSet(ctx, config_obj, arg.ClientId, label) {
 				return false
 			}
 		}
@@ -84,7 +85,7 @@ func (self *AddLabels) Call(ctx context.Context,
 			return vfilter.Null{}
 		}
 	}
-	return arg
+	return vfilter.RowToDict(ctx, scope, arg)
 }
 
 func (self AddLabels) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
@@ -92,7 +93,8 @@ func (self AddLabels) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfil
 		Name: "label",
 		Doc: "Add the labels to the client. " +
 			"If op is 'remove' then remove these labels.",
-		ArgType: type_map.AddType(scope, &AddLabelsArgs{}),
+		ArgType:  type_map.AddType(scope, &AddLabelsArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.LABEL_CLIENT).Build(),
 	}
 }
 

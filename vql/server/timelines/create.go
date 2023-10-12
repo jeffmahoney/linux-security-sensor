@@ -9,6 +9,8 @@ import (
 	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/timelines"
+	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/functions"
 	"www.velocidex.com/golang/velociraptor/vql/sorter"
@@ -96,9 +98,11 @@ func (self *AddTimelineFunction) Call(ctx context.Context,
 			return vfilter.Null{}
 		}
 
-		ts, err := functions.TimeFromAny(scope, key)
-		if err == nil {
-			writer.Write(ts, vfilter.RowToDict(sub_ctx, subscope, row))
+		if !utils.IsNil(key) {
+			ts, err := functions.TimeFromAny(scope, key)
+			if err == nil {
+				writer.Write(ts, vfilter.RowToDict(sub_ctx, subscope, row))
+			}
 		}
 	}
 
@@ -135,9 +139,10 @@ func (self *AddTimelineFunction) Call(ctx context.Context,
 func (self AddTimelineFunction) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "timeline_add",
-		Doc:     "Add a new query to a timeline.",
-		ArgType: type_map.AddType(scope, &AddTimelineFunctionArgs{}),
+		Name:     "timeline_add",
+		Doc:      "Add a new query to a timeline.",
+		ArgType:  type_map.AddType(scope, &AddTimelineFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.READ_RESULTS).Build(),
 	}
 }
 

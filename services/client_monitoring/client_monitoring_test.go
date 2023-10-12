@@ -1,4 +1,4 @@
-package client_monitoring
+package client_monitoring_test
 
 import (
 	"context"
@@ -15,6 +15,7 @@ import (
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/services/client_monitoring"
 	"www.velocidex.com/golang/velociraptor/services/labels"
 	"www.velocidex.com/golang/velociraptor/utils"
 	"www.velocidex.com/golang/velociraptor/vtesting"
@@ -58,11 +59,49 @@ type ClientMonitoringTestSuite struct {
 }
 
 func (self *ClientMonitoringTestSuite) SetupTest() {
-	self.TestSuite.SetupTest()
-	self.LoadArtifacts(mock_definitions)
-	require.NoError(self.T(), self.Sm.Start(StartClientMonitoringService))
+	self.ConfigObj = self.TestSuite.LoadConfig()
+	self.ConfigObj.Services.ClientMonitoring = true
 
+	self.LoadArtifactsIntoConfig(mock_definitions)
+
+	self.TestSuite.SetupTest()
 	self.client_id = "C.12312"
+
+	manager, err := services.GetRepositoryManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	repository, err := manager.GetGlobalRepository(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	_, err = repository.LoadYaml(`
+name: TestArtifact
+sources:
+- query:
+    SELECT * FROM info()
+`, services.ArtifactOptions{
+		ValidateArtifact:  true,
+		ArtifactIsBuiltIn: false})
+
+	assert.NoError(self.T(), err)
+	_, err = repository.LoadYaml(`
+name: SomethingElse
+sources:
+- query:
+    SELECT * FROM info()
+`, services.ArtifactOptions{
+		ValidateArtifact:  true,
+		ArtifactIsBuiltIn: false})
+
+	assert.NoError(self.T(), err)
+
+	client_info_manager, err := services.GetClientInfoManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	client_info_manager.Set(self.Ctx, &services.ClientInfo{
+		actions_proto.ClientInfo{
+			ClientId: self.client_id,
+		},
+	})
 }
 
 // Check that monitoring tables eventually follow when artifact
@@ -70,22 +109,10 @@ func (self *ClientMonitoringTestSuite) SetupTest() {
 func (self *ClientMonitoringTestSuite) TestUpdatingArtifacts() {
 	current_clock := &utils.IncClock{NowTime: 10}
 
-	self.LoadCustomArtifacts([]string{`
-name: TestArtifact
-sources:
-- query:
-    SELECT * FROM info()
-`, `
-name: SomethingElse
-sources:
-- query:
-    SELECT * FROM info()
-`})
+	manager, err := services.ClientEventManager(self.ConfigObj)
+	manager.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
-	manager := services.ClientEventManager().(*ClientEventTable)
-	manager.SetClock(current_clock)
-
-	err := manager.SetClientMonitoringState(
+	err = manager.SetClientMonitoringState(
 		context.Background(), self.ConfigObj, "",
 		&flows_proto.ClientEventTable{
 			Artifacts: &flows_proto.ArtifactCollectorArgs{
@@ -95,32 +122,36 @@ sources:
 	assert.NoError(self.T(), err)
 
 	old_table_message := manager.GetClientUpdateEventTableMessage(
-		self.ConfigObj, self.client_id)
+		context.Background(), self.ConfigObj, self.client_id)
 	assert.NotContains(self.T(), json.StringIndent(old_table_message), "Crib")
 
 	table_version := old_table_message.UpdateEventTable.Version
 
 	// Now update the artifact.
-	repository_manager, _ := services.GetRepositoryManager()
-	_, err = repository_manager.SetArtifactFile(self.ConfigObj, "", `
+	repository_manager, err := services.GetRepositoryManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	ctx := self.Ctx
+	_, err = repository_manager.SetArtifactFile(ctx,
+		self.ConfigObj, "", `
 name: TestArtifact
 sources:
 - query:
     SELECT *, Crib FROM info()
 `, "")
-	assert.NoError(self.T(), err)
+	require.NoError(self.T(), err)
 
 	var new_table_message *crypto_proto.VeloMessage
 
 	// The table should magically be updated!
 	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
 		if !manager.CheckClientEventsVersion(
-			self.ConfigObj, self.client_id, table_version) {
+			context.Background(), self.ConfigObj, self.client_id, table_version) {
 			return false
 		}
 
 		new_table_message = manager.GetClientUpdateEventTableMessage(
-			self.ConfigObj, self.client_id)
+			context.Background(), self.ConfigObj, self.client_id)
 		return strings.Contains(json.StringIndent(new_table_message), "Crib")
 	})
 
@@ -131,18 +162,19 @@ sources:
 	table_version = new_table_message.UpdateEventTable.Version
 
 	// Now delete the artifact completely
-	repository_manager.DeleteArtifactFile(self.ConfigObj, "", "TestArtifact")
+	repository_manager.DeleteArtifactFile(
+		ctx, self.ConfigObj, "", "TestArtifact")
 
 	// The table should magically be updated!
 	table_json := ""
 	vtesting.WaitUntil(5*time.Second, self.T(), func() bool {
 		if !manager.CheckClientEventsVersion(
-			self.ConfigObj, self.client_id, table_version) {
+			context.Background(), self.ConfigObj, self.client_id, table_version) {
 			return false
 		}
 
 		table := manager.GetClientUpdateEventTableMessage(
-			self.ConfigObj, self.client_id)
+			context.Background(), self.ConfigObj, self.client_id)
 		table_json = json.StringIndent(table)
 
 		// The table should not contain the Crib any more
@@ -156,19 +188,21 @@ sources:
 func (self *ClientMonitoringTestSuite) TestUpdatingClientTable() {
 	current_clock := &utils.IncClock{NowTime: 10}
 
-	repository_manager, _ := services.GetRepositoryManager()
-	repository_manager.SetArtifactFile(self.ConfigObj, "", `
+	repository_manager, _ := services.GetRepositoryManager(self.ConfigObj)
+	repository_manager.SetArtifactFile(self.Ctx, self.ConfigObj, "", `
 name: TestArtifact
 sources:
 - query:
     SELECT * FROM info()
 `, "")
 
-	manager := services.ClientEventManager().(*ClientEventTable)
-	manager.SetClock(current_clock)
+	manager, err := services.ClientEventManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	manager.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
 	// Set the initial table.
-	err := manager.SetClientMonitoringState(
+	err = manager.SetClientMonitoringState(
 		context.Background(), self.ConfigObj, "",
 		&flows_proto.ClientEventTable{
 			Artifacts: &flows_proto.ArtifactCollectorArgs{
@@ -178,7 +212,8 @@ sources:
 	assert.NoError(self.T(), err)
 
 	// Get the client's event table
-	old_table := manager.GetClientUpdateEventTableMessage(self.ConfigObj, self.client_id)
+	old_table := manager.GetClientUpdateEventTableMessage(
+		context.Background(), self.ConfigObj, self.client_id)
 
 	// Now update the monitoring state
 	err = manager.SetClientMonitoringState(
@@ -191,7 +226,8 @@ sources:
 	assert.NoError(self.T(), err)
 
 	// Get the client event table again
-	table := manager.GetClientUpdateEventTableMessage(self.ConfigObj, self.client_id)
+	table := manager.GetClientUpdateEventTableMessage(
+		context.Background(), self.ConfigObj, self.client_id)
 
 	// Make sure the client event table version is updated.
 	assert.True(self.T(),
@@ -201,19 +237,21 @@ sources:
 func (self *ClientMonitoringTestSuite) TestUpdatingClientTableMultiFrontend() {
 	current_clock := &utils.IncClock{NowTime: 10}
 
-	repository_manager, _ := services.GetRepositoryManager()
-	repository_manager.SetArtifactFile(self.ConfigObj, "", `
+	repository_manager, _ := services.GetRepositoryManager(self.ConfigObj)
+	repository_manager.SetArtifactFile(self.Ctx, self.ConfigObj, "", `
 name: TestArtifact
 sources:
 - query:
     SELECT * FROM info()
 `, "")
 
-	manager1 := services.ClientEventManager().(*ClientEventTable)
-	manager1.SetClock(current_clock)
+	manager1, err := services.ClientEventManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	manager1.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
 	// Set the initial table.
-	err := manager1.SetClientMonitoringState(
+	err = manager1.SetClientMonitoringState(
 		context.Background(), self.ConfigObj, "",
 		&flows_proto.ClientEventTable{
 			Artifacts: &flows_proto.ArtifactCollectorArgs{
@@ -223,12 +261,15 @@ sources:
 	assert.NoError(self.T(), err)
 
 	// Get the client's event table
-	old_table := manager1.GetClientUpdateEventTableMessage(self.ConfigObj, self.client_id)
+	old_table := manager1.GetClientUpdateEventTableMessage(
+		context.Background(), self.ConfigObj, self.client_id)
 
 	// Now another frontend sets the client monitoring state
-	require.NoError(self.T(), self.Sm.Start(StartClientMonitoringService))
-	manager2 := services.ClientEventManager().(*ClientEventTable)
-	manager2.SetClock(current_clock)
+	manager2, err := client_monitoring.NewClientMonitoringService(
+		self.Ctx, self.Wg, self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	manager2.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
 	// Now update the monitoring state
 	err = manager2.SetClientMonitoringState(
@@ -241,7 +282,8 @@ sources:
 	assert.NoError(self.T(), err)
 
 	// Get the client event table again
-	table := manager2.GetClientUpdateEventTableMessage(self.ConfigObj, self.client_id)
+	table := manager2.GetClientUpdateEventTableMessage(
+		context.Background(), self.ConfigObj, self.client_id)
 
 	// Make sure the client event table version is updated.
 	assert.True(self.T(),
@@ -253,12 +295,13 @@ func (self *ClientMonitoringTestSuite) TestClientMonitoringCompiling() {
 	// increment.
 	current_clock := &utils.IncClock{NowTime: 10}
 
-	labeler := services.GetLabeler().(*labels.Labeler)
-	labeler.SetClock(current_clock)
+	labeler := services.GetLabeler(self.ConfigObj)
+	labeler.(*labels.Labeler).SetClock(current_clock)
 
 	// If no table exists, we will get a default table.
-	manager := services.ClientEventManager().(*ClientEventTable)
-	manager.SetClock(current_clock)
+	manager, err := services.ClientEventManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+	manager.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
 	// Install an initial monitoring table: Everyone gets ServiceCreation.
 	manager.SetClientMonitoringState(
@@ -269,7 +312,8 @@ func (self *ClientMonitoringTestSuite) TestClientMonitoringCompiling() {
 			},
 		})
 
-	table := manager.GetClientUpdateEventTableMessage(self.ConfigObj, self.client_id)
+	table := manager.GetClientUpdateEventTableMessage(
+		context.Background(), self.ConfigObj, self.client_id)
 
 	// There should be one event table sent.
 	assert.Equal(self.T(), len(table.UpdateEventTable.Event), 1)
@@ -278,19 +322,23 @@ func (self *ClientMonitoringTestSuite) TestClientMonitoringCompiling() {
 	assert.True(self.T(), version > 0)
 
 	// Now the client upgraded its table, do we need to update it again?
-	assert.False(self.T(), manager.CheckClientEventsVersion(self.ConfigObj,
+	assert.False(self.T(), manager.CheckClientEventsVersion(
+		context.Background(), self.ConfigObj,
 		self.client_id, version))
 
 	// Add a label to the client
-	require.NoError(self.T(), labeler.SetClientLabel(self.ConfigObj,
+	require.NoError(self.T(), labeler.SetClientLabel(
+		context.Background(), self.ConfigObj,
 		self.client_id, "Label1"))
 
 	// Since the client's label changed it might need to be updated.
-	assert.True(self.T(), manager.CheckClientEventsVersion(self.ConfigObj,
+	assert.True(self.T(), manager.CheckClientEventsVersion(
+		context.Background(), self.ConfigObj,
 		self.client_id, version))
 
 	// But the event table does not include a rule for this label anyway.
-	table = manager.GetClientUpdateEventTableMessage(self.ConfigObj, self.client_id)
+	table = manager.GetClientUpdateEventTableMessage(
+		context.Background(), self.ConfigObj, self.client_id)
 	assert.Equal(self.T(), len(table.UpdateEventTable.Event), 1)
 
 	// New table is still updated though.
@@ -319,11 +367,13 @@ func (self *ClientMonitoringTestSuite) TestClientMonitoringCompiling() {
 		})
 
 	// A new table is installed, this client must update.
-	assert.True(self.T(), manager.CheckClientEventsVersion(self.ConfigObj,
+	assert.True(self.T(), manager.CheckClientEventsVersion(
+		context.Background(), self.ConfigObj,
 		self.client_id, version))
 
 	// The new table includes 2 rules - the default and for Label1
-	table = manager.GetClientUpdateEventTableMessage(self.ConfigObj, self.client_id)
+	table = manager.GetClientUpdateEventTableMessage(
+		context.Background(), self.ConfigObj, self.client_id)
 	assert.Equal(self.T(), len(table.UpdateEventTable.Event), 2)
 
 	// New table has a later version.
@@ -335,14 +385,16 @@ func (self *ClientMonitoringTestSuite) TestClientMonitoringCompiling() {
 		[]string{"Windows.Events.ServiceCreation", "Windows.Events.DNSQueries"})
 
 	// Lets add Label2 to this client.
-	labeler.SetClientLabel(self.ConfigObj, self.client_id, "Label2")
+	labeler.SetClientLabel(context.Background(), self.ConfigObj, self.client_id, "Label2")
 
 	// A new table is installed, this client must update.
-	assert.True(self.T(), manager.CheckClientEventsVersion(self.ConfigObj,
+	assert.True(self.T(), manager.CheckClientEventsVersion(
+		context.Background(), self.ConfigObj,
 		self.client_id, version))
 
 	// The new table includes 3 rules - the default and for Label1 and Label2
-	table = manager.GetClientUpdateEventTableMessage(self.ConfigObj, self.client_id)
+	table = manager.GetClientUpdateEventTableMessage(
+		context.Background(), self.ConfigObj, self.client_id)
 	assert.Equal(self.T(), len(table.UpdateEventTable.Event), 3)
 
 	// New table has a later version.
@@ -356,7 +408,8 @@ func (self *ClientMonitoringTestSuite) TestClientMonitoringCompiling() {
 			"Windows.Events.ProcessCreation"})
 
 	// We are done now... no need to update anymore.
-	assert.False(self.T(), manager.CheckClientEventsVersion(self.ConfigObj,
+	assert.False(self.T(), manager.CheckClientEventsVersion(
+		context.Background(), self.ConfigObj,
 		self.client_id, version))
 }
 
@@ -370,12 +423,14 @@ func (self *ClientMonitoringTestSuite) TestClientMonitoringCompiling() {
 func (self *ClientMonitoringTestSuite) TestClientMonitoringCompilingMultipleArtifacts() {
 	current_clock := &utils.IncClock{NowTime: 10}
 
-	labeler := services.GetLabeler().(*labels.Labeler)
-	labeler.SetClock(current_clock)
+	labeler := services.GetLabeler(self.ConfigObj)
+	labeler.(*labels.Labeler).SetClock(current_clock)
 
 	// If no table exists, we will get a default table.
-	manager := services.ClientEventManager().(*ClientEventTable)
-	manager.SetClock(current_clock)
+	manager, err := services.ClientEventManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+
+	manager.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
 	// Install an initial monitoring table: Everyone gets ServiceCreation.
 	manager.SetClientMonitoringState(
@@ -388,7 +443,8 @@ func (self *ClientMonitoringTestSuite) TestClientMonitoringCompilingMultipleArti
 				},
 			},
 		})
-	table := manager.GetClientUpdateEventTableMessage(self.ConfigObj, self.client_id)
+	table := manager.GetClientUpdateEventTableMessage(
+		context.Background(), self.ConfigObj, self.client_id)
 
 	// Count how many SELECT statements exist in each event table.
 	for _, event := range table.UpdateEventTable.Event {
@@ -422,17 +478,20 @@ func extractArtifacts(args *actions_proto.VQLEventTable) []string {
 
 // Check that labels are properly populated from the index.
 func (self *ClientMonitoringTestSuite) TestClientMonitoring() {
-	current_clock := &utils.MockClock{MockNow: time.Unix(10, 0)}
+	current_clock := utils.NewMockClock(time.Unix(10, 0))
 
-	labeler := services.GetLabeler().(*labels.Labeler)
-	labeler.SetClock(current_clock)
+	labeler := services.GetLabeler(self.ConfigObj)
+	labeler.(*labels.Labeler).SetClock(current_clock)
 
 	// If no table exists, we will get a default table.
-	manager := services.ClientEventManager().(*ClientEventTable)
-	manager.SetClock(current_clock)
+	manager, err := services.ClientEventManager(self.ConfigObj)
+	assert.NoError(self.T(), err)
+	manager.(*client_monitoring.ClientEventTable).SetClock(current_clock)
 
 	test_utils.GetMemoryDataStore(self.T(), self.ConfigObj).Clear()
-	assert.NoError(self.T(), manager.LoadFromFile(context.Background(), self.ConfigObj))
+	assert.NoError(self.T(),
+		manager.(*client_monitoring.ClientEventTable).LoadFromFile(
+			context.Background(), self.ConfigObj))
 
 	table := manager.GetClientMonitoringState()
 
@@ -442,20 +501,23 @@ func (self *ClientMonitoringTestSuite) TestClientMonitoring() {
 
 	// If a client presents an earlier version table they will
 	// need to update.
-	assert.True(self.T(), manager.CheckClientEventsVersion(self.ConfigObj,
+	assert.True(self.T(), manager.CheckClientEventsVersion(
+		context.Background(), self.ConfigObj,
 		self.client_id, 50))
 
 	// If a client presents the same table version they dont need to do anything.
-	assert.False(self.T(), manager.CheckClientEventsVersion(self.ConfigObj,
+	assert.False(self.T(), manager.CheckClientEventsVersion(
+		context.Background(), self.ConfigObj,
 		self.client_id, uint64(10000000000)))
 
 	// Some time later we label the client.
-	current_clock.MockNow = time.Unix(20, 0)
-	labeler.SetClientLabel(self.ConfigObj, self.client_id, "Foobar")
+	current_clock.Set(time.Unix(20, 0))
+	labeler.SetClientLabel(self.Ctx, self.ConfigObj, self.client_id, "Foobar")
 
 	// Client will now be required to update its event table to
 	// make sure the new label does not apply.
-	assert.True(self.T(), manager.CheckClientEventsVersion(self.ConfigObj,
+	assert.True(self.T(), manager.CheckClientEventsVersion(
+		self.Ctx, self.ConfigObj,
 		self.client_id, uint64(10000000000)))
 
 }

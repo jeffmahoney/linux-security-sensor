@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -22,17 +22,19 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/evtx"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 type _ParseEvtxPluginArgs struct {
-	Filenames []string `vfilter:"required,field=filename,doc=A list of event log files to parse."`
-	Accessor  string   `vfilter:"optional,field=accessor,doc=The accessor to use."`
-	Database  string   `vfilter:"optional,field=messagedb,doc=A Message database from https://github.com/Velocidex/evtx-data."`
+	Filenames []*accessors.OSPath `vfilter:"required,field=filename,doc=A list of event log files to parse."`
+	Accessor  string              `vfilter:"optional,field=accessor,doc=The accessor to use."`
+	Database  string              `vfilter:"optional,field=messagedb,doc=A Message database from https://github.com/Velocidex/evtx-data."`
 }
 
 type _ParseEvtxPlugin struct{}
@@ -80,12 +82,12 @@ func (self _ParseEvtxPlugin) Call(
 					return
 				}
 
-				accessor, err := glob.GetAccessor(arg.Accessor, scope)
+				accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 				if err != nil {
 					scope.Log("parse_evtx: %v", err)
 					return
 				}
-				fd, err := accessor.Open(filename)
+				fd, err := accessor.OpenWithOSPath(filename)
 				if err != nil {
 					scope.Log("Unable to open file %s: %v",
 						filename, err)
@@ -134,9 +136,10 @@ func (self _ParseEvtxPlugin) Call(
 
 func (self _ParseEvtxPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "parse_evtx",
-		Doc:     "Parses events from an EVTX file.",
-		ArgType: type_map.AddType(scope, &_ParseEvtxPluginArgs{}),
+		Name:     "parse_evtx",
+		Doc:      "Parses events from an EVTX file.",
+		ArgType:  type_map.AddType(scope, &_ParseEvtxPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
@@ -199,9 +202,10 @@ func (self _WatchEvtxPlugin) Call(
 
 func (self _WatchEvtxPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "watch_evtx",
-		Doc:     "Watch an EVTX file and stream events from it. ",
-		ArgType: type_map.AddType(scope, &_ParseEvtxPluginArgs{}),
+		Name:     "watch_evtx",
+		Doc:      "Watch an EVTX file and stream events from it. ",
+		ArgType:  type_map.AddType(scope, &_ParseEvtxPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

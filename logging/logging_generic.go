@@ -4,13 +4,14 @@ package logging
 
 import (
 	"bytes"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/rifflock/lfshook"
 	"github.com/sirupsen/logrus"
+	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
@@ -35,7 +36,9 @@ func (self *Formatter) Format(entry *logrus.Entry) ([]byte, error) {
 	b := &bytes.Buffer{}
 
 	levelText := strings.ToUpper(entry.Level.String())
-	fmt.Fprintf(b, "[%s] %v %s ", levelText, entry.Time.Format(time.RFC3339),
+	now := utils.GetTime().Now().UTC()
+
+	fmt.Fprintf(b, "[%s] %v %s ", levelText, now.Format(time.RFC3339),
 		replaceTagWithCode(strings.TrimRight(entry.Message, "\r\n")))
 
 	if len(entry.Data) > 0 {

@@ -1,0 +1,18 @@
+Queries:
+  - SELECT OSPath.Basename, Content.home
+    FROM Artifact.MacOS.System.Plist(
+       PlistGlob=srcDir+"/artifacts/testdata/files/vag*.plist")
+
+  - LET X <= SELECT mock(plugin='execve', results={
+      SELECT read_file(
+         filename=srcDir+"/artifacts/testdata/files/SPApplicationsDataType.json") AS Stdout
+         FROM scope()
+    }) FROM scope()
+
+  - SELECT * FROM Artifact.MacOS.System.Packages()
+
+  - SELECT File, path, id, flags
+    FROM Artifact.MacOS.Forensics.FSEvents(Glob=srcDir+"/artifacts/testdata/files/fs_events_*")
+
+  - SELECT *, OSPath.Basename AS OSPath
+    FROM Artifact.MacOS.System.Dock(DockGlob=srcDir+"/artifacts/testdata/files/com.apple.dock.plist")

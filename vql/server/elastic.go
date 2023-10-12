@@ -13,8 +13,8 @@
 // with a very minimal footprint.
 
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -30,18 +30,16 @@
    along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 
-/* Plugin Elastic.
-
-
- */
+/*
+Plugin Elastic.
+*/
 package server
 
 import (
 	"bytes"
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"regexp"
@@ -51,12 +49,14 @@ import (
 
 	elasticsearch "github.com/Velocidex/go-elasticsearch/v7"
 	"github.com/Velocidex/ordereddict"
+	"github.com/go-errors/errors"
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/artifacts"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/crypto"
 	"www.velocidex.com/golang/velociraptor/json"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/networking"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
@@ -65,7 +65,7 @@ type _ElasticPluginArgs struct {
 	Query              vfilter.StoredQuery `vfilter:"required,field=query,doc=Source for rows to upload."`
 	Threads            int64               `vfilter:"optional,field=threads,doc=How many threads to use."`
 	Index              string              `vfilter:"optional,field=index,doc=The name of the index to upload to. If not specified ensure a column is named '_index'."`
-	Type               string              `vfilter:"required,field=type,doc=The type of the index to upload to."`
+	Type               string              `vfilter:"optional,field=type,doc=The type of the index to upload to."`
 	ChunkSize          int64               `vfilter:"optional,field=chunk_size,doc=The number of rows to send at the time."`
 	Addresses          []string            `vfilter:"optional,field=addresses,doc=A list of Elasticsearch nodes to use."`
 	Username           string              `vfilter:"optional,field=username,doc=Username for HTTP Basic Authentication."`
@@ -74,8 +74,10 @@ type _ElasticPluginArgs struct {
 	APIKey             string              `vfilter:"optional,field=api_key,doc=Base64-encoded token for authorization; if set, overrides username and password."`
 	WaitTime           int64               `vfilter:"optional,field=wait_time,doc=Batch elastic upload this long (2 sec)."`
 	PipeLine           string              `vfilter:"optional,field=pipeline,doc=Pipeline for uploads"`
-	DisableSSLSecurity bool                `vfilter:"optional,field=disable_ssl_security,doc=Disable ssl certificate verifications."`
+	DisableSSLSecurity bool                `vfilter:"optional,field=disable_ssl_security,doc=Disable ssl certificate verifications (deprecated in favor of SkipVerify)."`
+	SkipVerify         bool                `vfilter:"optional,field=skip_verify,doc=Disable ssl certificate verifications."`
 	RootCerts          string              `vfilter:"optional,field=root_ca,doc=As a better alternative to disable_ssl_security, allows root ca certs to be added here."`
+	MaxMemoryBuffer    uint64              `vfilter:"optional,field=max_memory_buffer,doc=How large we allow the memory buffer to grow to while we are trying to contact the Elastic server (default 100mb)."`
 }
 
 type _ElasticPlugin struct{}
@@ -146,18 +148,21 @@ func upload_rows(
 
 	var buf bytes.Buffer
 
-	CA_Pool := x509.NewCertPool()
-	crypto.AddPublicRoots(CA_Pool)
-	err := crypto.AddDefaultCerts(config_obj, CA_Pool)
+	tlsConfig, err := networking.GetTlsConfig(config_obj, arg.RootCerts)
 	if err != nil {
-		scope.Log("elastic: %v", err)
+		scope.Log("elastic: cannot get TLS config: %s", err)
 		return
 	}
 
-	if arg.RootCerts != "" &&
-		!CA_Pool.AppendCertsFromPEM([]byte(arg.RootCerts)) {
-		scope.Log("elastic: Unable to add root certs")
-		return
+	if arg.DisableSSLSecurity || arg.SkipVerify {
+		if arg.DisableSSLSecurity {
+			scope.Log("elastic: DisableSSLSecurity is deprecated, please use SkipVerify instead")
+		}
+
+		if err = networking.EnableSkipVerify(tlsConfig, config_obj); err != nil {
+			scope.Log("elastic: cannot disable SSL security: %s", err)
+			return
+		}
 	}
 
 	cfg := elasticsearch.Config{
@@ -169,11 +174,7 @@ func upload_rows(
 		Transport: &http.Transport{
 			MaxIdleConnsPerHost:   10,
 			ResponseHeaderTimeout: 100 * time.Second,
-			TLSClientConfig: &tls.Config{
-				ClientSessionCache: tls.NewLRUClientSessionCache(100),
-				RootCAs:            CA_Pool,
-				InsecureSkipVerify: arg.DisableSSLSecurity,
-			},
+			TLSClientConfig:       tlsConfig,
 		},
 	}
 
@@ -187,8 +188,18 @@ func upload_rows(
 	next_send_id := id + arg.ChunkSize
 	next_send_time := time.After(wait_time)
 
+	// If the buffer is too large we need to drop the data on the
+	// floor. This might happen if the elastic server is not reachable
+	// for example.
+	max_buffer_size := uint64(100 * 1024 * 1024)
+	if arg.MaxMemoryBuffer > 0 {
+		max_buffer_size = arg.MaxMemoryBuffer
+	}
+
 	// Flush any remaining rows
 	defer send_to_elastic(ctx, scope, output_chan, client, &buf)
+
+	opts := vql_subsystem.EncOptsFromScope(scope)
 
 	// Batch sending to elastic: Either
 	// when we get to chuncksize or wait
@@ -203,13 +214,14 @@ func upload_rows(
 			// FIXME: Find a better way to interleave id's
 			// to avoid collisions.
 			id = id + 3
-			err := append_row_to_buffer(ctx, scope, row, id, &buf, arg)
+			err := append_row_to_buffer(ctx, scope, row, id, &buf, arg, opts)
 			if err != nil {
 				scope.Log("elastic: %v", err)
 				continue
 			}
 
-			if id > next_send_id {
+			if id > next_send_id ||
+				buf.Len() > int(max_buffer_size) {
 				send_to_elastic(ctx, scope, output_chan,
 					client, &buf)
 				next_send_id = id + arg.ChunkSize
@@ -229,7 +241,7 @@ func append_row_to_buffer(
 	ctx context.Context,
 	scope vfilter.Scope,
 	row vfilter.Row, id int64, buf *bytes.Buffer,
-	arg *_ElasticPluginArgs) error {
+	arg *_ElasticPluginArgs, opts *json.EncOpts) error {
 
 	row_dict := vfilter.RowToDict(ctx, scope, row)
 	index := arg.Index
@@ -243,14 +255,13 @@ func append_row_to_buffer(
 	var meta []byte
 	pipeline := arg.PipeLine
 	if pipeline != "" {
-		meta = []byte(fmt.Sprintf(`{ "index" : {"_id" : "%d", "_type": "%s", "_index": "%s", "pipeline": "%s" } }%s`,
-			id, arg.Type, index, pipeline, "\n"))
+		meta = []byte(fmt.Sprintf(`{ "index" : {"_id" : "%d", "_index": "%s", "pipeline": "%s" } }%s`,
+			id, index, pipeline, "\n"))
 	} else {
-		meta = []byte(fmt.Sprintf(`{ "index" : {"_id" : "%d", "_type": "%s", "_index": "%s"} }%s`,
-			id, arg.Type, index, "\n"))
+		meta = []byte(fmt.Sprintf(`{ "index" : {"_id" : "%d", "_index": "%s"} }%s`,
+			id, index, "\n"))
 	}
 
-	opts := vql_subsystem.EncOptsFromScope(scope)
 	data, err := json.MarshalWithOptions(row_dict, opts)
 	if err != nil {
 		return err
@@ -276,7 +287,12 @@ func send_to_elastic(
 	}
 
 	res, err := client.Bulk(bytes.NewReader(b))
-	if err != nil {
+	if err != nil && !errors.Is(err, io.EOF) {
+		scope.Log("elastic: %v", err)
+		return
+	}
+
+	if res == nil {
 		scope.Log("elastic: %v", err)
 		return
 	}
@@ -290,6 +306,7 @@ func send_to_elastic(
 	select {
 	case <-ctx.Done():
 		return
+
 	case output_chan <- ordereddict.NewDict().
 		Set("StatusCode", res.StatusCode).
 		Set("Response", response):
@@ -310,10 +327,10 @@ func (self _ElasticPlugin) Info(
 	scope vfilter.Scope,
 	type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name: "elastic_upload",
-		Doc:  "Upload rows to elastic.",
-
-		ArgType: type_map.AddType(scope, &_ElasticPluginArgs{}),
+		Name:     "elastic_upload",
+		Doc:      "Upload rows to elastic.",
+		Metadata: vql.VQLMetadata().Permissions(acls.COLLECT_SERVER).Build(),
+		ArgType:  type_map.AddType(scope, &_ElasticPluginArgs{}),
 	}
 }
 

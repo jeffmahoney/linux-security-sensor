@@ -11,6 +11,11 @@ description: |
   user's Created and LastAccess timestamp and the fact that the user
   has actually visited the site and obtained a cookie.
 
+  ## NOTES:
+
+  This artifact is deprecated in favor of
+  Generic.Forensic.SQLiteHunter and will be removed in future
+
 parameters:
   - name: cookieGlobs
     default: \AppData\Local\Google\Chrome\User Data\*\Cookies
@@ -29,13 +34,14 @@ sources:
   - query: |
         LET cookie_files = SELECT * from foreach(
           row={
-             SELECT Uid, Name AS User, Directory
+             SELECT Uid, Name AS User,
+                    expand(path=Directory) AS HomeDirectory
              FROM Artifact.Windows.Sys.Users()
              WHERE Name =~ userRegex
           },
           query={
-             SELECT User, FullPath, Mtime from glob(
-               globs=Directory + cookieGlobs)
+             SELECT User, OSPath, Mtime
+             FROM glob(root=HomeDirectory, globs=cookieGlobs)
           })
 
         SELECT * FROM foreach(row=cookie_files,
@@ -46,6 +52,6 @@ sources:
                    host_key, name, path, value,
                    base64encode(string=encrypted_value) as EncryptedValue
             FROM sqlite(
-              file=FullPath,
+              file=OSPath,
               query=cookieSQLQuery)
           })

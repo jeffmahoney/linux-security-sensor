@@ -11,7 +11,6 @@ message ArtifactEnv {
     string value = 2;
 }
 
-
 message ColumnType {
     string name = 1;
     string type = 2;
@@ -37,11 +36,18 @@ message ArtifactParameter {
     repeated string choices = 6;
 
     string friendly_name = 5;
+
+    // For type = string
+    string validating_regex = 7;
+
+    // For type = artifactset
+    string artifact_type = 8;
 }
 
 message NotebookSourceCell {
     string template = 1;
     string type = 2;
+    string name = 4;
     repeated ArtifactEnv env = 3;
 }
 
@@ -82,6 +88,7 @@ message ArtifactSource {
 }
 
 
+// Deprecated - Reports have been replaced by notebooks.
 message Report {
     option (semantic) = {
         description: "A report is generated from the output of the artifact collected. "
@@ -116,6 +123,9 @@ message Artifact {
             "Linux.Browsers.ChromeHistory";
         }];
 
+    // Aliases are other names by which the same artifact is known
+    repeated string aliases = 21;
+
     string description = 2 [(sem_type) = {
             description: "What the artifact is trying to collect."
         }];
@@ -125,6 +135,10 @@ message Artifact {
         }];
 
     repeated string reference = 5 [(sem_type) = {
+            description: "A reference for this artifact."
+        }];
+
+    repeated string references = 23 [(sem_type) = {
             description: "A reference for this artifact."
         }];
 
@@ -188,8 +202,12 @@ message Artifact {
     // Artifact was already compiled.
     bool compiled = 14;
 
-    // The artifact is built into the Velociraptor binary.
+    // The artifact is considered built in and can not be overriden by the GUI
     bool built_in = 20;
+
+    // The artifact is built into the Velociraptor binary.
+    bool compiled_in = 24;
+    bool is_alias = 22;
 }
 
 message ArtifactDescriptors {
@@ -226,6 +244,30 @@ message Tool {
     // server versions.
     bool admin_override = 7;
 
+    // Hex encoded sha256 hash of the expected hash of the file. When
+    // the server downloads the file it will check against the
+    // expected hash and refuse to download an incorrect hash.  This
+    // is a way to pin the dependency into the artifact definition to
+    // protect against supply side attacks.
+    string expected_hash = 15;
+
+    // Specify a version for the tool. This allows multiple versions
+    // of the same tool to be used at the same time.
+    string version = 16;
+
+    // If set on a request we refresh the hash by downloading the file again.
+    bool materialize = 11;
+
+    // The artifact this definition came from.
+    string artifact = 13;
+
+    // A filestore path where the file can be downloaded from - if
+    // served locally. This can be provided by the caller to AddTool()
+    // after they uploaded the file to the filestore through some
+    // other mechanism. Note this path is relative to the /public/
+    // directory.
+    string filestore_path = 4;
+
 
     // Once the tool is added with the above fields, the following
     // fields are used to keep state on it.
@@ -238,10 +280,6 @@ message Tool {
     // Only valid for local dummy inventory.
     string serve_path = 12;
 
-    // A filestore path where the file can be downloaded from - if
-    // served locally.
-    string filestore_path = 4;
-
     // The name of the cached file on the endpoint. This file will
     // persist and can be accessed again if this tool is needed in
     // future. If the file is missing (or has the wrong hash), then it
@@ -249,12 +287,19 @@ message Tool {
     string filename = 5;
 
     // Hex encoded sha256 hash of the file. Endpoints will check this
-    // hash against their fetch file to ensure it was correctly
+    // hash against their fetched file to ensure it was correctly
     // transferred.
     string hash = 6;
 
-    // If set on a request we refresh the hash.
-    bool materialize = 11;
+    // When we attempted to download the file, and the hash did not
+    // match the expected hash, we record the actual hash here. The
+    // user can then opt for trusting this hash in the GUI which will
+    // copy it into the expected hash and clear this hash.
+    string invalid_hash = 17;
+
+    // Additional versions of this tool.
+    repeated Tool versions = 14;
+
 }
 
 // Keep track of all the third party tools we know about.
@@ -268,8 +313,15 @@ message Resources {
     // Default timeout for this artifact
     uint64 timeout = 1;
     float ops_per_second = 4;
+    float cpu_limit = 5;
+    float iops_limit = 6;
 
     // Default resource use for the entire collection.
     uint64 max_rows = 2;
     uint64 max_upload_bytes = 3;
+
+    // Batching control
+    uint64 max_batch_wait = 7;
+    uint64 max_batch_rows = 8;
+    uint64 max_batch_rows_buffer = 9;
 }

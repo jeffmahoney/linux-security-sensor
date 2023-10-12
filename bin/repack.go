@@ -1,8 +1,8 @@
 // +build !aix
 
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -20,16 +20,20 @@
 package main
 
 import (
-	"bytes"
-	"compress/zlib"
-	"encoding/binary"
-	"fmt"
 	"io/ioutil"
+	"log"
 	"os"
-	"regexp"
+	"path/filepath"
 
-	"www.velocidex.com/golang/velociraptor/config"
+	"github.com/Velocidex/ordereddict"
+	errors "github.com/go-errors/errors"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	logging "www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/startup"
+	"www.velocidex.com/golang/velociraptor/uploads"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
+	"www.velocidex.com/golang/vfilter"
 )
 
 var (
@@ -39,164 +43,137 @@ var (
 	repack_command_exe = repack_command.Flag(
 		"exe", "Use an alternative exe.").String()
 
+	repack_command_msi = repack_command.Flag(
+		"msi", "Use an msi to repack (synonym to --exe).").String()
+
 	repack_command_config = repack_command.Arg(
 		"config_file", "The filename to write into the binary.").
-		Required().String()
+		Required().File()
 
-	repack_command_append = repack_command.Flag(
-		"append", "If provided we append the file to the output binary.").
-		File()
+	repack_command_binaries = repack_command.Flag(
+		"binaries", "The list of tool names to append to the binary.").
+		Strings()
 
 	repack_command_output = repack_command.Arg(
 		"output", "The filename to write the repacked binary.").
 		Required().String()
-
-	embedded_re = regexp.MustCompile(`#{3}<Begin Embedded Config>\r?\n`)
 )
 
 func doRepack() error {
-	config_obj, err := new(config.Loader).
-		WithFileLoader(*repack_command_config).
-		LoadAndValidate()
-	if err != nil {
-		return fmt.Errorf("Unable to load config file: %w", err)
+	logging.DisableLogging()
+
+	executable := *repack_command_exe
+	if executable == "" {
+		executable = *repack_command_msi
 	}
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return fmt.Errorf("Starting services: %w", err)
+	if executable == "" {
+		executable, _ = os.Executable()
 	}
+
+	// Make sure the executable path is an absolute file and we can
+	// read it.
+	if executable == "" {
+		return errors.New("Unable to find executable to repack")
+	}
+
+	abs_executable, err := filepath.Abs(executable)
+	if err != nil {
+		return err
+	}
+
+	executable = abs_executable
+
+	// Read the config file
+	config_data, err := ioutil.ReadAll(*repack_command_config)
+	if err != nil {
+		return err
+	}
+
+	config_obj := &config_proto.Config{}
+	if isConfigSpecified(os.Args) {
+		config_obj, err = APIConfigLoader.WithNullLoader().
+			LoadAndValidate()
+		if err != nil {
+			return err
+		}
+		config_obj.Services = services.GenericToolServices()
+		if config_obj.Datastore != nil && config_obj.Datastore.Location != "" {
+			config_obj.Services.IndexServer = true
+			config_obj.Services.ClientInfo = true
+			config_obj.Services.Label = true
+		}
+
+	} else {
+		config_obj.Services = services.GenericToolServices()
+	}
+
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
 
-	// Load any embedded artifacts so we can identity syntax errors
-	err = load_config_artifacts(config_obj)
 	if err != nil {
-		return fmt.Errorf("Validating config: %w", err)
+		return err
 	}
 
-	logger := logging.GetLogger(config_obj, &logging.ToolComponent)
-
-	config_fd, err := os.Open(*repack_command_config)
+	output_path, err := filepath.Abs(*repack_command_output)
 	if err != nil {
-		return fmt.Errorf("Unable to open config file: %w", err)
+		return err
+	}
+	logger := &StdoutLogWriter{}
+	builder := services.ScopeBuilder{
+		Config:     sm.Config,
+		ACLManager: acl_managers.NewRoleACLManager(sm.Config, "administrator"),
+		Uploader: &uploads.FileBasedUploader{
+			UploadDir: filepath.Dir(output_path),
+		},
+		Logger: log.New(logger, "", 0),
+		Env: ordereddict.NewDict().
+			Set("ConfigData", config_data).
+			Set("Exe", executable).
+			Set("Binaries", *repack_command_binaries).
+			Set("UploadName", filepath.Base(output_path)),
 	}
 
-	config_data, err := ioutil.ReadAll(config_fd)
+	query := `
+       SELECT repack(exe=Exe, accessor="file",
+          config=ConfigData, upload_name=UploadName) AS RepackInfo
+       FROM scope()
+`
+
+	// Repacking binaries requires a working inventory service -
+	// therefore a server config.
+	if len(*repack_command_binaries) > 0 {
+		query = `
+       SELECT repack(exe=Exe, accessor="file", binaries=Binaries,
+          config=ConfigData, upload_name=UploadName) AS RepackInfo
+       FROM scope()
+`
+	}
+
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
-		return fmt.Errorf("Unable to open config file: %w", err)
+		return err
 	}
+	scope := manager.BuildScope(builder)
+	defer scope.Close()
 
-	// Compress the string.
-	var b bytes.Buffer
-	w := zlib.NewWriter(&b)
-	_, err = w.Write(config_data)
+	statements, err := vfilter.MultiParse(query)
 	if err != nil {
-		return fmt.Errorf("Unable to write: %w", err)
-	}
-	w.Close()
-
-	if b.Len() > len(config.FileConfigDefaultYaml)-40 {
-		return fmt.Errorf("config file is too large to embed.")
+		return err
 	}
 
-	config_data = b.Bytes()
-
-	// Now pad to the end of the config.
-	for i := 0; i < len(config.FileConfigDefaultYaml)-40-len(config_data); i++ {
-		config_data = append(config_data, '#')
-	}
-
-	input := *repack_command_exe
-	if input == "" {
-		input, err = os.Executable()
+	out_fd := os.Stdout
+	for _, vql := range statements {
+		err = outputJSON(ctx, scope, vql, out_fd)
 		if err != nil {
-			return fmt.Errorf("Unable to open executable: %w", err)
+			return err
 		}
 	}
 
-	fd, err := os.Open(input)
-	if err != nil {
-		return fmt.Errorf("Unable to open executable: %w", err)
-	}
-	defer fd.Close()
-
-	outfd, err := os.OpenFile(*repack_command_output,
-		os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
-	if err != nil {
-		return fmt.Errorf("Unable to create output file: %w", err)
-	}
-
-	data, err := ioutil.ReadAll(fd)
-	if err != nil {
-		return fmt.Errorf("Unable to read executable: %w", err)
-	}
-	logger.Info("Read complete binary at %v bytes\n", len(data))
-
-	if *repack_command_append != nil {
-		// A PE file - adjust the size of the .rsrc section to
-		// cover the entire binary.
-		if string(data[0:2]) == "MZ" {
-			stat, err := (*repack_command_append).Stat()
-			if err != nil {
-				return fmt.Errorf("Unable to read appended file: %w", err)
-			}
-
-			end_of_file := int64(len(data)) + stat.Size()
-
-			// This is the IMAGE_SECTION_HEADER.Name which
-			// is also the start of IMAGE_SECTION_HEADER.
-			offset_to_rsrc := bytes.Index(data, []byte(".rsrc"))
-
-			// Found it.
-			if offset_to_rsrc > 0 {
-				// IMAGE_SECTION_HEADER.PointerToRawData is a 32 bit int.
-				start_of_rsrc_section := binary.LittleEndian.Uint32(
-					data[offset_to_rsrc+20:])
-				size_of_raw_data := uint32(end_of_file) - start_of_rsrc_section
-				binary.LittleEndian.PutUint32(
-					data[offset_to_rsrc+16:], size_of_raw_data)
-			}
-		}
-
-		appended, err := ioutil.ReadAll(*repack_command_append)
-		if err != nil {
-			return fmt.Errorf("Unable to read appended file: %w", err)
-		}
-
-		data = append(data, appended...)
-	}
-
-	match := embedded_re.FindIndex(data)
-	if match == nil {
-		return fmt.Errorf("I can not seem to locate the embedded config????")
-	}
-
-	end := match[1]
-
-	logger.Info("Write %v\n", len(data[:end]))
-	_, err = outfd.Write(data[:end])
-	if err != nil {
-		return err
-	}
-
-	logger.Info("Write %v\n", len(config_data))
-	_, err = outfd.Write(config_data)
-	if err != nil {
-		return err
-	}
-
-	logger.Info("Write %v\n", len(data[end+len(config_data):]))
-	_, err = outfd.Write(data[end+len(config_data):])
-	if err != nil {
-		return err
-	}
-
-	err = outfd.Close()
-	if err != nil {
-		return err
-	}
-
-	return os.Chmod(outfd.Name(), 0777)
+	return logger.Error
 }
 
 func init() {

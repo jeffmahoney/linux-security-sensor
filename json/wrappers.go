@@ -3,9 +3,34 @@ package json
 import (
 	"bytes"
 	"reflect"
+	"sync"
 
 	"github.com/Velocidex/json"
 )
+
+type RawMessage = json.RawMessage
+type Marshaler = json.Marshaler
+
+var (
+	EncoderCallbackSkip = json.EncoderCallbackSkip
+
+	bufferPool = sync.Pool{
+		New: func() interface{} {
+			return new(bytes.Buffer)
+		},
+	}
+)
+
+func GetBuffer() *bytes.Buffer {
+	buf := bufferPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
+	return buf
+}
+
+func PutBuffer(buf *bytes.Buffer) {
+	bufferPool.Put(buf)
+}
 
 func MarshalWithOptions(v interface{}, opts *json.EncOpts) ([]byte, error) {
 	if opts == nil {
@@ -15,7 +40,7 @@ func MarshalWithOptions(v interface{}, opts *json.EncOpts) ([]byte, error) {
 }
 
 func Marshal(v interface{}) ([]byte, error) {
-	opts := NewEncOpts()
+	opts := DefaultEncOpts()
 	return json.MarshalWithOptions(v, opts)
 }
 
@@ -44,7 +69,7 @@ func StringIndent(v interface{}) string {
 }
 
 func MarshalIndent(v interface{}) ([]byte, error) {
-	opts := NewEncOpts()
+	opts := DefaultEncOpts()
 	return MarshalIndentWithOptions(v, opts)
 }
 
@@ -53,8 +78,10 @@ func MarshalIndentWithOptions(v interface{}, opts *json.EncOpts) ([]byte, error)
 	if err != nil {
 		return nil, err
 	}
-	var buf bytes.Buffer
-	err = json.Indent(&buf, b, "", " ")
+
+	buf := GetBuffer()
+	defer PutBuffer(buf)
+	err = json.Indent(buf, b, "", " ")
 	if err != nil {
 		return nil, err
 	}
@@ -69,8 +96,11 @@ func MarshalJsonl(v interface{}) ([]byte, error) {
 
 	a_slice := reflect.ValueOf(v)
 
-	options := NewEncOpts()
-	out := bytes.Buffer{}
+	options := DefaultEncOpts()
+
+	out := GetBuffer()
+	defer PutBuffer(out)
+
 	for i := 0; i < a_slice.Len(); i++ {
 		row := a_slice.Index(i).Interface()
 		serialized, err := json.MarshalWithOptions(row, options)
@@ -80,7 +110,8 @@ func MarshalJsonl(v interface{}) ([]byte, error) {
 		out.Write(serialized)
 		out.Write([]byte{'\n'})
 	}
-	return out.Bytes(), nil
+	// Need to make a copy because the real buffer will be reused in the pool.
+	return CopySlice(out.Bytes()), nil
 }
 
 func Unmarshal(b []byte, v interface{}) error {
@@ -102,4 +133,10 @@ func MarshalIndentNormalized(v interface{}) ([]byte, error) {
 	}
 
 	return MarshalIndent(data)
+}
+
+func CopySlice(in []byte) []byte {
+	result := make([]byte, len(in))
+	copy(result, in)
+	return result
 }

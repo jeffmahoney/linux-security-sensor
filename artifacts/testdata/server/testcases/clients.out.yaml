@@ -10,49 +10,58 @@ LET _ <= SELECT label(client_id=client_id, op='remove', labels=labels), client_i
   "agent_information": {
    "version": "2019-11-07T22:08:33+10:00",
    "name": "velociraptor",
-   "build_time": ""
+   "build_time": "",
+   "build_url": ""
   },
   "os_info": {
    "system": "windows",
    "hostname": "DESKTOP-BP4S7TF",
    "release": "Microsoft Windows 10 Enterprise Evaluation10.0.18362 Build 18362",
-   "version": "",
    "machine": "amd64",
-   "kernel": "",
    "fqdn": "DESKTOP-BP4S7TF",
-   "install_date": 0,
-   "libc_ver": "",
-   "architecture": ""
+   "mac_addresses": []
   },
   "first_seen_at": 0,
   "last_seen_at": 1638362977493088,
-  "last_booted_at": 0,
-  "last_clock": 0,
-  "last_crash_at": 0,
   "last_ip": "192.168.1.112:60239",
   "last_interrogate_flow_id": "F.BN21C82J8DM8K",
   "last_interrogate_artifact_name": "",
-  "last_ip_class": "UNKNOWN",
-  "labels": []
+  "labels": [],
+  "last_hunt_timestamp": 0,
+  "last_event_table_version": 0,
+  "last_label_timestamp": 0
  }
 ]SELECT client_id, timestamp(epoch=create_time/1000000) as CreateTime, request.artifacts as Artifacts, session_id as Flow FROM flows(client_id='C.4f5e52adf0a337a9') WHERE Artifacts =~ "Netstat"[
  {
-  "client_id": "C.56a8dfd31eb1fa6f",
+  "client_id": "C.4f5e52adf0a337a9",
   "CreateTime": "2020-08-03T01:24:30.468293905Z",
   "Artifacts": [
    "Windows.Network.NetstatEnriched"
   ],
   "Flow": "F.BSJMEJIPT6P9I"
  }
-]SELECT client_set_metadata(client_id='C.4f5e52adf0a337a9', Foo='Bar', Bar='Baz', Invalid=5) FROM scope()[
+]SELECT client_set_metadata(client_id='C.4f5e52adf0a337a9', Foo='Bar', Bar='Baz', IntConvertedToString=5) FROM scope()[
  {
-  "client_set_metadata(client_id='C.4f5e52adf0a337a9', Foo='Bar', Bar='Baz', Invalid=5)": true
+  "client_set_metadata(client_id='C.4f5e52adf0a337a9', Foo='Bar', Bar='Baz', IntConvertedToString=5)": true
  }
 ]SELECT client_metadata(client_id='C.4f5e52adf0a337a9') FROM scope()[
  {
   "client_metadata(client_id='C.4f5e52adf0a337a9')": {
    "Foo": "Bar",
-   "Bar": "Baz"
+   "Bar": "Baz",
+   "IntConvertedToString": "5"
+  }
+ }
+]SELECT client_set_metadata(client_id='C.4f5e52adf0a337a9', AnotherItem="Hello", Bar=NULL) FROM scope()[
+ {
+  "client_set_metadata(client_id='C.4f5e52adf0a337a9', AnotherItem=\"Hello\", Bar=NULL)": true
+ }
+]SELECT client_metadata(client_id='C.4f5e52adf0a337a9') FROM scope()[
+ {
+  "client_metadata(client_id='C.4f5e52adf0a337a9')": {
+   "Foo": "Bar",
+   "IntConvertedToString": "5",
+   "AnotherItem": "Hello"
   }
  }
 ]

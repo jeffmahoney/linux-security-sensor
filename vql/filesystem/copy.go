@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -24,20 +24,22 @@ import (
 	"strings"
 
 	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/artifacts"
-	"www.velocidex.com/golang/velociraptor/glob"
 	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 type CopyFunctionArgs struct {
-	Filename    string `vfilter:"required,field=filename,doc=The file to copy from."`
-	Accessor    string `vfilter:"optional,field=accessor,doc=The accessor to use"`
-	Destination string `vfilter:"required,field=dest,doc=The destination file to write."`
-	Permissions string `vfilter:"optional,field=permissions,doc=Required permissions (e.g. 'x')."`
-	Append      bool   `vfilter:"optional,field=append,doc=If true we append to the target file otherwise truncate it"`
+	Filename    *accessors.OSPath `vfilter:"required,field=filename,doc=The file to copy from."`
+	Accessor    string            `vfilter:"optional,field=accessor,doc=The accessor to use"`
+	Destination string            `vfilter:"required,field=dest,doc=The destination file to write."`
+	Permissions string            `vfilter:"optional,field=permissions,doc=Required permissions (e.g. 'x')."`
+	Append      bool              `vfilter:"optional,field=append,doc=If true we append to the target file otherwise truncate it"`
 }
 
 type CopyFunction struct{}
@@ -72,13 +74,13 @@ func (self *CopyFunction) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
-	accessor, err := glob.GetAccessor(arg.Accessor, scope)
+	accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 	if err != nil {
 		scope.Log("copy: %v", err)
 		return vfilter.Null{}
 	}
 
-	fd, err := accessor.Open(arg.Filename)
+	fd, err := accessor.OpenWithOSPath(arg.Filename)
 	if err != nil {
 		scope.Log("copy: Failed to open %v: %v",
 			arg.Filename, err)
@@ -109,6 +111,14 @@ func (self *CopyFunction) Call(ctx context.Context,
 			arg.Destination)
 	}
 
+	// We are about to write on the filesystem - make sure the user
+	// has write access.
+	err = vql_subsystem.CheckAccess(scope, acls.FILESYSTEM_WRITE)
+	if err != nil {
+		scope.Log("copy: %s", err.Error())
+		return vfilter.Null{}
+	}
+
 	flags := os.O_RDWR | os.O_CREATE | os.O_TRUNC
 	if arg.Append {
 		flags = os.O_WRONLY | os.O_APPEND
@@ -133,9 +143,10 @@ func (self *CopyFunction) Call(ctx context.Context,
 
 func (self CopyFunction) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "copy",
-		Doc:     "Copy a file.",
-		ArgType: type_map.AddType(scope, &CopyFunctionArgs{}),
+		Name:     "copy",
+		Doc:      "Copy a file.",
+		ArgType:  type_map.AddType(scope, &CopyFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_WRITE, acls.FILESYSTEM_READ).Build(),
 	}
 }
 

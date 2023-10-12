@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -28,7 +28,7 @@ import (
 	"net"
 	"time"
 
-	errors "github.com/pkg/errors"
+	errors "github.com/go-errors/errors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/crypto/utils"
 	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
@@ -37,6 +37,9 @@ import (
 type CertBundle struct {
 	Cert       string
 	PrivateKey string
+
+	PrivateKeyObj interface{}
+	Certificate   *x509.Certificate
 }
 
 func GenerateCACert(rsaBits int) (*CertBundle, error) {
@@ -82,12 +85,18 @@ func GenerateCACert(rsaBits int) (*CertBundle, error) {
 		rand.Reader, &template, &template,
 		&priv.PublicKey,
 		priv)
-
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, errors.Wrap(err, 0)
+	}
+
+	x509_cert, err := x509.ParseCertificate(derBytes)
+	if err != nil {
+		return nil, errors.Wrap(err, 0)
 	}
 
 	return &CertBundle{
+		PrivateKeyObj: priv,
+		Certificate:   x509_cert,
 		PrivateKey: string(pem.EncodeToMemory(
 			&pem.Block{
 				Type:  "RSA PRIVATE KEY",
@@ -112,8 +121,14 @@ func GenerateServerCert(config_obj *config_proto.Config, name string) (*CertBund
 		return nil, err
 	}
 
+	days_valid := int64(365)
+	if config_obj.Defaults != nil &&
+		config_obj.Defaults.CertificateValidityDays > 0 {
+		days_valid = config_obj.Defaults.CertificateValidityDays
+	}
+
 	start_time := time.Now()
-	end_time := start_time.Add(365 * 24 * time.Hour)
+	end_time := start_time.Add(time.Duration(days_valid) * 24 * time.Hour)
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
@@ -168,12 +183,18 @@ func GenerateServerCert(config_obj *config_proto.Config, name string) (*CertBund
 		rand.Reader, &template, ca_cert,
 		&priv.PublicKey,
 		ca_private_key)
-
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, errors.Wrap(err, 0)
+	}
+
+	x509_cert, err := x509.ParseCertificate(derBytes)
+	if err != nil {
+		return nil, errors.Wrap(err, 0)
 	}
 
 	return &CertBundle{
+		PrivateKeyObj: priv,
+		Certificate:   x509_cert,
 		PrivateKey: string(pem.EncodeToMemory(
 			&pem.Block{
 				Type:  "RSA PRIVATE KEY",
@@ -208,8 +229,15 @@ func ReissueServerCert(config_obj *config_proto.Config,
 		return nil, err
 	}
 
+	days_valid := int64(365)
+	if config_obj.Defaults != nil &&
+		config_obj.Defaults.CertificateValidityDays > 0 {
+		days_valid = config_obj.Defaults.CertificateValidityDays
+	}
+
 	template.NotBefore = time.Now()
-	template.NotAfter = template.NotBefore.Add(365 * 24 * time.Hour)
+	template.NotAfter = template.NotBefore.Add(
+		time.Duration(days_valid) * 24 * time.Hour)
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	template.SerialNumber, err = rand.Int(rand.Reader, serialNumberLimit)
@@ -248,7 +276,7 @@ func ReissueServerCert(config_obj *config_proto.Config,
 		ca_private_key)
 
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, errors.Wrap(err, 0)
 	}
 
 	return &CertBundle{

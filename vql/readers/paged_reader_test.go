@@ -13,17 +13,21 @@ import (
 	"github.com/Velocidex/ordereddict"
 	"github.com/alecthomas/assert"
 	"github.com/stretchr/testify/suite"
+	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/constants"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
 	"www.velocidex.com/golang/velociraptor/vtesting"
 	"www.velocidex.com/golang/vfilter"
+
+	_ "www.velocidex.com/golang/velociraptor/accessors/file"
 )
 
 type TestSuite struct {
 	suite.Suite
 	scope     vfilter.Scope
 	tmp_dir   string
-	filenames []string
+	filenames []*accessors.OSPath
 	pool      *ReaderPool
 }
 
@@ -31,6 +35,7 @@ func (self *TestSuite) SetupTest() {
 	self.scope = vql_subsystem.MakeScope()
 	self.scope.AppendVars(ordereddict.NewDict().
 		Set(vql_subsystem.CACHE_VAR, vql_subsystem.NewScopeCache()).
+		Set(vql_subsystem.ACL_MANAGER_VAR, acl_managers.NullACLManager{}).
 		Set(constants.SCOPE_ROOT, self.scope))
 
 	// Make a very small pool
@@ -42,14 +47,19 @@ func (self *TestSuite) SetupTest() {
 
 	// Create 10 files with data
 	buff := make([]byte, 4)
-	self.filenames = make([]string, 0, 10)
+	self.filenames = make([]*accessors.OSPath, 0, 10)
+	accessor, err := accessors.GetAccessor("file", self.scope)
+	assert.NoError(self.T(), err)
 
 	for i := 0; i < 10; i++ {
-		filename := fmt.Sprintf("%s/Test%x.txt", self.tmp_dir, i)
-		self.filenames = append(self.filenames, filename)
+		filename, err := accessor.ParsePath(self.tmp_dir)
+		assert.NoError(self.T(), err)
+
+		file := filename.Append(fmt.Sprintf("Test%x.txt", i))
+		self.filenames = append(self.filenames, file)
 
 		out_fd, err := os.OpenFile(
-			filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+			file.String(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 		assert.NoError(self.T(), err)
 
 		binary.LittleEndian.PutUint32(buff, uint32(i))
@@ -70,9 +80,11 @@ func (self *TestSuite) TestPagedReader() {
 	buff := make([]byte, 4)
 
 	for i := 0; i < 10; i++ {
-		reader, err := NewPagedReader(self.scope, "file", self.filenames[i], 100)
+		reader, err := NewPagedReader(
+			self.scope, "file", self.filenames[i], 100)
 		assert.NoError(self.T(), err)
-		reader.ReadAt(buff, 0)
+		_, err = reader.ReadAt(buff, 0)
+		assert.NoError(self.T(), err)
 		assert.Equal(self.T(), binary.LittleEndian.Uint32(buff), uint32(i))
 		readers = append(readers, reader)
 	}
@@ -80,7 +92,8 @@ func (self *TestSuite) TestPagedReader() {
 	for i := 0; i < 10; i++ {
 		reader, err := NewPagedReader(self.scope, "file", self.filenames[i], 100)
 		assert.NoError(self.T(), err)
-		reader.ReadAt(buff, 0)
+		_, err = reader.ReadAt(buff, 0)
+		assert.NoError(self.T(), err)
 		assert.Equal(self.T(), binary.LittleEndian.Uint32(buff), uint32(i))
 	}
 
@@ -89,7 +102,9 @@ func (self *TestSuite) TestPagedReader() {
 		reader, err := NewPagedReader(self.scope, "file", self.filenames[1], 100)
 		assert.NoError(self.T(), err)
 
-		reader.ReadAt(buff, 0)
+		_, err = reader.ReadAt(buff, 0)
+		assert.NoError(self.T(), err)
+
 		assert.Equal(self.T(), binary.LittleEndian.Uint32(buff), uint32(1))
 	}
 
@@ -100,14 +115,17 @@ func (self *TestSuite) TestPagedReader() {
 
 	for i := 0; i < 10; i++ {
 		reader.Close()
-		reader.ReadAt(buff, 0)
+		_, err = reader.ReadAt(buff, 0)
+		assert.NoError(self.T(), err)
+
 		assert.Equal(self.T(), binary.LittleEndian.Uint32(buff), uint32(1))
 	}
 
 	// Make the reader's timeout very short.
 	reader.SetLifetime(10 * time.Millisecond)
 	reader.Close()
-	reader.ReadAt(buff, 0)
+	_, err = reader.ReadAt(buff, 0)
+	assert.NoError(self.T(), err)
 	assert.Equal(self.T(), binary.LittleEndian.Uint32(buff), uint32(1))
 
 	// Wait here until the reader closes itself by itself.
@@ -119,17 +137,24 @@ func (self *TestSuite) TestPagedReader() {
 	})
 
 	// Next read still works.
-	reader.ReadAt(buff, 0)
+	_, err = reader.ReadAt(buff, 0)
+	assert.NoError(self.T(), err)
 	assert.Equal(self.T(), binary.LittleEndian.Uint32(buff), uint32(1))
 
 	// Close the scope - this should close all the pool
 	self.scope.Close()
 
 	// Destoying the scope should close the readers.
-	assert.Nil(self.T(), reader.reader)
+	vtesting.WaitUntil(time.Second, self.T(), func() bool {
+		reader.mu.Lock()
+		defer reader.mu.Unlock()
+
+		return reader.reader == nil
+	})
 
 	// No outstanding readers
-	assert.Equal(self.T(), int64(0), self.pool.lru.Size())
+	metrics := self.pool.lru.GetMetrics()
+	assert.Equal(self.T(), int64(0), metrics.Size)
 
 }
 

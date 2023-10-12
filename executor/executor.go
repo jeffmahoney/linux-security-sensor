@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -20,57 +20,26 @@ package executor
 import (
 	"context"
 	"fmt"
-	"log"
 	"runtime/debug"
 	"sync"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	"www.velocidex.com/golang/velociraptor/actions"
-	"www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/utils"
 
+	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/responder"
 )
 
-var (
-	Canceller = &canceller{
-		cancelled: make(map[string]bool),
-	}
-)
-
-// Keep track of cancelled flows client side. NOTE We never expire the
-// map of cancelled flows but it is expected to be very uncommon.
-type canceller struct {
-	mu        sync.Mutex
-	cancelled map[string]bool
-}
-
-func (self *canceller) Cancel(flow_id string) {
-	// Some flows are non-cancellable.
-	switch flow_id {
-	case constants.MONITORING_WELL_KNOWN_FLOW:
-		return
-	}
-
-	self.mu.Lock()
-	self.cancelled[flow_id] = true
-	self.mu.Unlock()
-}
-
-func (self *canceller) IsCancelled(flow_id string) bool {
-	self.mu.Lock()
-	_, pres := self.cancelled[flow_id]
-	self.mu.Unlock()
-
-	return pres
-}
-
 type Executor interface {
+	ClientId() string
+
 	// These are called by the executor code.
-	ReadFromServer() *crypto_proto.VeloMessage
 	SendToServer(message *crypto_proto.VeloMessage)
 
 	// These two are called by the comms module.
@@ -82,103 +51,45 @@ type Executor interface {
 
 	// Read a single response from the executor to be sent to the server.
 	ReadResponse() <-chan *crypto_proto.VeloMessage
+
+	FlowManager() *responder.FlowManager
+	EventManager() *actions.EventTable
+
+	GetClientInfo() *actions_proto.ClientInfo
 }
 
 // A concerete implementation of a client executor.
 
-// _FlowContext keeps track of all the queries running as part of a
-// given flow. When the flow is cancelled we cancel all these queries.
-type _FlowContext struct {
-	cancel  func()
-	id      int
-	flow_id string
-}
-
 type ClientExecutor struct {
+	client_id string
+
+	ctx      context.Context
+	wg       *sync.WaitGroup
 	Inbound  chan *crypto_proto.VeloMessage
 	Outbound chan *crypto_proto.VeloMessage
 
-	// Map all the contexts with the flow id.
-	mu         sync.Mutex
 	config_obj *config_proto.Config
-	in_flight  map[string][]*_FlowContext
-	next_id    int
 
 	concurrency *utils.Concurrency
+
+	flow_manager  *responder.FlowManager
+	event_manager *actions.EventTable
 }
 
-func (self *ClientExecutor) Cancel(
-	ctx context.Context, flow_id string, responder *responder.Responder) bool {
-	if Canceller.IsCancelled(flow_id) {
-		return false
-	}
-
-	self.mu.Lock()
-	contexts, ok := self.in_flight[flow_id]
-	if ok {
-		contexts = contexts[:]
-	}
-	self.mu.Unlock()
-
-	if ok {
-		// Cancel all existing queries.
-		Canceller.Cancel(flow_id)
-		for _, flow_ctx := range contexts {
-			flow_ctx.cancel()
-		}
-
-		return true
-	}
-
-	return ok
+func (self *ClientExecutor) GetClientInfo() *actions_proto.ClientInfo {
+	return actions.GetClientInfo(self.ctx, self.config_obj)
 }
 
-func (self *ClientExecutor) _FlowContext(flow_id string) (context.Context, *_FlowContext) {
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	ctx, cancel := context.WithCancel(context.Background())
-
-	result := &_FlowContext{
-		flow_id: flow_id,
-		cancel:  cancel,
-		id:      self.next_id,
-	}
-	self.next_id++
-
-	contexts, ok := self.in_flight[flow_id]
-	if ok {
-		contexts = append(contexts, result)
-	} else {
-		contexts = []*_FlowContext{result}
-	}
-	self.in_flight[flow_id] = contexts
-
-	return ctx, result
+func (self *ClientExecutor) FlowManager() *responder.FlowManager {
+	return self.flow_manager
 }
 
-// _CloseContext removes the flow_context from the in_flight map.
-// Note: There are multiple queries tied to the same flow id but all
-// of them need to be cancelled when the flow is cancelled.
-func (self *ClientExecutor) _CloseContext(flow_context *_FlowContext) {
-	self.mu.Lock()
-	defer self.mu.Unlock()
+func (self *ClientExecutor) EventManager() *actions.EventTable {
+	return self.event_manager
+}
 
-	contexts, ok := self.in_flight[flow_context.flow_id]
-	if ok {
-		new_context := make([]*_FlowContext, 0, len(contexts))
-		for i := 0; i < len(contexts); i++ {
-			if contexts[i].id != flow_context.id {
-				new_context = append(new_context, contexts[i])
-			}
-		}
-
-		if len(new_context) == 0 {
-			delete(self.in_flight, flow_context.flow_id)
-		} else {
-			self.in_flight[flow_context.flow_id] = new_context
-		}
-	}
+func (self *ClientExecutor) ClientId() string {
+	return self.client_id
 }
 
 // Blocks until a request is received from the server. Called by the
@@ -202,28 +113,6 @@ func (self *ClientExecutor) ReadResponse() <-chan *crypto_proto.VeloMessage {
 	return self.Outbound
 }
 
-func makeErrorResponse(output chan *crypto_proto.VeloMessage,
-	req *crypto_proto.VeloMessage, message string) {
-	output <- &crypto_proto.VeloMessage{
-		SessionId: req.SessionId,
-		RequestId: constants.LOG_SINK,
-		LogMessage: &crypto_proto.LogMessage{
-			Message:   message,
-			Timestamp: uint64(time.Now().UTC().UnixNano() / 1000),
-		},
-	}
-
-	output <- &crypto_proto.VeloMessage{
-		SessionId:  req.SessionId,
-		RequestId:  req.RequestId,
-		ResponseId: 1,
-		Status: &crypto_proto.GrrStatus{
-			Status:       crypto_proto.GrrStatus_GENERIC_ERROR,
-			ErrorMessage: message,
-		},
-	}
-}
-
 func (self *ClientExecutor) processRequestPlugin(
 	config_obj *config_proto.Config,
 	ctx context.Context,
@@ -242,60 +131,50 @@ func (self *ClientExecutor) processRequestPlugin(
 
 	// Never serve unauthenticated requests.
 	if req.AuthState != crypto_proto.VeloMessage_AUTHENTICATED {
-		log.Printf("Unauthenticated")
-		makeErrorResponse(self.Outbound,
-			req, fmt.Sprintf("Unauthenticated message received: %v.", req))
-		return
-	}
-
-	// Handle the requests. This used to be a plugin registration
-	// process but there are very few plugins any more and so it
-	// is easier to hard code this.
-	responder := responder.NewResponder(config_obj, req, self.Outbound)
-
-	if req.VQLClientAction != nil {
-		// Control concurrency on the executor only.
-		if !req.Urgent {
-			cancel, err := self.concurrency.StartConcurrencyControl(ctx)
-			if err != nil {
-				responder.RaiseError(ctx, fmt.Sprintf("%v", err))
-				return
-			}
-			defer cancel()
-		}
-		actions.VQLClientAction{}.StartQuery(
-			config_obj, ctx, responder, req.VQLClientAction)
-		return
-	}
-
-	if req.UpdateEventTable != nil {
-		actions.UpdateEventTable{}.Run(
-			config_obj, ctx, responder, req.UpdateEventTable)
-		return
-	}
-
-	if req.UpdateForeman != nil {
-		actions.UpdateForeman{}.Run(
-			config_obj, ctx, responder, req.UpdateForeman)
+		responder.MakeErrorResponse(self.Outbound,
+			req.SessionId,
+			fmt.Sprintf("Unauthenticated message received: %v.", req))
 		return
 	}
 
 	if req.Cancel != nil {
-		// Only log when the flow is not already cancelled.
-		if self.Cancel(ctx, req.SessionId, responder) {
-			makeErrorResponse(self.Outbound,
-				req, fmt.Sprintf("Cancelled all inflight queries for flow %v",
-					req.SessionId))
-		}
+		// Try to cancel the flow and send a message if it worked
+		self.flow_manager.Cancel(ctx, req.SessionId)
 		return
 	}
 
-	makeErrorResponse(self.Outbound,
-		req, fmt.Sprintf("Unsupported payload for message: %v", req))
+	if req.FlowRequest != nil {
+		self.ProcessFlowRequest(ctx, config_obj, req)
+		return
+	}
+
+	if req.UpdateEventTable != nil {
+		self.event_manager.UpdateEventTable(
+			self.ctx, self.wg, config_obj,
+			self.Outbound, req.UpdateEventTable)
+		return
+	}
+
+	// This is the old deprecated VQLClientAction that is sent for old
+	// client compatibility. New clients ignore this and only process
+	// a FlowRequest message.
+	if req.VQLClientAction != nil {
+		return
+	}
+
+	// This action is deprecated now.
+	if req.UpdateForeman != nil {
+		return
+	}
+
+	responder.MakeErrorResponse(self.Outbound,
+		req.SessionId, fmt.Sprintf(
+			"Unsupported payload for message: %v", json.MustMarshalString(req)))
 }
 
 func NewClientExecutor(
 	ctx context.Context,
+	client_id string,
 	config_obj *config_proto.Config) (*ClientExecutor, error) {
 
 	level := int(config_obj.Client.Concurrency)
@@ -303,13 +182,21 @@ func NewClientExecutor(
 		level = 2
 	}
 
-	result := &ClientExecutor{
-		Inbound:     make(chan *crypto_proto.VeloMessage, 10),
-		Outbound:    make(chan *crypto_proto.VeloMessage, 10),
-		in_flight:   make(map[string][]*_FlowContext),
-		config_obj:  config_obj,
-		concurrency: utils.NewConcurrencyControl(level, time.Hour),
+	wg := &sync.WaitGroup{}
+	self := &ClientExecutor{
+		ctx:          ctx,
+		client_id:    client_id,
+		Inbound:      make(chan *crypto_proto.VeloMessage, 10),
+		Outbound:     make(chan *crypto_proto.VeloMessage, 10),
+		concurrency:  utils.NewConcurrencyControl(level, time.Hour),
+		wg:           wg,
+		config_obj:   config_obj,
+		flow_manager: responder.NewFlowManager(ctx, config_obj),
 	}
+
+	// Install and initialize the event manager
+	self.event_manager = actions.NewEventTable(ctx, wg, config_obj)
+	self.event_manager.StartFromWriteback(ctx, wg, config_obj, self.Outbound)
 
 	// Drain messages from server and execute them, pushing
 	// results to the output channel.
@@ -318,11 +205,8 @@ func NewClientExecutor(
 		// channels. The executed queries should finish by
 		// themselves when the context is done.
 
-		// defer close(result.Outbound)
-
 		// Do not exit until all goroutines have finished.
-		wg := &sync.WaitGroup{}
-		defer wg.Wait()
+		defer self.wg.Wait()
 
 		logger := logging.GetLogger(config_obj, &logging.ClientComponent)
 
@@ -334,33 +218,46 @@ func NewClientExecutor(
 			case <-ctx.Done():
 				return
 
-			// Pump messages from input channel and
-			// process each request.
-			case req, ok := <-result.Inbound:
+			// Pump messages from input channel and process each
+			// request.
+			case req, ok := <-self.Inbound:
 				if !ok {
 					return
+				}
+
+				// The server sets both VQLClientAction and
+				// FlowRequest members on some messages for backwards
+				// compatibility. We strip the old VQLClientAction
+				// because we dont use it.
+
+				// This message has VQLClientAction and no FlowRequest
+				// - we can not use it - it is for the old clients.
+				if req.VQLClientAction != nil && req.FlowRequest == nil {
+					continue
 				}
 
 				// Ignore unauthenticated messages - the
 				// server should never send us those.
 				if req.AuthState == crypto_proto.VeloMessage_AUTHENTICATED {
-					// Each request has its own context.
-					ctx, flow_context := result._FlowContext(
-						req.SessionId)
-					logger.Debug("Received request: %v", req)
-
-					wg.Add(1)
+					self.wg.Add(1)
 					go func() {
-						defer wg.Done()
+						defer self.wg.Done()
 
-						result.processRequestPlugin(
-							config_obj, ctx, req)
-						result._CloseContext(flow_context)
+						DebugMessage(req, logger)
+						self.processRequestPlugin(config_obj, ctx, req)
 					}()
 				}
 			}
 		}
 	}()
 
-	return result, nil
+	return self, nil
+}
+
+func DebugMessage(req *crypto_proto.VeloMessage, logger *logging.LogContext) {
+	if logger.IsEnabled(logging.DEBUG) {
+		req_copy := proto.Clone(req).(*crypto_proto.VeloMessage)
+		req_copy.VQLClientAction = nil
+		logger.Debug("Received request: %v", req_copy)
+	}
 }

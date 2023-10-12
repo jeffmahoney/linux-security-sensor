@@ -1,4 +1,4 @@
-SELECT basename(path=FullPath) AS Name, parse_pe(file=FullPath) as PEInfo FROM glob(globs=srcDir + "/artifacts/**10/*.{exe,sys}") WHERE PEInfo.ImpHash =~ "f34d5f2d4577"[
+SELECT basename(path=OSPath) AS Name, parse_pe(file=OSPath) as PEInfo FROM glob(globs=srcDir + "/artifacts/**10/*.{exe,sys}") WHERE PEInfo.ImpHash =~ "f34d5f2d4577"[
  {
   "Name": "3DBuilder.ResourceResolver.exe",
   "PEInfo": {
@@ -11,6 +11,50 @@ SELECT basename(path=FullPath) AS Name, parse_pe(file=FullPath) as PEInfo FROM g
    },
    "GUIDAge": "84068848695B4DFDA86ECCE04021A1A91",
    "PDB": "C:\\BA\\2821\\i\\obj\\resourceresolver.csproj__1458271508\\Release\\x64\\3DBuilder.ResourceResolver.pdb",
+   "Directories": {
+    "Base_Relocation_Directory": {
+     "Timestamp": "1970-01-01T00:00:00Z",
+     "TimestampRaw": 0,
+     "Size": 12,
+     "FileAddress": 24576,
+     "SectionName": ""
+    },
+    "DotNet_Directory": {
+     "Timestamp": "1970-03-23T22:06:33Z",
+     "TimestampRaw": 7077993,
+     "Size": 72,
+     "FileAddress": 8200,
+     "SectionName": ".rsrc"
+    },
+    "Debug_Directory": {
+     "Timestamp": "1970-01-01T00:00:00Z",
+     "TimestampRaw": 0,
+     "Size": 28,
+     "FileAddress": 14944,
+     "SectionName": ""
+    },
+    "IAT_Directory": {
+     "Timestamp": "1970-02-21T13:54:59Z",
+     "TimestampRaw": 4456499,
+     "Size": 8,
+     "FileAddress": 8192,
+     "SectionName": ".rsrc"
+    },
+    "Import_Directory": {
+     "Timestamp": "1970-01-01T00:00:00Z",
+     "TimestampRaw": 0,
+     "Size": 79,
+     "FileAddress": 15256,
+     "SectionName": ""
+    },
+    "Resource_Directory": {
+     "Timestamp": "1970-01-01T00:00:00Z",
+     "TimestampRaw": 0,
+     "Size": 1028,
+     "FileAddress": 16384,
+     "SectionName": ""
+    }
+   },
    "Sections": [
     {
      "Perm": "xr-",
@@ -71,20 +115,20 @@ SELECT basename(path=FullPath) AS Name, parse_pe(file=FullPath) as PEInfo FROM g
    }
   }
  }
-]SELECT filter(list=parse_pe(file=FullPath).Imports, regex='MmGetPhysicalMemoryRanges') FROM glob(globs=srcDir + "/artifacts/**10/*.sys")[
+]SELECT filter(list=parse_pe(file=OSPath).Imports, regex='MmGetPhysicalMemoryRanges') FROM glob(globs=srcDir + "/artifacts/**10/*.sys")[
  {
-  "filter(list=parse_pe(file=FullPath).Imports, regex='MmGetPhysicalMemoryRanges')": [
+  "filter(list=parse_pe(file=OSPath).Imports, regex='MmGetPhysicalMemoryRanges')": [
    "ntoskrnl.exe!MmGetPhysicalMemoryRanges"
   ]
  }
-]LET X = SELECT basename(path=FullPath) AS Name, parse_pe(file=FullPath) as PEInfo FROM glob(globs=srcDir + "/artifacts/**10/*.{exe,sys}")[]SELECT PEInfo.VersionInformation.CompanyName AS CompanyName FROM X WHERE PEInfo.VersionInformation AND CompanyName =~ "Microsoft"[
+]LET X = SELECT basename(path=OSPath) AS Name, parse_pe(file=OSPath) as PEInfo FROM glob(globs=srcDir + "/artifacts/**10/*.{exe,sys}")[]SELECT PEInfo.VersionInformation.CompanyName AS CompanyName FROM X WHERE PEInfo.VersionInformation AND CompanyName =~ "Microsoft"[
  {
   "CompanyName": "Microsoft Corporation"
  },
  {
   "CompanyName": "Microsoft Corporation"
  }
-]SELECT Name FROM glob(globs=srcDir + "/artifacts/**10/*.{sys,exe}") WHERE "ntoskrnl.exe!MmGetSystemRoutineAddress" IN parse_pe(file=FullPath).Imports[
+]SELECT Name FROM glob(globs=srcDir + "/artifacts/**10/*.{sys,exe}") WHERE "ntoskrnl.exe!MmGetSystemRoutineAddress" IN parse_pe(file=OSPath).Imports[
  {
   "Name": "winpmem_x64.sys"
  }
@@ -129,7 +173,7 @@ SELECT basename(path=FullPath) AS Name, parse_pe(file=FullPath) as PEInfo FROM g
   },
   "_Source": "Windows.Detection.BinaryRename"
  }
-]LET X = SELECT parse_pe(file=FullPath) as PEInfo FROM glob(globs=srcDir + "/artifacts/**/winpmem*.sys")[]SELECT PEInfo.Authenticode AS Authenticode, PEInfo.AuthenticodeHash AS AuthenticodeHash FROM X[
+]LET X = SELECT parse_pe(file=OSPath) as PEInfo FROM glob(globs=srcDir + "/artifacts/**/winpmem*.sys")[]SELECT PEInfo.Authenticode AS Authenticode, PEInfo.AuthenticodeHash AS AuthenticodeHash FROM X[
  {
   "Authenticode": {
    "Signer": {

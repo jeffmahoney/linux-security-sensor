@@ -10,14 +10,12 @@ import (
 
 func (self *PathManagerTestSuite) TestNotebookPathManager() {
 	manager := paths.NewNotebookPathManager("N.123")
-	manager.Clock = &utils.MockClock{
-		MockNow: time.Unix(1000000000, 0).UTC(),
-	}
+	manager.Clock = utils.NewMockClock(time.Unix(1000000000, 0).UTC())
 
 	assert.Equal(self.T(), "/ds/notebooks/N.123.json.db",
 		self.getDatastorePath(manager.Path()))
 
-	assert.Equal(self.T(), "/fs/notebooks/N.123/files/NA.123%2Fimage.png",
+	assert.Equal(self.T(), "/fs/notebooks/N.123/uploads/attach%2FNA.123%2Fimage.png",
 		self.getFilestorePath(manager.Attachment("NA.123/image.png")))
 
 	// Exports are available in the (authenticated) downloads directory.

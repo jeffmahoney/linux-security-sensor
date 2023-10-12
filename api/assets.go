@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -25,33 +25,37 @@ import (
 	"time"
 
 	"github.com/gorilla/csrf"
+	"github.com/lpar/gzipped"
 	"www.velocidex.com/golang/velociraptor/api/proto"
+	utils "www.velocidex.com/golang/velociraptor/api/utils"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/gui/velociraptor"
 	gui_assets "www.velocidex.com/golang/velociraptor/gui/velociraptor"
-	users "www.velocidex.com/golang/velociraptor/users"
+	"www.velocidex.com/golang/velociraptor/services"
 )
 
 func install_static_assets(config_obj *config_proto.Config, mux *http.ServeMux) {
-	base := ""
-	if config_obj.GUI != nil {
-		base = config_obj.GUI.BasePath
-	}
-	dir := base + "/app/"
-	mux.Handle(dir, http.StripPrefix(dir, http.FileServer(gui_assets.HTTP)))
+	base := utils.GetBasePath(config_obj)
+	dir := utils.Join(base, "/app/")
+	mux.Handle(dir, ipFilter(config_obj, http.StripPrefix(
+		dir, gzipped.FileServer(NewCachedFilesystem(gui_assets.HTTP)))))
+
 	mux.Handle("/favicon.png",
-		http.RedirectHandler(base+"/static/images/favicon.ico",
+		http.RedirectHandler(utils.Join(base, "/favicon.ico"),
 			http.StatusMovedPermanently))
 }
 
 func GetTemplateHandler(
 	config_obj *config_proto.Config, template_name string) (http.Handler, error) {
+	gui_assets.Init()
+
 	data, err := gui_assets.ReadFile(template_name)
 	if err != nil {
 		// It is possible that the binary was not built with the GUI
 		// app. This is not a fatal error but it is not very useful :-).
 		data = []byte(
 			`<html><body>
-  <h1>This binary was not build with GUI support!</h1>
+  <h1>This binary was not built with GUI support!</h1>
 
   Search for building instructions on https://docs.velociraptor.app/
 </body></html>`)
@@ -62,8 +66,6 @@ func GetTemplateHandler(
 		return nil, err
 	}
 
-	base := config_obj.GUI.BasePath
-
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		userinfo := GetUserInfo(r.Context(), config_obj)
 
@@ -73,18 +75,20 @@ func GetTemplateHandler(
 			return
 		}
 
-		user_options, err := users.GetUserOptions(config_obj, userinfo.Name)
+		users := services.GetUserManager()
+		user_options, err := users.GetUserOptions(r.Context(), userinfo.Name)
 		if err != nil {
 			// Options may not exist yet
 			user_options = &proto.SetGUIOptionsRequest{}
 		}
 
-		args := _templateArgs{
+		args := velociraptor.HTMLtemplateArgs{
 			Timestamp: time.Now().UTC().UnixNano() / 1000,
 			CsrfToken: csrf.Token(r),
-			BasePath:  base,
+			BasePath:  utils.GetBasePath(config_obj),
 			Heading:   "Heading",
 			UserTheme: user_options.Theme,
+			OrgId:     user_options.Org,
 		}
 		err = tmpl.Execute(w, args)
 		if err != nil {

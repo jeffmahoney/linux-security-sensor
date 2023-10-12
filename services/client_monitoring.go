@@ -1,7 +1,6 @@
 package services
 
 /*
-
    The Velociraptor client maintains a table of event queries it runs
    on startup. This service manages this table. It provides methods
    for the Velociraptor administrator to update the table for this
@@ -21,30 +20,20 @@ package services
 
 import (
 	"context"
-	"sync"
 
+	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	flows_proto "www.velocidex.com/golang/velociraptor/flows/proto"
 )
 
-var (
-	client_manager_mu    sync.Mutex
-	client_event_manager ClientEventTable
-)
+func ClientEventManager(config_obj *config_proto.Config) (ClientEventTable, error) {
+	org_manager, err := GetOrgManager()
+	if err != nil {
+		return nil, err
+	}
 
-func ClientEventManager() ClientEventTable {
-	client_manager_mu.Lock()
-	defer client_manager_mu.Unlock()
-
-	return client_event_manager
-}
-
-func RegisterClientEventManager(manager ClientEventTable) {
-	client_manager_mu.Lock()
-	defer client_manager_mu.Unlock()
-
-	client_event_manager = manager
+	return org_manager.Services(config_obj.OrgId).ClientEventManager()
 }
 
 type ClientEventTable interface {
@@ -52,12 +41,14 @@ type ClientEventTable interface {
 	// client. If the client's version is lower then we resync the
 	// client's event table.
 	CheckClientEventsVersion(
+		ctx context.Context,
 		config_obj *config_proto.Config,
 		client_id string, client_version uint64) bool
 
 	// Get the message to send to the client in order to force it
 	// to update.
 	GetClientUpdateEventTableMessage(
+		ctx context.Context,
 		config_obj *config_proto.Config,
 		client_id string) *crypto_proto.VeloMessage
 
@@ -70,4 +61,9 @@ type ClientEventTable interface {
 		config_obj *config_proto.Config,
 		principal string,
 		state *flows_proto.ClientEventTable) error
+
+	ListAvailableEventResults(
+		ctx context.Context,
+		in *api_proto.ListAvailableEventResultsRequest) (
+		*api_proto.ListAvailableEventResultsResponse, error)
 }

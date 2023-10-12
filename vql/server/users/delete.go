@@ -4,16 +4,17 @@ import (
 	"context"
 
 	"github.com/Velocidex/ordereddict"
-	"www.velocidex.com/golang/velociraptor/acls"
-	"www.velocidex.com/golang/velociraptor/datastore"
-	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/users"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 type UserDeleteFunctionArgs struct {
-	Username string `vfilter:"required,field=user,docs=The user to delete."`
+	Username   string   `vfilter:"required,field=user,doc=The user to delete."`
+	OrgIds     []string `vfilter:"optional,field=orgs,doc=If set we only delete from these orgs, otherwise we delete from the current org."`
+	ReallyDoIt bool     `vfilter:"optional,field=really_do_it,doc=If not specified, just show what user will be removed"`
 }
 
 type UserDeleteFunction struct{}
@@ -23,43 +24,41 @@ func (self UserDeleteFunction) Call(
 	scope vfilter.Scope,
 	args *ordereddict.Dict) vfilter.Any {
 
-	err := vql_subsystem.CheckAccess(scope, acls.SERVER_ADMIN)
-	if err != nil {
-		scope.Log("user_delete: %s", err)
-		return vfilter.Null{}
-	}
-
+	// ACLs are checked by the users module
 	config_obj, ok := vql_subsystem.GetServerConfig(scope)
 	if !ok {
-		scope.Log("Command can only run on the server")
+		scope.Log("user_delete, Command can only run on the server")
 		return vfilter.Null{}
 	}
 
 	arg := &UserDeleteFunctionArgs{}
-	err = arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
+	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
 	if err != nil {
 		scope.Log("user_delete: %s", err)
 		return vfilter.Null{}
 	}
 
-	db, err := datastore.GetDB(config_obj)
-	if err != nil {
-		scope.Log("user_delete: %s", err)
-		return vfilter.Null{}
+	orgs := []string{config_obj.OrgId}
+	if len(arg.OrgIds) != 0 {
+		orgs = arg.OrgIds
 	}
 
-	user_path_manager := paths.NewUserPathManager(arg.Username)
-	err = db.DeleteSubject(config_obj, user_path_manager.Path())
-	if err != nil {
-		scope.Log("user_delete: %s", err)
-		return vfilter.Null{}
-	}
+	if arg.ReallyDoIt {
+		principal := vql_subsystem.GetPrincipal(scope)
+		err = users.DeleteUser(ctx, principal, arg.Username, orgs)
+		if err != nil {
+			scope.Log("user_delete: %s", err)
+			return vfilter.Null{}
+		}
 
-	// Also remove the ACLs for the user.
-	err = db.DeleteSubject(config_obj, user_path_manager.ACL())
-	if err != nil {
-		scope.Log("user_delete: %s", err)
-		return vfilter.Null{}
+		services.LogAudit(ctx,
+			config_obj, principal, "user_delete",
+			ordereddict.NewDict().
+				Set("username", arg.Username).
+				Set("org_ids", orgs))
+
+	} else {
+		scope.Log("user_delete: Will remove %v from orgs %v", arg.Username, orgs)
 	}
 
 	return arg.Username

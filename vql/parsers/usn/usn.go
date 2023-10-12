@@ -5,17 +5,18 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	ntfs "www.velocidex.com/golang/go-ntfs/parser"
-	"www.velocidex.com/golang/velociraptor/paths"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/accessors/ntfs/readers"
 	utils "www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
-	"www.velocidex.com/golang/velociraptor/vql/windows/filesystems/readers"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 type USNPluginArgs struct {
-	Device   string `vfilter:"required,field=device,doc=The device file to open."`
-	StartUSN int64  `vfilter:"optional,field=start_offset,doc=The starting offset of the first USN record to parse."`
+	Device   *accessors.OSPath `vfilter:"required,field=device,doc=The device file to open."`
+	Accessor string            `vfilter:"optional,field=accessor,doc=The accessor to use."`
+	StartUSN int64             `vfilter:"optional,field=start_offset,doc=The starting offset of the first USN record to parse."`
 }
 
 type USNPlugin struct{}
@@ -37,17 +38,34 @@ func (self USNPlugin) Call(
 			return
 		}
 
-		device, _, err := paths.GetDeviceAndSubpath(arg.Device)
+		// If an accessor is not specified we interpret the path as an
+		// NTFS path.
+		if arg.Accessor == "" {
+			arg.Accessor = "ntfs"
+			arg.Device, err = accessors.NewWindowsNTFSPath(arg.Device.String())
+			if err != nil {
+				scope.Log("parse_usn: %v", err)
+				return
+			}
+		}
+
+		device, accessor, err := readers.GetRawDeviceAndAccessor(
+			scope, arg.Device, arg.Accessor)
 		if err != nil {
 			scope.Log("parse_usn: %v", err)
 			return
 		}
 
-		ntfs_ctx, err := readers.GetNTFSContext(scope, device)
+		ntfs_ctx, err := readers.GetNTFSContext(scope, device, accessor)
 		if err != nil {
 			scope.Log("parse_usn: %v", err)
 			return
 		}
+		defer ntfs_ctx.Close()
+
+		options := readers.GetScopeOptions(scope)
+		options.PrefixComponents = arg.Device.Components
+		ntfs_ctx.SetOptions(options)
 
 		for item := range ntfs.ParseUSN(ctx, ntfs_ctx, arg.StartUSN) {
 			output_chan <- makeUSNRecord(item)
@@ -66,7 +84,7 @@ func (self USNPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfil
 }
 
 type WatchUSNPluginArgs struct {
-	Device string `vfilter:"required,field=device,doc=The device file to open."`
+	Device string `vfilter:"required,field=device,doc=The device file to open (as an NTFS device)."`
 }
 
 type WatchUSNPlugin struct{}
@@ -96,9 +114,23 @@ func (self WatchUSNPlugin) Call(
 
 		event_channel := make(chan vfilter.Row)
 
+		// We need to interpret the device as an NTFS path in all
+		// cases because we can only really watch a raw NTFS partition
+		// (it does not make sense to watch a static file).
+		ntfs_device, err := accessors.NewWindowsNTFSPath(arg.Device)
+		if err != nil {
+			scope.Log("watch_usn: %v", err)
+			return
+		}
+
 		// Register our interest in the log.
-		cancel := GlobalEventLogService.Register(
-			arg.Device, ctx, config_obj, scope, event_channel)
+		cancel, err := GlobalEventLogService.Register(
+			ntfs_device, "ntfs", ctx, config_obj, scope, event_channel)
+		if err != nil {
+			scope.Log("watch_usn: %v", err)
+			return
+		}
+
 		defer cancel()
 
 		for {
@@ -133,11 +165,18 @@ func init() {
 }
 
 func makeUSNRecord(item *ntfs.USN_RECORD) *ordereddict.Dict {
+	links := item.Links()
+	fullpath := ""
+	if len(links) > 0 {
+		fullpath = links[0]
+	}
+
 	return ordereddict.NewDict().
 		Set("Usn", item.Usn()).
 		Set("Timestamp", item.TimeStamp().Time).
 		Set("Filename", item.Filename()).
-		Set("FullPath", item.FullPath()).
+		Set("_Links", links).
+		Set("OSPath", fullpath).
 		Set("FileAttributes", item.FileAttributes()).
 		Set("Reason", item.Reason()).
 		Set("SourceInfo", item.SourceInfo()).

@@ -1,4 +1,4 @@
-package datastore
+package datastore_test
 
 import (
 	"errors"
@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/suite"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
+	"www.velocidex.com/golang/velociraptor/datastore"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/path_specs"
 	"www.velocidex.com/golang/velociraptor/utils"
@@ -39,7 +40,7 @@ type BaseTestSuite struct {
 	suite.Suite
 
 	config_obj *config_proto.Config
-	datastore  DataStore
+	datastore  datastore.DataStore
 }
 
 func (self BaseTestSuite) TestSetGetJSON() {
@@ -72,31 +73,6 @@ func (self BaseTestSuite) TestSetGetJSON() {
 	}
 	sort.Strings(results)
 	assert.Equal(self.T(), []string{"d", "d/a", "d?\""}, results)
-}
-
-// Old server versions might have data encoded in protobufs. As we
-// port new data to json, we need to support reading the old data
-// properly.
-func (self BaseTestSuite) TestSetGetMigration() {
-	message := &crypto_proto.VeloMessage{Source: "Server"}
-	for _, path := range []path_specs.DSPathSpec{
-		path_specs.NewUnsafeDatastorePath("a", "b", "c"),
-	} {
-		// Write a protobuf based file
-		urn := path_specs.NewSafeDatastorePath(path.Components()...).
-			SetType(api.PATH_TYPE_DATASTORE_PROTO)
-		err := self.datastore.SetSubject(
-			self.config_obj, urn, message)
-		assert.NoError(self.T(), err)
-
-		// Even if we read it with json it should work.
-		read_message := &crypto_proto.VeloMessage{}
-		err = self.datastore.GetSubject(self.config_obj,
-			path.SetType(api.PATH_TYPE_DATASTORE_JSON), read_message)
-		assert.NoError(self.T(), err)
-
-		assert.Equal(self.T(), message.Source, read_message.Source)
-	}
 }
 
 func (self BaseTestSuite) TestSetGetSubjectWithEscaping() {
@@ -216,8 +192,9 @@ func (self BaseTestSuite) TestListChildren() {
 		"/a/b/c/3"}, asStrings(children))
 
 	visited := []api.DSPathSpec{}
-	Walk(self.config_obj, self.datastore,
+	datastore.Walk(self.config_obj, self.datastore,
 		path_specs.NewSafeDatastorePath("a", "b"),
+		datastore.WalkWithoutDirectories,
 		func(path_name api.DSPathSpec) error {
 			visited = append(visited, path_name)
 			return nil
@@ -257,8 +234,9 @@ func (self BaseTestSuite) TestListChildrenTypes() {
 		"/a/b/c/3:dir"}, asStringsWithTypes(children))
 
 	visited := []api.DSPathSpec{}
-	Walk(self.config_obj, self.datastore,
+	datastore.Walk(self.config_obj, self.datastore,
 		path_specs.NewSafeDatastorePath("a", "b"),
+		datastore.WalkWithoutDirectories,
 		func(path_name api.DSPathSpec) error {
 			visited = append(visited, path_name)
 			return nil
@@ -304,8 +282,9 @@ func (self BaseTestSuite) TestUnsafeListChildren() {
 		"/a/b:b/c:b/3"}, asStrings(children))
 
 	visited := []api.DSPathSpec{}
-	Walk(self.config_obj, self.datastore,
+	datastore.Walk(self.config_obj, self.datastore,
 		root,
+		datastore.WalkWithoutDirectories,
 		func(path_name api.DSPathSpec) error {
 			visited = append(visited, path_name)
 			return nil
@@ -350,7 +329,7 @@ func (self BaseTestSuite) TestListChildrenSubdirs() {
 }
 
 func benchmarkSearchClient(b *testing.B,
-	data_store DataStore,
+	data_store datastore.DataStore,
 	config_obj *config_proto.Config) {
 
 }

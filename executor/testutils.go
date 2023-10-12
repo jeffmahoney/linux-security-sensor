@@ -3,19 +3,56 @@ package executor
 import (
 	"context"
 
+	"www.velocidex.com/golang/velociraptor/actions"
+	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
+	"www.velocidex.com/golang/velociraptor/responder"
 )
 
-type TestExecutor struct{}
+type _TestExecutor struct {
+	flow_manager  *responder.FlowManager
+	event_manager *actions.EventTable
+}
 
-func (self *TestExecutor) ReadFromServer() *crypto_proto.VeloMessage {
+func NewTestExecutor() *_TestExecutor {
+	return &_TestExecutor{
+		event_manager: &actions.EventTable{},
+	}
+}
+
+func NewClientExecutorForTests(config_obj *config_proto.Config) *ClientExecutor {
+	return &ClientExecutor{
+		Outbound:      make(chan *crypto_proto.VeloMessage),
+		Inbound:       make(chan *crypto_proto.VeloMessage),
+		event_manager: &actions.EventTable{},
+		config_obj:    config_obj,
+	}
+}
+
+func (self *_TestExecutor) GetClientInfo() *actions_proto.ClientInfo {
+	return &actions_proto.ClientInfo{}
+}
+
+func (self *_TestExecutor) FlowManager() *responder.FlowManager {
 	return nil
 }
-func (self *TestExecutor) SendToServer(message *crypto_proto.VeloMessage) {}
-func (self *TestExecutor) ProcessRequest(
-	ctx context.Context,
+
+func (self *_TestExecutor) EventManager() *actions.EventTable {
+	return nil
+}
+
+func (self *_TestExecutor) ClientId() string {
+	return ""
+}
+
+func (self *_TestExecutor) ReadFromServer() *crypto_proto.VeloMessage {
+	return nil
+}
+func (self *_TestExecutor) SendToServer(message *crypto_proto.VeloMessage) {}
+func (self *_TestExecutor) ProcessRequest(ctx context.Context,
 	message *crypto_proto.VeloMessage) {
 }
-func (self *TestExecutor) ReadResponse() <-chan *crypto_proto.VeloMessage {
+func (self *_TestExecutor) ReadResponse() <-chan *crypto_proto.VeloMessage {
 	return nil
 }

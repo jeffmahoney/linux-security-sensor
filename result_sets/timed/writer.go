@@ -12,9 +12,9 @@ import (
 	"errors"
 	"time"
 
-	"github.com/Velocidex/json"
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/timelines"
@@ -26,12 +26,15 @@ var (
 )
 
 type rowContainer struct {
-	ts  time.Time
-	row *ordereddict.Dict
+	ts         time.Time
+	serialized []byte
+	count      int
 }
 
 type TimedResultSetWriterImpl struct {
-	rows               []rowContainer
+	rows              []rowContainer
+	total_rows_cached int
+
 	opts               *json.EncOpts
 	file_store_factory api.FileStore
 
@@ -48,12 +51,35 @@ type TimedResultSetWriterImpl struct {
 }
 
 func (self *TimedResultSetWriterImpl) Write(row *ordereddict.Dict) {
-	self.rows = append(self.rows, rowContainer{
-		row: row,
-		ts:  self.Clock.Now(),
-	})
+	// Encode each row ASAP but then store the raw json for combined
+	// writes. This allows us to get rid of memory from the query
+	// ASAP.
+	serialized, err := json.MarshalWithOptions(row, self.opts)
+	if err != nil {
+		return
+	}
 
-	if len(self.rows) > 10000 {
+	self.rows = append(self.rows, rowContainer{
+		serialized: serialized,
+		count:      1,
+		ts:         self.Clock.Now(),
+	})
+	self.total_rows_cached += 1
+
+	if self.total_rows_cached > 10000 {
+		self.Flush()
+	}
+}
+
+func (self *TimedResultSetWriterImpl) WriteJSONL(jsonl []byte, count int) {
+	self.rows = append(self.rows, rowContainer{
+		serialized: jsonl,
+		count:      count,
+		ts:         self.Clock.Now(),
+	})
+	self.total_rows_cached += count
+
+	if self.total_rows_cached > 10000 {
 		self.Flush()
 	}
 }
@@ -62,19 +88,20 @@ func (self *TimedResultSetWriterImpl) Write(row *ordereddict.Dict) {
 // or until 10k rows are queued in memory.
 func (self *TimedResultSetWriterImpl) Flush() {
 	// Nothing to do...
-	if len(self.rows) == 0 {
+	if self.total_rows_cached == 0 {
 		return
 	}
 
 	for _, row := range self.rows {
 		writer, err := self.getWriter(row.ts)
 		if err == nil {
-			writer.Write(row.ts, row.row)
+			writer.WriteBuffer(row.ts, row.serialized)
 		}
 	}
 
 	// Reset the slice.
 	self.rows = self.rows[:0]
+	self.total_rows_cached = 0
 }
 
 func (self *TimedResultSetWriterImpl) getWriter(ts time.Time) (

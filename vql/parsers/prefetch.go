@@ -6,16 +6,18 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	prefetch "www.velocidex.com/golang/go-prefetch"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
 	utils "www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	vfilter "www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -32,8 +34,8 @@ import (
 */
 
 type _PrefetchPluginArgs struct {
-	Filenames []string `vfilter:"required,field=filename,doc=A list of event log files to parse."`
-	Accessor  string   `vfilter:"optional,field=accessor,doc=The accessor to use."`
+	Filenames []*accessors.OSPath `vfilter:"required,field=filename,doc=A list of event log files to parse."`
+	Accessor  string              `vfilter:"optional,field=accessor,doc=The accessor to use."`
 }
 
 type _PrefetchPlugin struct{}
@@ -64,12 +66,12 @@ func (self _PrefetchPlugin) Call(
 					return
 				}
 
-				accessor, err := glob.GetAccessor(arg.Accessor, scope)
+				accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 				if err != nil {
 					scope.Log("prefetch: %v", err)
 					return
 				}
-				fd, err := accessor.Open(filename)
+				fd, err := accessor.OpenWithOSPath(filename)
 				if err != nil {
 					scope.Log("Unable to open file %s: %v",
 						filename, err)
@@ -106,9 +108,10 @@ func (self _PrefetchPlugin) Call(
 
 func (self _PrefetchPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "prefetch",
-		Doc:     "Parses a prefetch file.",
-		ArgType: type_map.AddType(scope, &_PrefetchPluginArgs{}),
+		Name:     "prefetch",
+		Doc:      "Parses a prefetch file.",
+		ArgType:  type_map.AddType(scope, &_PrefetchPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 

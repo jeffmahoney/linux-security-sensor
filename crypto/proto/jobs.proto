@@ -10,8 +10,39 @@ package proto;
 
 option go_package = "www.velocidex.com/golang/velociraptor/crypto/proto";
 
+// Represents a complete collection.
+message FlowRequest {
+    repeated VQLCollectorArgs VQLClientActions = 1;
+
+    // The maximum time in milliseconds the client will batch log
+    // messages before forwarding them to the server. If this is 0, no
+    // updates will be sent until he very end of the query. You can
+    // specify the default in
+    // Frontend.resources.default_log_batch_time
+    uint64 log_batch_time = 2;
+
+    // The maximum time in milliseconds the client will wait before
+    // sending progress updates on the running flows. This is useful
+    // to monitor how the client is progress but if it done too often
+    // increases load on the server. Default is 5000 (5sec) and you
+    // can updatet the default in
+    // Client.default_server_flow_stats_update
+    uint64 flow_update_time = 3;
+
+    // A limit on total number of rows returned from the
+    // collection. Does not count log messages.
+    uint64 max_rows = 4;
+
+    // If the client exceeds this, the client will abort the
+    // collection.
+    uint64 max_upload_bytes = 5;
+
+    // Execute this trace query while the main collection is running.
+    repeated VQLCollectorArgs trace = 6;
+}
+
+
 // This message is sent between the client and the server.
-// Next field: 24
 message VeloMessage {
   string session_id = 1 [(sem_type) = {
       description: "The session id of the flow that this message belongs to."
@@ -29,30 +60,36 @@ message VeloMessage {
   // queued needlessly.
   bool urgent = 36;
 
+  // DEPRECATED: not used any more.
   uint64 response_id = 3 [(sem_type) = {
       description: "Responses for each request are also numbered from 1."
     }];
 
-  string source = 6  [(sem_type) = {
-      description: "Client name where the message came from "
-      "(Filled in by the frontend)."
-    }];
+  // The source of this message. Note that clients may group together
+  // many messages from the same source. The authenticity of the
+  // source is cryptographically determined by the CipherMetadata but
+  // the source is also copied down to each message by the server
+  // after verification. This means that we ignore what the client
+  // actually stores in this field and override it from the
+  // CipherMetadata.Source field.
+  string source = 6;
+
+  // The Org this client belongs to - set by the frontend from
+  // information gathered by the encryption envelope
+  string org_id = 40;
 
   // A Flag to indicate if the message is authenticated. Note that the client
   // does not get to decide this - the server will verify the message and tag it
   // as such. The message is then passed down the chain of components carrying
   // this tag.
 
-  // This is done because signing is done on a group of messages as they arrive
-  // over the POST, but after decryption and unpacking, messages are queued
-  // individually and therefore need to retain their authenticated status.
+  // This is done because signing is done on a group of messages as
+  // they arrive over the POST transaction, but after decryption and
+  // unpacking, messages are processed individually and therefore need
+  // to retain their authenticated status.
   enum AuthorizationState {
     UNAUTHENTICATED = 0;
     AUTHENTICATED = 1;
-
-    // This indicates that clocks are out of sync and this message may be a
-    // replay.
-    DESYNCHRONIZED = 2;
   };
 
   AuthorizationState auth_state = 7;
@@ -63,22 +100,31 @@ message VeloMessage {
 
   // Generally only one of the following will be set.
   // Client to server:
-  GrrStatus status = 25;
+  FlowStats flow_stats = 41;
+  VeloStatus status = 25;
   ForemanCheckin ForemanCheckin = 27;  // Upon initial connection.
   FileBuffer FileBuffer = 28;  // For uploads.
   Certificate CSR = 29;   // For enrollment.
   VQLResponse VQLResponse = 33;
   LogMessage LogMessage = 34;
+  Cancel     Ping = 39;
 
   // Server to client:
   VQLEventTable UpdateEventTable = 31;
+
+  // DEPRECATED but used to talk with older clients. New clients will
+  // ignore this message and read the FlowRequest message instead.
   VQLCollectorArgs VQLClientAction = 30;
+
+  // Requests a flow to be collected - contains all the queries that
+  // make up the collection.
+  FlowRequest FlowRequest = 42;
+
   Cancel Cancel = 32;
   ForemanCheckin UpdateForeman = 35;
 
   // Immediately kill the client and reset all buffers.
   Cancel  KillKillKill = 38;
-
 
   // DEPRECATED: The following fields were used as part of the old
   // VeloMessage communication protocol. These fields were replaced
@@ -96,7 +142,7 @@ message VeloMessage {
   // The rdfvalue class of the args.
   string args_rdf_name = 14;
 
-  // DEPRECATED: Status messages just carry the GrrStatus member.
+  // DEPRECATED: Status messages just carry the VeloStatus member.
   enum Type {
     MESSAGE = 0; // The main kind of message.
     STATUS = 1; //
@@ -108,7 +154,9 @@ message VeloMessage {
   Type type = 8;
 };
 
-message Cancel {};
+message Cancel {
+    string principal = 1;
+};
 
 // Certificates are exchanged with this.
 message Certificate {
@@ -123,12 +171,42 @@ message Certificate {
   string cn = 3;
 };
 
+// A periodic message sent from the client to the server to update the
+// server about the flow progress.
+message FlowStats {
+    uint64 total_uploaded_files = 1;
+    uint64 total_expected_uploaded_bytes = 2;
+    uint64 total_uploaded_bytes = 3;
+    uint64 total_collected_rows = 4;
+    uint64 total_logs = 5;
+
+    uint64 timestamp = 6;
+
+    repeated string names_with_response = 9;
+
+    repeated VeloStatus query_status = 7;
+
+    // When this is true, the flow is considered complete. It is
+    // guaranteed to only fire once.
+    bool flow_complete = 8;
+}
+
+
 // This is a status response that is sent for each complete
-// transaction. It is always the last message in the transaction.
-message GrrStatus {
+// query. Velociraptor collections consist of multiple queries (for
+// example collecting multiple artifacts or artifacts with multiple
+// sources). Each query request ellicits a status message when
+// finished to indicate the query's success status and send stats
+// about it.
+message VeloStatus {
     // Velociraptor only uses OK and GENERIC_ERROR right now.
     enum ReturnedStatus {
+        // Query completed successfully
         OK = 0;
+
+        // A progress report of the query but does not mean it is
+        // completed.
+        PROGRESS = 4;
         GENERIC_ERROR = 10;
     };
 
@@ -140,6 +218,31 @@ message GrrStatus {
 
     // Total duration the query took to run on the client.
     int64 duration = 4;
+    uint64 last_active = 14;
+    uint64 first_active = 15;
+
+    // Return statistics about the request
+
+    // A List of artifacts that had some results.
+    repeated string names_with_response = 5;
+
+    // The artifact that this status refers to
+    string Artifact = 10;
+
+    // How many log rows we generated
+    int64 log_rows = 6;
+
+    // How many files were uploaded in this query.
+    int64 uploaded_files = 11;
+    int64 uploaded_bytes = 12;
+    int64 expected_uploaded_bytes = 13;
+
+    int64 result_rows = 7;
+
+    // This status corresponds to this query number out of the total
+    // in this collection.
+    int64 query_id = 8;
+    int64 total_queries = 9;
 };
 
 // This is a list of job messages.
@@ -162,11 +265,6 @@ message PackedMessageList {
 
   // A serialized and compressed MessageList for signing
   repeated bytes message_list = 1;
-
-  string source = 3 [(sem_type) = {
-      type: "RDFURN",
-      description: "The source where this message came from."
-    }];
 
   uint64 timestamp = 6 [(sem_type) = {
       type: "RDFDatetime",
@@ -256,6 +354,9 @@ message ClientCommunication {
   };
   Status status = 5;
 
+  // Communication version:
+  // 3 - All versions before release 0.6.8
+  // 4 - Release 0.6.8
   uint32 api_version = 6;
 
   // This is the FULL_HMAC. It covers:
@@ -274,24 +375,36 @@ message ClientCommunication {
 };
 
 message LogMessage {
-  string message = 1 [(sem_type) = {
-      description: "The message to send to the server.",
-    }];
+    // An incremental ID of the first log message
+    int64 id = 5;
 
-  uint64 timestamp = 2 [(sem_type) = {
-      description: "The time when the message was generated.",
-      type: "RDFDatetime",
-    }];
+    // Total number of rows encoded in the jsonl field.
+    uint64 number_of_rows = 6;
+
+    // A JSONL encoded list of log messages
+    string jsonl = 7;
+
+    // If any of the messages in jsonl are at error level the first is
+    // captured in this string.
+    string error_message = 8;
+
+    // Deprecated: The fields below are used by older clients and can
+    // still be processed by the server but newer clients batch log
+    // messages in the jsonl field above.
+    string message = 1 [(sem_type) = {
+            description: "The message to send to the server.",
+        }];
+
+    uint64 timestamp = 2 [(sem_type) = {
+            description: "The time when the message was generated.",
+            type: "RDFDatetime",
+        }];
 
     // The artifact name that we were running at the time.
     string artifact = 3;
 
-    enum Level {
-        DEFAULT = 0; // INFO level
-        ERROR = 1;
-        DEBUG = 2;
-    }
-    Level level = 4;
+    // DEFAULT, ERROR, DEBUG
+    string level = 4;
 }
 
 // Message written to the data store with the PEM of the client's

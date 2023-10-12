@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -26,11 +26,12 @@ package http_comms
 
 import (
 	"context"
-	"runtime/debug"
 	"sync"
 	"sync/atomic"
+	"time"
 
-	errors "github.com/pkg/errors"
+	"github.com/go-errors/errors"
+	"golang.org/x/time/rate"
 	"google.golang.org/protobuf/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/crypto"
@@ -38,6 +39,10 @@ import (
 	"www.velocidex.com/golang/velociraptor/executor"
 	"www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/utils"
+)
+
+const (
+	URGENT = true
 )
 
 type Sender struct {
@@ -57,9 +62,16 @@ type Sender struct {
 	clock utils.Clock
 }
 
+func (self *Sender) CleanOnExit(ctx context.Context) {
+	<-ctx.Done()
+	self.urgent_buffer.Close()
+	self.ring_buffer.Close()
+}
+
 // Persistent loop to pump messages from the executor to the ring
 // buffer. This function should never exit in a real client.
 func (self *Sender) PumpExecutorToRingBuffer(ctx context.Context) {
+
 	// We should never exit from this.
 	defer self.maybeCallOnExit()
 
@@ -69,13 +81,24 @@ func (self *Sender) PumpExecutorToRingBuffer(ctx context.Context) {
 
 	for {
 		if atomic.LoadInt32(&self.IsPaused) != 0 {
-			self.clock.Sleep(self.minPoll)
-			continue
+			select {
+			case <-ctx.Done():
+				return
+			case <-self.clock.After(self.minPoll):
+				continue
+			}
 		}
+
+		executor.Nanny.UpdatePumpToRb()
 
 		select {
 		case <-ctx.Done():
 			return
+
+			// Keep the nanny alive to ensure we are still inside this
+			// loop.
+		case <-time.After(self.maxPoll):
+			continue
 
 		case msg, ok := <-executor_chan:
 			// Executor closed the channel.
@@ -150,45 +173,43 @@ func (self *Sender) PumpExecutorToRingBuffer(ctx context.Context) {
 // the server is not available. This function should never exit in a
 // real client.
 func (self *Sender) PumpRingBufferToSendMessage(ctx context.Context) {
+
 	// We should never exit from this.
 	defer self.maybeCallOnExit()
 
+	compression := crypto_proto.PackedMessageList_ZCOMPRESSION
+	if self.config_obj.Client.DisableCompression {
+		compression = crypto_proto.PackedMessageList_UNCOMPRESSED
+	}
+
 	for {
+		executor.Nanny.UpdatePumpRbToServer()
+
 		if atomic.LoadInt32(&self.IsPaused) == 0 {
 			// Grab some messages from the urgent ring buffer.
 			compressed_messages := LeaseAndCompress(self.urgent_buffer,
-				self.config_obj.Client.MaxUploadSize)
+				self.config_obj.Client.MaxUploadSize, compression)
 			if len(compressed_messages) > 0 {
-				self.sendMessageList(ctx, compressed_messages,
-					true /* urgent */)
+				self.sendMessageList(ctx, compressed_messages, URGENT, compression)
 				self.urgent_buffer.Commit()
 			}
 
 			// Grab some messages from the ring buffer.
 			compressed_messages = LeaseAndCompress(self.ring_buffer,
-				self.config_obj.Client.MaxUploadSize)
+				self.config_obj.Client.MaxUploadSize, compression)
 			if len(compressed_messages) > 0 {
-				// sendMessageList will block until
-				// the messages are successfully sent
-				// to the server. When it returns we
-				// know the messages are sent so we
-				// can commit them from the ring
-				// buffer.
-				self.sendMessageList(ctx, compressed_messages,
-					false /* urgent */)
+				// sendMessageList will block until the messages are
+				// successfully sent to the server. When it returns we
+				// know the messages are sent so we can commit them
+				// from the ring buffer.
+				self.sendMessageList(ctx, compressed_messages, !URGENT, compression)
 				self.ring_buffer.Commit()
-
-				// We need to make sure our memory
-				// footprint is as small as
-				// possible. The Velociraptor client
-				// prioritizes low memory footprint
-				// over latency. We just sent data to
-				// the server and we wont need that
-				// for a while so we can free our
-				// memory to the OS.
-				debug.FreeOSMemory()
 			}
 		}
+
+		self.mu.Lock()
+		release := self.release
+		self.mu.Unlock()
 
 		// Wait a minimum time before sending the next one to
 		// give the executor a chance to fill the queue.
@@ -198,7 +219,7 @@ func (self *Sender) PumpRingBufferToSendMessage(ctx context.Context) {
 
 			// If the queue is too large we need to flush
 			// it out immediately so skip the wait below.
-		case <-self.release:
+		case <-release:
 			continue
 
 			// Wait a minimum amount of time to allow for
@@ -211,20 +232,39 @@ func (self *Sender) PumpRingBufferToSendMessage(ctx context.Context) {
 
 // The sender simply sends any server bound messages to the server. We
 // only send messages when responses are pending.
-func (self *Sender) Start(ctx context.Context) {
-	go self.PumpExecutorToRingBuffer(ctx)
-	go self.PumpRingBufferToSendMessage(ctx)
+func (self *Sender) Start(
+	ctx context.Context, wg *sync.WaitGroup) {
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		self.PumpExecutorToRingBuffer(ctx)
+
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		self.PumpRingBufferToSendMessage(ctx)
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		self.CleanOnExit(ctx)
+	}()
 }
 
 func NewSender(
 	config_obj *config_proto.Config,
 	connector IConnector,
-	manager crypto.ICryptoManager,
+	crypto_manager crypto.ICryptoManager,
 	executor executor.Executor,
 	ring_buffer IRingBuffer,
 	enroller *Enroller,
 	logger *logging.LogContext,
 	name string,
+	limiter *rate.Limiter,
 	handler string,
 	on_exit func(),
 	clock utils.Clock) (*Sender, error) {
@@ -234,16 +274,19 @@ func NewSender(
 	}
 
 	result := &Sender{
-		NotificationReader: NewNotificationReader(config_obj, connector, manager,
-			executor, enroller, logger, name, handler, on_exit, clock),
+		NotificationReader: NewNotificationReader(
+			config_obj, connector, crypto_manager,
+			executor, enroller, logger, name,
+			limiter, handler, on_exit, clock),
 		ring_buffer: ring_buffer,
 
 		// Urgent buffer is an in memory ring buffer to handle
 		// urgent queries. This ensures urgent queries can
 		// skip the buffer ahead of normal queries.
-		urgent_buffer: NewRingBuffer(config_obj, 2*config_obj.Client.MaxUploadSize),
-		release:       make(chan bool),
-		clock:         clock,
+		urgent_buffer: NewRingBuffer(config_obj, executor.FlowManager(),
+			2*config_obj.Client.MaxUploadSize),
+		release: make(chan bool),
+		clock:   clock,
 	}
 
 	return result, nil

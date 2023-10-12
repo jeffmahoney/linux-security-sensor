@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -26,28 +26,33 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/pprof"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/Velocidex/ordereddict"
 	"github.com/Velocidex/yaml/v2"
-	errors "github.com/pkg/errors"
+	errors "github.com/go-errors/errors"
 	"github.com/sergi/go-diff/diffmatchpatch"
-	"github.com/shirou/gopsutil/v3/process"
+	"www.velocidex.com/golang/velociraptor/actions"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
+	"www.velocidex.com/golang/velociraptor/file_store"
+	"www.velocidex.com/golang/velociraptor/json"
 	logging "www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/reporting"
 	"www.velocidex.com/golang/velociraptor/services"
-	"www.velocidex.com/golang/velociraptor/services/client_info"
-	"www.velocidex.com/golang/velociraptor/services/hunt_dispatcher"
-	"www.velocidex.com/golang/velociraptor/services/indexing"
 	"www.velocidex.com/golang/velociraptor/startup"
+	"www.velocidex.com/golang/velociraptor/utils"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
-	"www.velocidex.com/golang/velociraptor/vql/tools"
+	"www.velocidex.com/golang/velociraptor/vql/acl_managers"
+	"www.velocidex.com/golang/velociraptor/vql/psutils"
+	"www.velocidex.com/golang/velociraptor/vql/remapping"
 	vfilter "www.velocidex.com/golang/vfilter"
+	"www.velocidex.com/golang/vfilter/arg_parser"
 )
 
 var (
@@ -70,6 +75,17 @@ var (
 		"Normally golden tests run with the readonly datastore so as not to "+
 			"change the fixture. This flag allows updates to the fixtures.").
 		Bool()
+
+	// If the logs emit messages matching these then the test is
+	// considered failed. This helps us catch VQL errors.
+	fatalLogMessagesRegex = []string{
+		"(?i)Symbol .+ not found",
+		"(?i)Field .+ Expecting a .+ arg type, not",
+		"(?i)Artifact .+ not found",
+		"(?i)Order by column .+ not present in row",
+		"PANIC runtime error:",
+		"Extra unrecognized arg",
+	}
 )
 
 type testFixture struct {
@@ -93,8 +109,9 @@ func vqlCollectorArgsFromFixture(
 	return vql_collector_args
 }
 
-func makeCtxWithTimeout(duration int) (context.Context, func()) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
+func makeCtxWithTimeout(
+	root_ctx context.Context, duration int) (context.Context, func()) {
+	ctx, cancel := context.WithCancel(root_ctx)
 
 	deadline := time.Now().Add(time.Second * time.Duration(duration))
 	fmt.Printf("Setting deadline to %v\n", deadline)
@@ -113,12 +130,13 @@ func makeCtxWithTimeout(duration int) (context.Context, func()) {
 				// the goroutines and mutex and hard exit.
 			case <-time.After(time.Second):
 				if time.Now().Before(deadline) {
-					proc, _ := process.NewProcess(int32(os.Getpid()))
-					total_time, _ := proc.Percent(0)
-					memory, _ := proc.MemoryInfo()
+					pid := int32(os.Getpid())
+					total_time, _ := psutils.TimesWithContext(ctx, pid)
+					memory, _ := psutils.MemoryInfoWithContext(ctx, pid)
 
 					fmt.Printf("Not time to fire yet %v %v %v\n",
-						time.Now(), total_time, memory)
+						time.Now(), json.MustMarshalString(total_time),
+						json.MustMarshalString(memory))
 					continue
 				}
 
@@ -130,6 +148,12 @@ func makeCtxWithTimeout(duration int) (context.Context, func()) {
 				p = pprof.Lookup("mutex")
 				if p != nil {
 					_ = p.WriteTo(os.Stdout, 1)
+				}
+
+				// Write the recent queries.
+				fmt.Println("Recent Queries.")
+				for _, q := range actions.QueryLog.Get() {
+					fmt.Println(q)
 				}
 
 				os.Stdout.Close()
@@ -146,9 +170,11 @@ func makeCtxWithTimeout(duration int) (context.Context, func()) {
 func runTest(fixture *testFixture, sm *services.Service,
 	config_obj *config_proto.Config) (string, error) {
 
-	ctx := context.Background()
+	ctx := sm.Ctx
+
+	// Limit each test for maxmimum time
 	if !*disable_alarm {
-		sub_ctx, cancel := makeCtxWithTimeout(30)
+		sub_ctx, cancel := makeCtxWithTimeout(ctx, 30)
 		defer cancel()
 
 		ctx = sub_ctx
@@ -162,7 +188,7 @@ func runTest(fixture *testFixture, sm *services.Service,
 	defer os.Remove(tmpfile.Name())
 
 	container, err := reporting.NewContainer(
-		config_obj, tmpfile.Name(), "", 5)
+		config_obj, tmpfile.Name(), "", 5, nil)
 	if err != nil {
 		return "", fmt.Errorf("Can not create output container: %w", err)
 	}
@@ -170,12 +196,13 @@ func runTest(fixture *testFixture, sm *services.Service,
 
 	builder := services.ScopeBuilder{
 		Config:     config_obj,
-		ACLManager: vql_subsystem.NewRoleACLManager("administrator"),
+		ACLManager: acl_managers.NewRoleACLManager(config_obj, "administrator", "org_admin"),
 		Logger:     log.New(log_writer, "Velociraptor: ", 0),
 		Uploader:   container,
 		Env: ordereddict.NewDict().
 			Set("GoldenOutput", tmpfile.Name()).
-			Set(constants.SCOPE_MOCK, &tools.MockingScopeContext{}),
+			Set("_SessionId", "F.Golden").
+			Set(constants.SCOPE_MOCK, &remapping.MockingScopeContext{}),
 	}
 
 	if golden_env_map != nil {
@@ -190,7 +217,7 @@ func runTest(fixture *testFixture, sm *services.Service,
 	}
 
 	// Cleanup after the query.
-	manager, err := services.GetRepositoryManager()
+	manager, err := services.GetRepositoryManager(config_obj)
 	if err != nil {
 		return "", err
 	}
@@ -227,25 +254,22 @@ func runTest(fixture *testFixture, sm *services.Service,
 		}
 	}
 
-	res, err := log_writer.Matches("Symbol .+ not found")
-	if err != nil {
-		return result, err
-	}
-
-	if res {
-		return result, errors.New("Symbol not found error!")
+	for _, msg := range fatalLogMessagesRegex {
+		matches, err := log_writer.Matches(msg)
+		if matches || err != nil {
+			return "", fmt.Errorf("Log out matches %q", msg)
+		}
 	}
 
 	return result, nil
 }
 
 func doGolden() error {
-	vql_subsystem.RegisterPlugin(&MemoryLogPlugin{})
+	logging.DisableLogging()
 
-	if !*disable_alarm {
-		_, cancel := makeCtxWithTimeout(120)
-		defer cancel()
-	}
+	vql_subsystem.RegisterPlugin(&MemoryLogPlugin{})
+	vql_subsystem.RegisterFunction(&WriteFilestoreFunction{})
+	vql_subsystem.RegisterFunction(&MockTimeFunciton{})
 
 	config_obj, err := makeDefaultConfigLoader().LoadAndValidate()
 	if err != nil {
@@ -264,35 +288,27 @@ func doGolden() error {
 
 	failures := []string{}
 
-	//Force a clean slate for each test.
-	startup.Reset()
+	config_obj.Services = services.GoldenServicesSpec()
 
-	sm, err := startEssentialServices(config_obj)
-	if err != nil {
-		return err
+	ctx, cancel := install_sig_handler()
+	defer cancel()
+
+	// Global timeout for the entire test
+	if !*disable_alarm {
+		timeout_ctx, cancel := makeCtxWithTimeout(ctx, 120)
+		defer cancel()
+
+		ctx = timeout_ctx
 	}
+
+	sm, err := startup.StartToolServices(ctx, config_obj)
 	defer sm.Close()
 
-	// Start specific services needed for golden files
-	err = sm.Start(hunt_dispatcher.StartHuntDispatcher)
 	if err != nil {
 		return err
 	}
 
-	err = sm.Start(client_info.StartClientInfoService)
-	if err != nil {
-		return err
-	}
-
-	err = sm.Start(indexing.StartIndexingService)
-	if err != nil {
-		return err
-	}
-
-	_, err = getRepository(config_obj)
-	if err != nil {
-		return fmt.Errorf("Loading extra artifacts: %w", err)
-	}
+	var file_paths []string
 
 	err = filepath.Walk(*golden_command_directory, func(file_path string, info os.FileInfo, err error) error {
 		if *golden_command_filter != "" &&
@@ -302,6 +318,21 @@ func doGolden() error {
 
 		if !strings.HasSuffix(file_path, ".in.yaml") {
 			return nil
+		}
+
+		file_paths = append(file_paths, file_path)
+		return nil
+	})
+
+	// Run the test cases in a predictable way
+	sort.Strings(file_paths)
+	logger.Info("<green>Testing %v test cases</>", len(file_paths))
+
+	for _, file_path := range file_paths {
+		select {
+		case <-sm.Ctx.Done():
+			return errors.New("Cancelled!")
+		default:
 		}
 
 		logger := log.New(os.Stderr, "golden: ", 0)
@@ -350,11 +381,10 @@ func doGolden() error {
 				return fmt.Errorf("Unable to write golden file: %w", err)
 			}
 		}
-		return nil
-	})
+	}
 
 	if err != nil {
-		return fmt.Errorf("golden error: %w", err)
+		return fmt.Errorf("golden error FAIL: %w", err)
 	}
 
 	if len(failures) > 0 {
@@ -437,6 +467,8 @@ func (self MemoryLogPlugin) Call(
 				output_chan <- ordereddict.NewDict().
 					Set("Log", line)
 			}
+
+			log_writer.Clear()
 		}
 
 	}()
@@ -449,5 +481,88 @@ func (self MemoryLogPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap)
 		Name:    "test_read_logs",
 		Doc:     "Read logs in golden test.",
 		ArgType: type_map.AddType(scope, vfilter.Null{}),
+	}
+}
+
+type WriteFilestoreFunctionArgs struct {
+	Data   string `vfilter:"optional,field=data"`
+	FSPath string `vfilter:"optional,field=path"`
+}
+
+type WriteFilestoreFunction struct{}
+
+func (self WriteFilestoreFunction) Call(ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+
+	arg := &WriteFilestoreFunctionArgs{}
+	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
+	if err != nil {
+		scope.Log("write_filestore: %s", err)
+		return &vfilter.Null{}
+	}
+
+	config_obj, ok := vql_subsystem.GetServerConfig(scope)
+	if !ok {
+		scope.Log("Command can only run on the server")
+		return &vfilter.Null{}
+	}
+
+	file_store_factory := file_store.GetFileStore(config_obj)
+	pathspec := paths.FSPathSpecFromClientPath(arg.FSPath)
+	writer, err := file_store_factory.WriteFile(pathspec)
+	if err != nil {
+		scope.Log("write_filestore: %s", err)
+		return &vfilter.Null{}
+	}
+	defer writer.Close()
+
+	writer.Write([]byte(arg.Data))
+
+	return true
+}
+
+func (self WriteFilestoreFunction) Info(
+	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+	return &vfilter.FunctionInfo{
+		Name:    "write_filestore",
+		Doc:     "Write a file on the filestore.",
+		ArgType: type_map.AddType(scope, &WriteFilestoreFunctionArgs{}),
+	}
+}
+
+type MockTimeFuncitonArgs struct {
+	Now int64 `vfilter:"required,field=now"`
+}
+
+type MockTimeFunciton struct{}
+
+func (self MockTimeFunciton) Call(ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) vfilter.Any {
+
+	arg := &MockTimeFuncitonArgs{}
+	err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
+	if err != nil {
+		scope.Log("mock_time: %s", err)
+		return &vfilter.Null{}
+	}
+
+	clock := utils.NewMockClock(time.Unix(arg.Now, 0))
+	cancel := utils.MockTime(clock)
+	err = vql_subsystem.GetRootScope(scope).AddDestructor(cancel)
+	if err != nil {
+		scope.Log("mock_time: %s", err)
+		return &vfilter.Null{}
+	}
+
+	return true
+}
+
+func (self MockTimeFunciton) Info(
+	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
+	return &vfilter.FunctionInfo{
+		Name:    "mock_time",
+		ArgType: type_map.AddType(scope, &MockTimeFuncitonArgs{}),
 	}
 }

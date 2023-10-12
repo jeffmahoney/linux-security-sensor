@@ -50,11 +50,6 @@ Tips:
 import (
 	"fmt"
 	"strings"
-
-	acl_proto "www.velocidex.com/golang/velociraptor/acls/proto"
-	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/datastore"
-	"www.velocidex.com/golang/velociraptor/paths"
 )
 
 type ACL_PERMISSION int
@@ -80,6 +75,9 @@ const (
 	// Schedule or cancel new collections on clients.
 	COLLECT_CLIENT
 
+	// Allows the user to start a hunt
+	START_HUNT
+
 	// Schedule new artifact collections on velociraptor servers.
 	COLLECT_SERVER
 
@@ -98,6 +96,12 @@ const (
 	// Allowed to manage server configuration.
 	SERVER_ADMIN
 
+	// Allowed to manage orgs
+	ORG_ADMIN
+
+	// Allows the user to specify a different username for the query() plugin
+	IMPERSONATION
+
 	// Allowed to read arbitrary files from the filesystem.
 	FILESYSTEM_READ
 
@@ -110,12 +114,23 @@ const (
 	// Allowed to create zip files.
 	PREPARE_RESULTS
 
+	// Allowed to delete results from the server
+	DELETE_RESULTS
+
 	// Allowed raw datastore access
 	DATASTORE_ACCESS
 
 	// When adding new permission - update CheckAccess,
 	// GetRolePermissions and acl.proto
 )
+
+func (self ACL_PERMISSION) MarshalJSON() ([]byte, error) {
+	return []byte(fmt.Sprintf("\"%s\"", self.String())), nil
+}
+
+func (self ACL_PERMISSION) MarshalYAML() (interface{}, error) {
+	return self.String(), nil
+}
 
 func (self ACL_PERMISSION) String() string {
 	switch self {
@@ -133,6 +148,8 @@ func (self ACL_PERMISSION) String() string {
 		return "LABEL_CLIENT"
 	case COLLECT_CLIENT:
 		return "COLLECT_CLIENT"
+	case START_HUNT:
+		return "START_HUNT"
 	case COLLECT_SERVER:
 		return "COLLECT_SERVER"
 	case ARTIFACT_WRITER:
@@ -145,6 +162,10 @@ func (self ACL_PERMISSION) String() string {
 		return "NOTEBOOK_EDITOR"
 	case SERVER_ADMIN:
 		return "SERVER_ADMIN"
+	case ORG_ADMIN:
+		return "ORG_ADMIN"
+	case IMPERSONATION:
+		return "IMPERSONATION"
 	case FILESYSTEM_READ:
 		return "FILESYSTEM_READ"
 	case FILESYSTEM_WRITE:
@@ -153,6 +174,8 @@ func (self ACL_PERMISSION) String() string {
 		return "MACHINE_STATE"
 	case PREPARE_RESULTS:
 		return "PREPARE_RESULTS"
+	case DELETE_RESULTS:
+		return "DELETE_RESULTS"
 	case DATASTORE_ACCESS:
 		return "DATASTORE_ACCESS"
 
@@ -177,6 +200,8 @@ func GetPermission(name string) ACL_PERMISSION {
 		return LABEL_CLIENT
 	case "COLLECT_CLIENT":
 		return COLLECT_CLIENT
+	case "START_HUNT":
+		return START_HUNT
 	case "COLLECT_SERVER":
 		return COLLECT_SERVER
 	case "ARTIFACT_WRITER":
@@ -189,6 +214,10 @@ func GetPermission(name string) ACL_PERMISSION {
 		return NOTEBOOK_EDITOR
 	case "SERVER_ADMIN":
 		return SERVER_ADMIN
+	case "ORG_ADMIN":
+		return ORG_ADMIN
+	case "IMPERSONATION":
+		return IMPERSONATION
 	case "FILESYSTEM_READ":
 		return FILESYSTEM_READ
 	case "FILESYSTEM_WRITE":
@@ -197,165 +226,11 @@ func GetPermission(name string) ACL_PERMISSION {
 		return MACHINE_STATE
 	case "PREPARE_RESULTS":
 		return PREPARE_RESULTS
+	case "DELETE_RESULTS":
+		return DELETE_RESULTS
 	case "DATASTORE_ACCESS":
 		return DATASTORE_ACCESS
 
 	}
 	return NO_PERMISSIONS
-}
-
-func GetPolicy(
-	config_obj *config_proto.Config,
-	principal string) (*acl_proto.ApiClientACL, error) {
-
-	db, err := datastore.GetDB(config_obj)
-	if err != nil {
-		return nil, err
-	}
-
-	acl_obj := &acl_proto.ApiClientACL{}
-	user_path_manager := paths.UserPathManager{Name: principal}
-	err = db.GetSubject(config_obj, user_path_manager.ACL(), acl_obj)
-	if err != nil {
-		return nil, err
-	}
-
-	return acl_obj, nil
-}
-
-// GetEffectivePolicy expands any roles in the policy object to
-// produce a simple object.
-func GetEffectivePolicy(
-	config_obj *config_proto.Config,
-	principal string) (*acl_proto.ApiClientACL, error) {
-
-	db, err := datastore.GetDB(config_obj)
-	if err != nil {
-		return nil, err
-	}
-
-	acl_obj := &acl_proto.ApiClientACL{}
-	user_path_manager := paths.UserPathManager{Name: principal}
-	err = db.GetSubject(config_obj, user_path_manager.ACL(), acl_obj)
-	if err != nil {
-		return nil, err
-	}
-
-	err = GetRolePermissions(config_obj, acl_obj.Roles, acl_obj)
-	if err != nil {
-		return nil, err
-	}
-
-	return acl_obj, nil
-}
-
-func SetPolicy(
-	config_obj *config_proto.Config,
-	principal string, acl_obj *acl_proto.ApiClientACL) error {
-
-	db, err := datastore.GetDB(config_obj)
-	if err != nil {
-		return err
-	}
-
-	user_path_manager := paths.UserPathManager{Name: principal}
-	return db.SetSubject(config_obj, user_path_manager.ACL(), acl_obj)
-}
-
-func CheckAccess(
-	config_obj *config_proto.Config,
-	principal string,
-	permissions ...ACL_PERMISSION) (bool, error) {
-
-	// Internal calls from the server are allowed to do anything.
-	if config_obj.Client != nil && principal == config_obj.Client.PinnedServerName {
-		return true, nil
-	}
-
-	if principal == "" {
-		return false, nil
-	}
-
-	acl_obj, err := GetEffectivePolicy(config_obj, principal)
-	if err != nil {
-		return false, err
-	}
-
-	for _, permission := range permissions {
-		ok, err := CheckAccessWithToken(acl_obj, permission)
-		if !ok || err != nil {
-			return ok, err
-		}
-	}
-
-	return true, nil
-}
-
-func CheckAccessWithToken(
-	token *acl_proto.ApiClientACL,
-	permission ACL_PERMISSION, args ...string) (bool, error) {
-
-	// Requested permission
-	switch permission {
-	case ALL_QUERY:
-		return token.AllQuery, nil
-
-	case ANY_QUERY:
-		return token.AnyQuery, nil
-
-	case PUBLISH:
-		if len(args) == 1 {
-			for _, allowed_queue := range token.PublishQueues {
-				if allowed_queue == args[0] {
-					return true, nil
-				}
-
-			}
-		}
-
-	case READ_RESULTS:
-		return token.ReadResults, nil
-
-	case LABEL_CLIENT:
-		return token.LabelClients, nil
-
-	case COLLECT_CLIENT:
-		return token.CollectClient, nil
-
-	case COLLECT_SERVER:
-		return token.CollectServer, nil
-
-	case ARTIFACT_WRITER:
-		return token.ArtifactWriter, nil
-
-	case SERVER_ARTIFACT_WRITER:
-		return token.ServerArtifactWriter, nil
-
-	case EXECVE:
-		return token.Execve, nil
-
-	case NOTEBOOK_EDITOR:
-		return token.NotebookEditor, nil
-
-	case SERVER_ADMIN:
-		return token.ServerAdmin, nil
-
-	case FILESYSTEM_READ:
-		return token.FilesystemRead, nil
-
-	case FILESYSTEM_WRITE:
-		return token.FilesystemWrite, nil
-
-	case MACHINE_STATE:
-		return token.MachineState, nil
-
-	case PREPARE_RESULTS:
-		return token.PrepareResults, nil
-
-	case DATASTORE_ACCESS:
-		return token.DatastoreAccess, nil
-
-	}
-
-	return false, nil
 }

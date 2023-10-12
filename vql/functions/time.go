@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"www.velocidex.com/golang/vfilter/protocols"
 	"www.velocidex.com/golang/vfilter/types"
 
 	"github.com/Velocidex/ordereddict"
@@ -26,7 +27,12 @@ const (
 )
 
 var (
-	invalidTimeError = errors.New("Invalid time")
+	invalidTimeError     = errors.New("Invalid time")
+	exported_time_fields = []string{
+		"Day", "Hour", "ISOWeek", "IsDST", "IsZero", "Minute",
+		"Month", "Nanosecond", "Second", "String", "UTC",
+		"Unix", "UnixMicro", "UnixMilli", "UnixNano",
+		"Weekday", "Year", "YearDay", "Zone"}
 )
 
 type cachedTime struct {
@@ -203,6 +209,12 @@ func TimeFromAny(scope vfilter.Scope, timestamp vfilter.Any) (time.Time, error) 
 		if t == "" {
 			return time.Time{}, nil
 		}
+		// It might really be an int encoded as a string.
+		int_time, ok := utils.ToInt64(t)
+		if ok {
+			return TimeFromAny(scope, int_time)
+		}
+
 		return ParseTimeFromString(scope, t)
 
 	case time.Time:
@@ -223,25 +235,13 @@ func TimeFromAny(scope vfilter.Scope, timestamp vfilter.Any) (time.Time, error) 
 			return time.Time{}, invalidTimeError
 		}
 
-		// Maybe it is in ns
-		if sec > 20000000000000000 { // 11 October 2603 in microsec
-			dec = sec
-			sec = 0
-
-		} else if sec > 20000000000000 { // 11 October 2603 in milliseconds
-			dec = sec * 1000
-			sec = 0
-
-		} else if sec > 20000000000 { // 11 October 2603 in seconds
-			dec = sec * 1000000
-			sec = 0
-		}
+		return utils.ParseTimeFromInt64(sec), nil
 	}
 
 	// Empty times are allowed, they will just be set to the earliest
 	// time we have (Note this is not the epoch!).
 	if sec == 0 && dec == 0 {
-		return time.Time{}, invalidTimeError
+		return time.Time{}, nil
 	}
 
 	return time.Unix(int64(sec), int64(dec)), nil
@@ -493,6 +493,41 @@ func (self _TimeEqInt) Applicable(a vfilter.Any, b vfilter.Any) bool {
 	return ok
 }
 
+type _TimeAssociative struct{}
+
+// Filter some method calls to be more useful.
+func (self _TimeAssociative) Associative(scope vfilter.Scope, a vfilter.Any, b vfilter.Any) (vfilter.Any, bool) {
+	a_time, ok := utils.IsTime(a)
+	if !ok {
+		return &vfilter.Null{}, false
+	}
+
+	method, ok := b.(string)
+	if !ok {
+		return &vfilter.Null{}, false
+	}
+
+	if method == "String" {
+		return a_time.UTC().Format(time.RFC3339), true
+	}
+
+	return protocols.DefaultAssociative{}.Associative(scope, a, method)
+}
+
+func (self _TimeAssociative) Applicable(a vfilter.Any, b vfilter.Any) bool {
+	_, a_ok := utils.IsTime(a)
+	if !a_ok {
+		return false
+	}
+
+	_, ok := b.(string)
+	return ok
+}
+
+func (self _TimeAssociative) GetMembers(scope vfilter.Scope, a vfilter.Any) []string {
+	return exported_time_fields
+}
+
 func init() {
 	vql_subsystem.RegisterFunction(&_Timestamp{})
 	vql_subsystem.RegisterProtocol(&_TimeLt{})
@@ -502,5 +537,6 @@ func init() {
 	vql_subsystem.RegisterProtocol(&_TimeLtString{})
 	vql_subsystem.RegisterProtocol(&_TimeGtString{})
 	vql_subsystem.RegisterProtocol(&_TimeEq{})
+	vql_subsystem.RegisterProtocol(&_TimeAssociative{})
 	vql_subsystem.RegisterProtocol(&_TimeEqInt{})
 }

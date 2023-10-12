@@ -13,17 +13,23 @@ import (
 
 	"github.com/Velocidex/ordereddict"
 	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/velociraptor/vql/windows"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
+	"www.velocidex.com/golang/vfilter/types"
 )
 
 type VMemInfo struct {
-	Address     uint64
-	Size        uint64
-	MappingName string
-	Protection  string
+	Address       uint64
+	Size          uint64
+	MappingName   string
+	State         string
+	Type          string
+	Protection    string
+	ProtectionMsg string
+	ProtectionRaw uint32
 }
 
 type ModuleInfo struct {
@@ -65,7 +71,8 @@ func (self ModulesPlugin) Call(
 
 		modules, err := GetProcessModules(uint32(arg.Pid))
 		if err != nil {
-			scope.Log("modules: %s", err.Error())
+			scope.Log("modules: GetProcessModules %v: %v",
+				GetProcessContext(ctx, scope, uint64(arg.Pid)), err)
 			return
 		}
 
@@ -84,9 +91,10 @@ func (self ModulesPlugin) Call(
 
 func (self ModulesPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "modules",
-		Doc:     "Enumerate Loaded DLLs.",
-		ArgType: type_map.AddType(scope, &PidArgs{}),
+		Name:     "modules",
+		Doc:      "Enumerate Loaded DLLs.",
+		ArgType:  type_map.AddType(scope, &PidArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	}
 }
 
@@ -112,9 +120,9 @@ func (self VADPlugin) Call(
 			return
 		}
 
-		vads, handle, err := GetVads(uint32(arg.Pid))
+		vads, handle, err := GetVads(ctx, scope, uint32(arg.Pid))
 		if err != nil {
-			scope.Log("vad: %s", err.Error())
+			scope.Log("vad: %v", err)
 			return
 		}
 		defer windows.CloseHandle(handle)
@@ -139,7 +147,9 @@ func (self VADPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfil
 	}
 }
 
-func GetVads(pid uint32) ([]*VMemInfo, syscall.Handle, error) {
+func GetVads(
+	ctx context.Context, scope types.Scope,
+	pid uint32) ([]*VMemInfo, syscall.Handle, error) {
 	result := []*VMemInfo{}
 
 	proc_handle, err := windows.OpenProcess(
@@ -147,7 +157,8 @@ func GetVads(pid uint32) ([]*VMemInfo, syscall.Handle, error) {
 		false, pid)
 	if err != nil {
 		return nil, 0, errors.New(
-			fmt.Sprintf("OpenProcess for pid %v: %v ", pid, err))
+			fmt.Sprintf("OpenProcess for pid %v: %v ",
+				GetProcessContext(ctx, scope, uint64(pid)), err))
 	}
 
 	var si windows.SYSTEM_INFO
@@ -177,10 +188,14 @@ func GetVads(pid uint32) ([]*VMemInfo, syscall.Handle, error) {
 		// Ignore pages with no access.
 		if info.Protect != windows.PAGE_NOACCESS {
 			result = append(result, &VMemInfo{
-				Address:     info.BaseAddress,
-				Size:        info.RegionSize,
-				MappingName: filename,
-				Protection:  getProtection(info.Protect),
+				Address:       info.BaseAddress,
+				Size:          info.RegionSize,
+				MappingName:   filename,
+				State:         getState(info.State),
+				Type:          getType(info.Type),
+				Protection:    getProtection(info.Protect),
+				ProtectionMsg: getProtectionMsg(info.Protect),
+				ProtectionRaw: info.Protect,
 			})
 		}
 
@@ -228,6 +243,62 @@ func GetProcessModules(pid uint32) ([]ModuleInfo, error) {
 				fmt.Sprintf("Module32Next for pid %v: %v ", pid, err))
 		}
 	}
+}
+
+func getState(p uint32) string {
+	switch p {
+	case 0x1000:
+		return "MEM_COMMIT"
+	case 0x10000:
+		return "MEM_FREE"
+	case 0x2000:
+		return "MEM_RESERVE"
+	default:
+		return fmt.Sprintf("Unknown %d", p)
+	}
+}
+
+func getType(p uint32) string {
+	switch p {
+	case 0x1000000:
+		return "MEM_IMAGE"
+	case 0x40000:
+		return "MEM_MAPPED"
+	case 0x20000:
+		return "MEM_PRIVATE"
+	default:
+		return fmt.Sprintf("Unknown %d", p)
+	}
+}
+
+func getProtectionMsg(p uint32) string {
+	result := []string{}
+	if p&windows.PAGE_EXECUTE > 0 {
+		result = append(result, "PAGE_EXECUTE")
+	}
+	if p&windows.PAGE_EXECUTE_READ > 0 {
+		result = append(result, "PAGE_EXECUTE_READ")
+	}
+	if p&windows.PAGE_EXECUTE_READWRITE > 0 {
+		result = append(result, "PAGE_EXECUTE_READWRITE")
+	}
+	if p&windows.PAGE_EXECUTE_WRITECOPY > 0 {
+		result = append(result, "PAGE_EXECUTE_WRITECOPY")
+	}
+	if p&windows.PAGE_NOACCESS > 0 {
+		result = append(result, "PAGE_NOACCESS")
+	}
+	if p&windows.PAGE_READONLY > 0 {
+		result = append(result, "PAGE_READONLY")
+	}
+	if p&windows.PAGE_READWRITE > 0 {
+		result = append(result, "PAGE_READWRITE")
+	}
+	if p&windows.PAGE_WRITECOPY > 0 {
+		result = append(result, "PAGE_WRITECOPY")
+	}
+
+	return strings.Join(result, ",")
 }
 
 func getProtection(p uint32) string {

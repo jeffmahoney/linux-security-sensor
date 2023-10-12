@@ -10,12 +10,13 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tink-ab/tempfile"
 	"www.velocidex.com/golang/velociraptor/acls"
 	"www.velocidex.com/golang/velociraptor/actions"
 	"www.velocidex.com/golang/velociraptor/logging"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/vql/tools/process"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
 )
@@ -50,72 +51,28 @@ func remove(scope vfilter.Scope, name string) {
 	}
 }
 
-func writeMetrics(scope vfilter.Scope, output_chan chan vfilter.Row) {
-	gathering, err := prometheus.DefaultGatherer.Gather()
+func writeMetrics(
+	ctx context.Context, scope vfilter.Scope, output_chan chan vfilter.Row) {
+	metrics, err := getMetrics()
 	if err != nil {
 		scope.Log("profile: while gathering metrics: %v", err)
 		return
 	}
 
-	for _, metric := range gathering {
-		for _, m := range metric.Metric {
-			var value interface{}
-			if m.Gauge != nil {
-				value = int64(*m.Gauge.Value)
-			} else if m.Counter != nil {
-				value = int64(*m.Counter.Value)
-			} else if m.Histogram != nil {
-				// Histograms are buckets so we send a dict.
-				result := ordereddict.NewDict()
-				value = result
-
-				label := "_"
-				for _, l := range m.Label {
-					label += *l.Value + "_"
-				}
-
-				for idx, b := range m.Histogram.Bucket {
-					name := fmt.Sprintf("%v%v_%0.2f", *metric.Name,
-						label, *b.UpperBound)
-					if idx == len(m.Histogram.Bucket)-1 {
-						name = fmt.Sprintf("%v%v_inf", *metric.Name,
-							label)
-					}
-					result.Set(name, int64(*b.CumulativeCount))
-				}
-
-			} else if m.Summary != nil {
-				result := ordereddict.NewDict().
-					Set(fmt.Sprintf("%v_sample_count", *metric.Name),
-						m.Summary.SampleCount)
-				value = result
-
-				for _, b := range m.Summary.Quantile {
-					name := fmt.Sprintf("%v_%v", *metric.Name, *b.Quantile)
-					result.Set(name, int64(*b.Value))
-				}
-
-			} else if m.Untyped != nil {
-				value = int64(*m.Untyped.Value)
-
-			} else {
-				// Unknown type just send the raw metric
-				value = m
-			}
-
-			output_chan <- ordereddict.NewDict().
-				Set("Type", "metrics").
-				Set("Line", ordereddict.NewDict().
-					Set("name", *metric.Name).
-					Set("help", *metric.Help).
-					Set("value", value)).
-				Set("FullPath", "").
-				Set("_RawMetric", m)
+	for _, metric := range metrics {
+		select {
+		case <-ctx.Done():
+			return
+		case output_chan <- ordereddict.NewDict().
+			Set("Type", "metrics").
+			Set("Line", metric).
+			Set("OSPath", ""):
 		}
 	}
 }
 
-func writeProfile(scope vfilter.Scope,
+func writeProfile(
+	ctx context.Context, scope vfilter.Scope,
 	output_chan chan vfilter.Row, name string, debug int64) {
 	tmpfile, err := ioutil.TempFile("", "tmp*.tmp")
 	if err != nil {
@@ -144,10 +101,15 @@ func writeProfile(scope vfilter.Scope,
 		return
 	}
 
-	output_chan <- ordereddict.NewDict().
+	select {
+	case <-ctx.Done():
+		return
+	case output_chan <- ordereddict.NewDict().
 		Set("Type", name).
 		Set("Line", fmt.Sprintf("Generating profile %v", name)).
-		Set("FullPath", tmpfile.Name())
+		Set("FullPath", tmpfile.Name()).
+		Set("OSPath", tmpfile.Name()):
+	}
 }
 
 func writeCPUProfile(
@@ -179,10 +141,14 @@ func writeCPUProfile(
 	}
 	pprof.StopCPUProfile()
 
-	output_chan <- ordereddict.NewDict().
+	select {
+	case <-ctx.Done():
+		return
+	case output_chan <- ordereddict.NewDict().
 		Set("Type", "profile").
 		Set("Line", "Generating CPU profile").
-		Set("FullPath", tmpfile.Name())
+		Set("OSPath", tmpfile.Name()):
+	}
 }
 
 func writeTraceProfile(
@@ -210,10 +176,15 @@ func writeTraceProfile(
 	}
 	trace.Stop()
 
-	output_chan <- ordereddict.NewDict().
+	select {
+	case <-ctx.Done():
+		return
+	case output_chan <- ordereddict.NewDict().
 		Set("Type", "trace").
 		Set("Line", "Generating Trace profile").
-		Set("FullPath", tmpfile.Name())
+		Set("FullPath", tmpfile.Name()).
+		Set("OSPath", tmpfile.Name()):
+	}
 }
 
 type ProfilePlugin struct{}
@@ -244,23 +215,23 @@ func (self *ProfilePlugin) Call(ctx context.Context,
 		}
 
 		if arg.Allocs {
-			writeProfile(scope, output_chan, "allocs", arg.Debug)
+			writeProfile(ctx, scope, output_chan, "allocs", arg.Debug)
 		}
 
 		if arg.Block {
-			writeProfile(scope, output_chan, "block", arg.Debug)
+			writeProfile(ctx, scope, output_chan, "block", arg.Debug)
 		}
 
 		if arg.Goroutine {
-			writeProfile(scope, output_chan, "goroutine", arg.Debug)
+			writeProfile(ctx, scope, output_chan, "goroutine", arg.Debug)
 		}
 
 		if arg.Heap {
-			writeProfile(scope, output_chan, "heap", arg.Debug)
+			writeProfile(ctx, scope, output_chan, "heap", arg.Debug)
 		}
 
 		if arg.Mutex {
-			writeProfile(scope, output_chan, "mutex", arg.Debug)
+			writeProfile(ctx, scope, output_chan, "mutex", arg.Debug)
 		}
 
 		if arg.Profile {
@@ -272,7 +243,15 @@ func (self *ProfilePlugin) Call(ctx context.Context,
 		}
 
 		if arg.Metrics {
-			writeMetrics(scope, output_chan)
+			writeMetrics(ctx, scope, output_chan)
+			select {
+			case <-ctx.Done():
+				return
+
+			case output_chan <- ordereddict.NewDict().
+				Set("Type", "process_tracker").
+				Set("Line", process.GetGlobalTracker().Stats()):
+			}
 		}
 
 		if arg.Logs {
@@ -284,7 +263,7 @@ func (self *ProfilePlugin) Call(ctx context.Context,
 				case output_chan <- ordereddict.NewDict().
 					Set("Type", "logs").
 					Set("Line", line).
-					Set("FullPath", ""):
+					Set("OSPath", ""):
 				}
 			}
 		}
@@ -298,7 +277,7 @@ func (self *ProfilePlugin) Call(ctx context.Context,
 				case output_chan <- ordereddict.NewDict().
 					Set("Type", "query").
 					Set("Line", q).
-					Set("FullPath", ""):
+					Set("OSPath", ""):
 				}
 			}
 		}
@@ -311,9 +290,10 @@ func (self *ProfilePlugin) Call(ctx context.Context,
 func (self ProfilePlugin) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "profile",
-		Doc:     "Returns a profile dump from the running process.",
-		ArgType: type_map.AddType(scope, &ProfilePluginArgs{}),
+		Name:     "profile",
+		Doc:      "Returns a profile dump from the running process.",
+		ArgType:  type_map.AddType(scope, &ProfilePluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	}
 }
 

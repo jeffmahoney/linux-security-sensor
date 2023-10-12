@@ -1,3 +1,38 @@
+/*
+  The client info manager caches client information in memory for
+  quick access without having to generate IO for each client record.
+
+  We maintain client stats as as:
+
+  - Ping time - When the client was last seen - this is useful for the GUI
+
+  - IpAddress - Last seen IP address
+
+  - LastHuntTimestamp - the last hunt that was run on this
+    client. This is used by the hunt dispatcher to decide which hunts
+    should be assigned to the client.
+
+  - LastEventTableVersion - the version of the client event table the
+    client currently has.
+
+  While client stats are needed on both the master and minion nodes
+  our goal is to minimize IO to the filestore.
+
+  Therefore we have the following rules:
+
+  1. Minions can read client info from the datastore but do not
+     update it - Instead they send update mutation to the
+     Server.Internal.ClientPing queue.
+
+  2. Only the master writes the update stats to storage.
+
+  3. All other nodes (master and minions) maintain their own internal
+     cache by following the Server.Internal.ClientPing queue.
+
+  4. Update mutations are sent periodically in a combined way to
+     avoid RPC overheads.
+*/
+
 package client_info
 
 import (
@@ -7,202 +42,124 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
-	"github.com/Velocidex/ttlcache/v2"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	"www.velocidex.com/golang/velociraptor/datastore"
-	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/velociraptor/services/journal"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
-	metricLRUCount = promauto.NewGauge(
-		prometheus.GaugeOpts{
-			Name: "client_info_lru_size",
-			Help: "Number of entries in client lru",
-		})
-
-	invalidError = errors.New("Invalid")
+	invalidError       = errors.New("Invalid")
+	invalidClientError = errors.New("Invalid Client Id")
 )
-
-const (
-	MAX_PING_SYNC_SEC = 10
-)
-
-type CachedInfo struct {
-	mu sync.Mutex
-
-	owner *ClientInfoManager
-
-	// Fresh data may not be flushed yet.
-	dirty bool
-
-	// Data on disk
-	record *services.ClientInfo
-
-	// Does this client have tasks outstanding?
-	has_tasks TASKS_AVAILABLE_STATUS
-
-	last_flush uint64
-}
-
-func (self *CachedInfo) SetHasTasks(status TASKS_AVAILABLE_STATUS) {
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	self.has_tasks = status
-}
-
-func (self *CachedInfo) GetHasTasks() TASKS_AVAILABLE_STATUS {
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	return self.has_tasks
-}
-
-func (self *CachedInfo) GetStats() *services.Stats {
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	return &services.Stats{
-		Ping:                  self.record.Ping,
-		IpAddress:             self.record.IpAddress,
-		LastHuntTimestamp:     self.record.LastHuntTimestamp,
-		LastEventTableVersion: self.record.LastEventTableVersion,
-	}
-}
-
-func (self *CachedInfo) UpdateStats(cb func(stats *services.Stats)) {
-	self.mu.Lock()
-
-	stats := &services.Stats{}
-
-	cb(stats)
-	self.dirty = true
-
-	if stats.Ping > 0 {
-		self.record.Ping = stats.Ping
-	}
-
-	if stats.IpAddress != "" {
-		self.record.IpAddress = stats.IpAddress
-	}
-
-	if stats.LastHuntTimestamp > 0 {
-		self.record.LastHuntTimestamp = stats.LastHuntTimestamp
-	}
-
-	if stats.LastEventTableVersion > 0 {
-		self.record.LastEventTableVersion = stats.LastEventTableVersion
-	}
-
-	// Notify other minions of the stats update.
-	now := uint64(self.owner.Clock.Now().UnixNano() / 1000)
-	if now > self.last_flush+1000000*MAX_PING_SYNC_SEC {
-		self.mu.Unlock()
-
-		self.owner.SendStats(self.record.ClientId, stats)
-
-		self.Flush()
-		return
-	}
-	self.mu.Unlock()
-}
-
-// Write ping record to data store
-func (self *CachedInfo) Flush() error {
-	self.mu.Lock()
-
-	// Nothing to do
-	if !self.dirty {
-		self.mu.Unlock()
-		return nil
-	}
-
-	ping_client_info := &actions_proto.ClientInfo{
-		Ping:                  self.record.Ping,
-		PingTime:              time.Unix(0, int64(self.record.Ping)*1000).String(),
-		IpAddress:             self.record.IpAddress,
-		LastHuntTimestamp:     self.record.LastHuntTimestamp,
-		LastEventTableVersion: self.record.LastEventTableVersion,
-	}
-	client_id := self.record.ClientId
-	self.dirty = false
-	self.last_flush = uint64(self.owner.Clock.Now().UnixNano() / 1000)
-	self.mu.Unlock()
-
-	// Record some stats about the client.
-	db, err := datastore.GetDB(self.owner.config_obj)
-	if err != nil {
-		return err
-	}
-
-	// A blind write will eventually hit the disk.
-	client_path_manager := paths.NewClientPathManager(client_id)
-	db.SetSubjectWithCompletion(
-		self.owner.config_obj, client_path_manager.Ping(),
-		ping_client_info, utils.BackgroundWriter)
-
-	return nil
-}
 
 type ClientInfoManager struct {
-	config_obj *config_proto.Config
+	config_obj       *config_proto.Config
+	uuid             int64
+	mu               sync.Mutex
+	mutation_manager *MutationManager
 
-	// Stores client_id -> *CachedInfo
-	lru *ttlcache.Cache
-
-	Clock utils.Clock
-
-	uuid int64
-
-	mu    sync.Mutex
-	queue []*ordereddict.Dict
+	storage *Store
 }
 
-func (self *ClientInfoManager) GetCachedClients() []string {
-	return self.lru.GetKeys()
+func (self *ClientInfoManager) ListClients(ctx context.Context) <-chan string {
+	output_chan := make(chan string)
+	go func() {
+		defer close(output_chan)
+
+		for _, key := range self.storage.Keys() {
+			select {
+			case <-ctx.Done():
+				return
+			case output_chan <- key:
+			}
+		}
+	}()
+
+	return output_chan
 }
 
-func (self *ClientInfoManager) SendStats(client_id string, stats *services.Stats) {
-	journal, err := services.GetJournal()
-	if err != nil {
-		return
-	}
-
-	journal.PushRowsToArtifactAsync(self.config_obj,
-		ordereddict.NewDict().
-			Set("ClientId", client_id).
-			Set("Stats", json.MustMarshalString(stats)).
-			Set("From", self.uuid),
-		"Server.Internal.ClientPing")
-}
-
-func (self *ClientInfoManager) GetStats(client_id string) (*services.Stats, error) {
-	cached_info, err := self.GetCacheInfo(client_id)
+func (self *ClientInfoManager) GetStats(
+	ctx context.Context, client_id string) (*services.Stats, error) {
+	record, err := self.storage.GetRecord(client_id)
 	if err != nil {
 		return nil, err
 	}
 
-	return cached_info.GetStats(), nil
+	return &services.Stats{
+		Ping:                  record.Ping,
+		IpAddress:             record.IpAddress,
+		LastHuntTimestamp:     record.LastHuntTimestamp,
+		LastEventTableVersion: record.LastEventTableVersion,
+	}, nil
+}
+
+// Checks the notification service for all currently connected clients
+// so we may send the most up to date Ping information possible.
+func (self *ClientInfoManager) UpdateMostRecentPing(ctx context.Context) {
+	notifier, err := services.GetNotifier(self.config_obj)
+	if err != nil {
+		return
+	}
+	now := uint64(time.Now().UnixNano() / 1000)
+	update_stat := &services.Stats{}
+	for _, client_id := range self.mutation_manager.pings.Keys() {
+		if notifier.IsClientDirectlyConnected(client_id) {
+			update_stat.Ping = now
+			self.UpdateStats(ctx, client_id, update_stat)
+		}
+	}
 }
 
 func (self *ClientInfoManager) UpdateStats(
+	ctx context.Context,
 	client_id string,
-	cb func(stats *services.Stats)) error {
-	cached_info, err := self.GetCacheInfo(client_id)
+	stats *services.Stats) error {
+
+	record, err := self.storage.GetRecord(client_id)
 	if err != nil {
-		return err
+		// If a record does not exist, just make one
+		record = &actions_proto.ClientInfo{
+			ClientId: client_id,
+		}
 	}
 
-	cached_info.UpdateStats(cb)
-	return nil
+	if stats.Ping > 0 && stats.Ping > record.Ping {
+		if self.mutation_manager != nil {
+			self.mutation_manager.AddPing(client_id, stats.Ping)
+		}
+		record.Ping = stats.Ping
+	}
+
+	if stats.IpAddress != "" &&
+		stats.IpAddress != record.IpAddress {
+		if self.mutation_manager != nil {
+			self.mutation_manager.AddIPAddress(client_id, stats.IpAddress)
+		}
+		record.IpAddress = stats.IpAddress
+	}
+
+	if stats.LastHuntTimestamp > 0 &&
+		stats.LastHuntTimestamp > record.LastHuntTimestamp {
+		if self.mutation_manager != nil {
+			self.mutation_manager.AddLastHuntTimestamp(
+				client_id, stats.LastHuntTimestamp)
+		}
+		record.LastHuntTimestamp = stats.LastHuntTimestamp
+	}
+
+	if stats.LastEventTableVersion > 0 &&
+		stats.LastEventTableVersion > record.LastEventTableVersion {
+		if self.mutation_manager != nil {
+			self.mutation_manager.AddLastEventTableVersion(client_id,
+				stats.LastEventTableVersion)
+		}
+		record.LastEventTableVersion = stats.LastEventTableVersion
+	}
+
+	return self.storage.SetRecord(record)
 }
 
 func (self *ClientInfoManager) Start(
@@ -211,45 +168,166 @@ func (self *ClientInfoManager) Start(
 	wg *sync.WaitGroup) error {
 
 	logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
-	logger.Info("<green>Starting</> Client Info service.")
+	logger.Info("<green>Starting</> Client Info service for %v.",
+		services.GetOrgName(config_obj))
 
-	// Watch for clients that are deleted and remove from local cache.
-	err := journal.WatchQueueWithCB(ctx, config_obj, wg,
-		"Server.Internal.ClientDelete", self.ProcessInterrogateResults)
-	if err != nil {
-		return err
-	}
+	// Start syncing the mutation_manager
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
 
-	// When clients are notified they need to refresh their tasks list
-	// and invalidate the cache.
-	err = journal.WatchQueueWithCB(ctx, config_obj, wg,
-		"Server.Internal.ClientTasks", self.ProcessNotification)
-	if err != nil {
-		return err
-	}
+		self.MutationSync(ctx, config_obj)
+	}()
 
-	// The master will be informed when new clients appear.
-	is_master := services.IsMaster(config_obj)
-	if is_master {
-		err = journal.WatchQueueWithCB(ctx, config_obj, wg,
-			"Server.Internal.ClientPing", self.ProcessPing)
+	// Only the master node writes to storage - there is no need to
+	// flush to disk that frequently because the master keeps a hot
+	// copy of the data in memory.
+	if services.IsMaster(config_obj) {
+		// By default write every 5 minutes
+		write_time := time.Duration(300) * time.Second
+		if config_obj.Frontend != nil && config_obj.Frontend.Resources != nil &&
+			config_obj.Frontend.Resources.ClientInfoWriteTime > 0 {
+			write_time = time.Duration(
+				config_obj.Frontend.Resources.ClientInfoWriteTime) * time.Second
+		}
+
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// When we teardown write the data to storage if needed.
+			defer self.storage.SaveSnapshot(ctx, config_obj)
+
+			for {
+				select {
+				case <-ctx.Done():
+					return
+
+				case <-time.After(write_time):
+					err := self.storage.SaveSnapshot(ctx, config_obj)
+					if err != nil {
+						logger.Error(
+							"<red>ClientInfo Manager</>: writing snapshot: %v for org %v",
+							err, services.GetOrgName(config_obj))
+					}
+				}
+			}
+		}()
+
+	} else {
+		// Minions watch for Server.Internal.ClientInfoSnapshot to
+		// trigger their snapshot loading.
+		err := journal.WatchQueueWithCB(ctx, config_obj, wg,
+			"Server.Internal.ClientInfoSnapshot",
+			"ClientInfoManager",
+			self.ProcessSnapshotWrites)
 		if err != nil {
 			return err
 		}
 	}
 
-	return journal.WatchQueueWithCB(ctx, config_obj, wg,
-		"Server.Internal.Interrogation", self.ProcessInterrogateResults)
+	// This is a mechanism that allows clients to be notified as soon
+	// as possible - without needing to wait for snapshot
+	// update. Minions listen for this event and immediately update
+	// the has_tasks field in the client record.
+	err := journal.WatchQueueWithCB(ctx, config_obj, wg,
+		"Server.Internal.ClientTasks",
+		"ClientInfoManager",
+		self.ProcessNotification)
+	if err != nil {
+		return err
+	}
+
+	// The master will be informed when new clients appear.
+	err = journal.WatchQueueWithCB(ctx, config_obj, wg,
+		"Server.Internal.ClientPing",
+		"ClientInfoManager",
+		self.ProcessPing)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (self *ClientInfoManager) ProcessInterrogateResults(
+func (self *ClientInfoManager) ProcessSnapshotWrites(
 	ctx context.Context, config_obj *config_proto.Config,
 	row *ordereddict.Dict) error {
-	client_id, pres := row.GetString("ClientId")
-	if pres {
-		self.lru.Remove(client_id)
+
+	from, pres := row.GetInt64("From")
+	if !pres || from == 0 {
+		return invalidError
 	}
-	return nil
+
+	// Ignore messages coming from us.
+	if from == self.uuid {
+		return nil
+	}
+
+	// If we receive a snapshot write broadcast then we are a minion
+	// and we must re-read the snapshot to receive the new data.
+	return self.storage.LoadFromSnapshot(ctx, config_obj)
+}
+
+// Send mutations periodically
+func (self *ClientInfoManager) MutationSync(
+	ctx context.Context, config_obj *config_proto.Config) {
+
+	frontend_manager, err := services.GetFrontendManager(config_obj)
+	if err != nil {
+		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+		logger.Info("MutationSync: %v.", err)
+		return
+	}
+
+	sync_time := time.Duration(10) * time.Second
+	if config_obj.Frontend != nil && config_obj.Frontend.Resources != nil &&
+		config_obj.Frontend.Resources.ClientInfoSyncTime > 0 {
+		sync_time = time.Duration(config_obj.Frontend.Resources.ClientInfoSyncTime) * time.Millisecond
+	}
+
+	journal, err := services.GetJournal(config_obj)
+	if err != nil {
+		logger := logging.GetLogger(config_obj, &logging.FrontendComponent)
+		logger.Info("MutationSync: %v.", err)
+		return
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+
+		case <-time.After(sync_time):
+			// Single server deployment does not need to sync
+			// anything. We only sync on multi-frontend deployments
+			// for the master to announce changes to the minions and
+			// the minions to inform the master. NOTE: We still have
+			// to check this at every iteration because a minion can
+			// connect at any time.
+			if services.IsMaster(config_obj) &&
+				frontend_manager.GetMinionCount() == 0 {
+				continue
+			}
+
+			// Only send a mutation if something has changed.
+			size := self.mutation_manager.Size()
+			if size > 0 {
+
+				logger := logging.GetLogger(self.config_obj, &logging.FrontendComponent)
+				logger.Debug("ClientInfoManager: sending a mutation with %v items", size)
+
+				// Update the ping info to the latest
+				//self.UpdateMostRecentPing()
+
+				journal.PushRowsToArtifactAsync(ctx, config_obj,
+					ordereddict.NewDict().
+						Set("Mutation", self.mutation_manager.GetMutation()).
+						Set("From", self.uuid),
+					"Server.Internal.ClientPing")
+			}
+		}
+	}
 }
 
 func (self *ClientInfoManager) ProcessPing(
@@ -266,198 +344,144 @@ func (self *ClientInfoManager) ProcessPing(
 		return nil
 	}
 
-	client_id, pres := row.GetString("ClientId")
+	mutation, pres := getDict(row, "Mutation")
 	if !pres {
 		return invalidError
 	}
 
-	stats := &services.Stats{}
-	serialized, pres := row.GetString("Stats")
-	if !pres {
-		return invalidError
+	ping, pres := getDict(mutation, "Ping")
+	if pres {
+		for _, client_id := range ping.Keys() {
+			value, pres := ping.GetInt64(client_id)
+			if !pres {
+				continue
+			}
+			record, err := self.storage.GetRecord(client_id)
+			if err == nil {
+				record.Ping = uint64(value)
+				self.storage.SetRecord(record)
+			}
+		}
 	}
 
-	err := json.Unmarshal([]byte(serialized), &stats)
-	if err != nil {
-		return invalidError
+	ip_addresses, pres := getDict(mutation, "IpAddress")
+	if pres {
+		for _, client_id := range ip_addresses.Keys() {
+			value, pres := ip_addresses.GetString(client_id)
+			if !pres {
+				continue
+			}
+			record, err := self.storage.GetRecord(client_id)
+			if err == nil {
+				record.IpAddress = value
+				self.storage.SetRecord(record)
+			}
+		}
 	}
 
-	cached_info, err := self.GetCacheInfo(client_id)
-	if err == nil {
-		// Update our internal cache but do not notify further (since
-		// this came from a notification anyway).
-		cached_info.UpdateStats(func(cached_stats *services.Stats) {
-			if stats.Ping != 0 {
-				cached_stats.Ping = stats.Ping
+	last_hunt_timestamp, pres := getDict(mutation, "LastHuntTimestamp")
+	if pres {
+		for _, client_id := range last_hunt_timestamp.Keys() {
+			value, pres := last_hunt_timestamp.GetInt64(client_id)
+			if !pres {
+				continue
 			}
 
-			if stats.IpAddress != "" {
-				cached_stats.IpAddress = stats.IpAddress
+			record, err := self.storage.GetRecord(client_id)
+			if err == nil {
+				record.LastHuntTimestamp = uint64(value)
+				self.storage.SetRecord(record)
+			}
+		}
+	}
+
+	last_event_table_version, pres := getDict(mutation, "LastEventTableVersion")
+	if pres {
+		for _, client_id := range last_event_table_version.Keys() {
+			value, pres := last_event_table_version.GetInt64(client_id)
+			if !pres {
+				continue
 			}
 
-			if stats.LastHuntTimestamp > 0 {
-				cached_stats.LastHuntTimestamp = stats.LastHuntTimestamp
+			record, err := self.storage.GetRecord(client_id)
+			if err == nil {
+				record.LastEventTableVersion = uint64(value)
+				self.storage.SetRecord(record)
 			}
-
-			if stats.LastEventTableVersion > 0 {
-				cached_stats.LastEventTableVersion = stats.LastEventTableVersion
-			}
-		})
+		}
 	}
 
 	return nil
 }
 
-func (self *ClientInfoManager) Flush(client_id string) {
-	cache_info, err := self.GetCacheInfo(client_id)
-	if err == nil {
-		cache_info.Flush()
-	}
-	self.lru.Remove(client_id)
+func (self *ClientInfoManager) Modify(
+	ctx context.Context, client_id string,
+	modifier func(client_info *services.ClientInfo) (
+		*services.ClientInfo, error)) error {
+	return self.storage.Modify(ctx, client_id, modifier)
 }
 
-func (self *ClientInfoManager) Clear() {
-	self.lru.Purge()
-}
-
-func (self *ClientInfoManager) Get(client_id string) (*services.ClientInfo, error) {
-	cached_info, err := self.GetCacheInfo(client_id)
+func (self *ClientInfoManager) Get(
+	ctx context.Context, client_id string) (*services.ClientInfo, error) {
+	record, err := self.storage.GetRecord(client_id)
 	if err != nil {
 		return nil, err
 	}
 
-	// Return a copy so it can be read safely.
-	cached_info.mu.Lock()
-	res := cached_info.record.Copy()
-	cached_info.mu.Unlock()
-
-	return &res, nil
-}
-
-// Only look in the ttl cache - does not do any IO - best effort.
-func (self *ClientInfoManager) GetCacheInfoFromCache(
-	client_id string) (*CachedInfo, error) {
-	self.mu.Lock()
-	defer self.mu.Unlock()
-
-	cached_any, err := self.lru.Get(client_id)
-	if err != nil {
-		return nil, err
-	}
-
-	cache_info, ok := cached_any.(*CachedInfo)
-	if !ok {
-		return nil, invalidError
-	}
-
-	return cache_info, nil
-}
-
-// Load the cache info from cache or from storage.
-func (self *ClientInfoManager) GetCacheInfo(client_id string) (*CachedInfo, error) {
-	cached_info, err := self.GetCacheInfoFromCache(client_id)
+	// If the client is presently connected, then update the current
+	// last_seen time because it is more accurate than the ping
+	// messages written.
+	notifier, err := services.GetNotifier(self.config_obj)
 	if err == nil {
-		return cached_info, nil
+		if notifier.IsClientDirectlyConnected(client_id) {
+			record.Ping = uint64(utils.GetTime().Now().UnixNano() / 1000)
+			self.storage.SetRecord(record)
+		}
 	}
-	return self.GetCacheInfoFromStorage(client_id)
+
+	return &services.ClientInfo{*record}, nil
 }
 
-func (self *ClientInfoManager) GetCacheInfoFromStorage(
-	client_id string) (*CachedInfo, error) {
-	db, err := datastore.GetDB(self.config_obj)
-	if err != nil {
-		return nil, err
-	}
-
-	client_info := &services.ClientInfo{}
-	client_path_manager := paths.NewClientPathManager(client_id)
-
-	// Read the main client record
-	err = db.GetSubject(self.config_obj, client_path_manager.Path(),
-		&client_info.ClientInfo)
-	// Special case the server - it is a special client that does not
-	// need to enrol. It actually does have a client record becuase it
-	// needs to schedule tasks for itself.
-	if err != nil && client_id != "server" {
-		return nil, err
-	}
-
-	cache_info := &CachedInfo{
-		owner:  self,
-		record: client_info,
-	}
-
-	// Now read the ping info in case it is there.
-	ping_info := &services.ClientInfo{}
-	err = db.GetSubject(self.config_obj, client_path_manager.Ping(), ping_info)
-	if err == nil {
-		client_info.Ping = ping_info.Ping
-		client_info.IpAddress = ping_info.IpAddress
-		client_info.LastHuntTimestamp = ping_info.LastHuntTimestamp
-		client_info.LastEventTableVersion = ping_info.LastEventTableVersion
-		cache_info.last_flush = ping_info.Ping
-	}
-
-	// Set the new cached info in the lru.
-	self.mu.Lock()
-	self.lru.Set(client_id, cache_info)
-	self.mu.Unlock()
-
-	return cache_info, nil
+func (self *ClientInfoManager) Remove(ctx context.Context, client_id string) {
+	self.storage.Remove(client_id)
 }
 
-func NewClientInfoManager(config_obj *config_proto.Config) *ClientInfoManager {
-	expected_clients := int64(100)
-	if config_obj.Frontend != nil &&
-		config_obj.Frontend.Resources != nil &&
-		config_obj.Frontend.Resources.ExpectedClients > 0 {
-		expected_clients = config_obj.Frontend.Resources.ExpectedClients
+func (self *ClientInfoManager) Set(
+	ctx context.Context, client_info *services.ClientInfo) error {
+
+	if client_info.ClientId == "" {
+		return invalidClientError
 	}
+
+	return self.storage.SetRecord(&client_info.ClientInfo)
+}
+
+func NewClientInfoManager(
+	ctx context.Context,
+	config_obj *config_proto.Config) (*ClientInfoManager, error) {
 
 	// Calculate a unique id for each service.
 	service := &ClientInfoManager{
-		config_obj: config_obj,
-		uuid:       utils.GetGUID(),
-		lru:        ttlcache.NewCache(),
-		Clock:      &utils.RealClock{},
+		config_obj:       config_obj,
+		uuid:             utils.GetGUID(),
+		mutation_manager: NewMutationManager(),
+	}
+	service.storage = NewStorage(service.uuid)
+
+	err := service.storage.LoadFromSnapshot(ctx, config_obj)
+	if err != nil {
+		return nil, err
 	}
 
-	// When we teardown write the data to storage if needed.
-	defer service.lru.Purge()
-
-	service.lru.SetCacheSizeLimit(int(expected_clients))
-
-	if config_obj.Frontend != nil &&
-		config_obj.Frontend.Resources != nil &&
-		config_obj.Frontend.Resources.ClientInfoLruTtl > 0 {
-		service.lru.SetTTL(
-			time.Duration(config_obj.Frontend.Resources.ClientInfoLruTtl) *
-				time.Second)
-	}
-
-	// Keep track of the total number of items in the lru.
-	service.lru.SetNewItemCallback(func(key string, value interface{}) {
-		metricLRUCount.Inc()
-	})
-
-	service.lru.SetExpirationCallback(func(key string, value interface{}) {
-		info, ok := value.(*CachedInfo)
-		if ok {
-			info.Flush()
-		}
-		metricLRUCount.Dec()
-	})
-
-	return service
+	return service, nil
 }
 
-func StartClientInfoService(
-	ctx context.Context,
-	wg *sync.WaitGroup,
-	config_obj *config_proto.Config) error {
+func getDict(item *ordereddict.Dict, name string) (*ordereddict.Dict, bool) {
+	res, pres := item.Get(name)
+	if !pres {
+		return nil, false
+	}
 
-	service := NewClientInfoManager(config_obj)
-	services.RegisterClientInfoManager(service)
-
-	return service.Start(ctx, config_obj, wg)
+	res_dict, ok := res.(*ordereddict.Dict)
+	return res_dict, ok
 }

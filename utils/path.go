@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -193,7 +193,7 @@ func escapeComponent(component string) string {
 // The opposite of SplitComponents above.
 func JoinComponents(components []string, sep string) string {
 	if len(components) == 0 {
-		return sep
+		return ""
 	}
 
 	result := []string{}
@@ -242,4 +242,25 @@ func PathSplit(path string) (string, string) {
 
 func Clean(path string) string {
 	return JoinComponents(SplitComponents(path), "/")
+}
+
+func PathTrim(components []string, trim []string) []string {
+	for idx, c := range components {
+		if idx >= len(trim) || c != trim[idx] {
+			return CopySlice(components[idx:])
+		}
+	}
+	return nil
+}
+
+func PathComponentsJoin(prefix, path []string) []string {
+	result := make([]string, 0, len(prefix)+len(path))
+	for _, c := range prefix {
+		result = append(result, c)
+	}
+
+	for _, c := range path {
+		result = append(result, c)
+	}
+	return result
 }

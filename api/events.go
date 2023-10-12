@@ -1,28 +1,14 @@
 package api
 
 import (
-	"crypto/x509"
-	"os"
-	"sort"
-	"strings"
-
 	context "golang.org/x/net/context"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
-	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
 	"www.velocidex.com/golang/velociraptor/acls"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
-	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
-	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
-	file_store "www.velocidex.com/golang/velociraptor/file_store"
-	"www.velocidex.com/golang/velociraptor/file_store/api"
-	"www.velocidex.com/golang/velociraptor/paths/artifacts"
-	"www.velocidex.com/golang/velociraptor/result_sets"
 	"www.velocidex.com/golang/velociraptor/services"
-	users "www.velocidex.com/golang/velociraptor/users"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
@@ -30,138 +16,120 @@ func (self *ApiServer) PushEvents(
 	ctx context.Context,
 	in *api_proto.PushEventRequest) (*emptypb.Empty, error) {
 
-	// Get the TLS context from the peer and verify its
-	// certificate.
-	peer, ok := peer.FromContext(ctx)
+	defer Instrument("PushEvents")()
+
+	users := services.GetUserManager()
+	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	user_name := user_record.Name
+	token, err := services.GetEffectivePolicy(org_config_obj, user_name)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	// Check that the principal is allowed to push to the queue.
+	ok, err := services.CheckAccessWithToken(token, acls.PUBLISH, in.Artifact)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
 	if !ok {
-		return nil, status.Error(codes.InvalidArgument, "cant get peer info")
+		return nil, status.Error(codes.PermissionDenied,
+			"Permission denied: PUBLISH "+user_name+" to "+in.Artifact)
 	}
 
-	tlsInfo, ok := peer.AuthInfo.(credentials.TLSInfo)
-	if !ok {
-		return nil, status.Error(codes.InvalidArgument, "unable to get credentials")
+	rows, err := utils.ParseJsonToDicts([]byte(in.Jsonl))
+	if err != nil {
+		return nil, Status(self.verbose, err)
 	}
 
-	// Authenticate API clients using certificates.
-	for _, peer_cert := range tlsInfo.State.PeerCertificates {
-		chains, err := peer_cert.Verify(
-			x509.VerifyOptions{Roots: self.ca_pool})
+	// The call can access the datastore from any org becuase it is a
+	// server->server call.
+	if token.SuperUser && org_config_obj.OrgId != in.OrgId {
+		org_manager, err := services.GetOrgManager()
 		if err != nil {
-			return nil, err
+			return nil, Status(self.verbose, err)
 		}
 
-		if len(chains) == 0 {
-			return nil, status.Error(codes.InvalidArgument, "no chains verified")
-		}
-
-		peer_name := crypto_utils.GetSubjectName(peer_cert)
-		if peer_name != self.config.Client.PinnedServerName {
-			token, err := acls.GetEffectivePolicy(self.config, peer_name)
-			if err != nil {
-				return nil, err
-			}
-
-			// Check that the principal is allowed to push to the queue.
-			ok, err := acls.CheckAccessWithToken(token, acls.PUBLISH, in.Artifact)
-			if err != nil {
-				return nil, err
-			}
-
-			if !ok {
-				return nil, status.Error(codes.PermissionDenied,
-					"Permission denied: PUBLISH "+peer_name+" to "+in.Artifact)
-			}
-		}
-
-		rows, err := utils.ParseJsonToDicts([]byte(in.Jsonl))
+		org_config_obj, err = org_manager.GetOrgConfig(in.OrgId)
 		if err != nil {
-			return nil, err
+			return nil, Status(self.verbose, err)
 		}
-
-		// Only return the first row
-		journal, err := services.GetJournal()
-		if err != nil {
-			return nil, err
-		}
-
-		// only broadcast the events for local listeners. Minions
-		// write the events themselves, so we just need to broadcast
-		// for any server event artifacts that occur.
-		journal.Broadcast(self.config,
-			rows, in.Artifact, in.ClientId, in.FlowId)
-		return &emptypb.Empty{}, err
 	}
 
-	return nil, status.Error(codes.InvalidArgument, "no peer certs?")
+	// Only return the first row
+	journal, err := services.GetJournal(org_config_obj)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	// only broadcast the events for local listeners. Minions
+	// write the events themselves, so we just need to broadcast
+	// for any server event artifacts that occur.
+	journal.Broadcast(ctx, org_config_obj,
+		rows, in.Artifact, in.ClientId, in.FlowId)
+	return &emptypb.Empty{}, err
 }
 
 func (self *ApiServer) WriteEvent(
 	ctx context.Context,
 	in *actions_proto.VQLResponse) (*emptypb.Empty, error) {
 
-	// Get the TLS context from the peer and verify its
-	// certificate.
-	peer, ok := peer.FromContext(ctx)
+	defer Instrument("WriteEvent")()
+
+	users := services.GetUserManager()
+	user_record, config_obj, err := users.GetUserFromContext(ctx)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	user_name := user_record.Name
+	token, err := services.GetEffectivePolicy(config_obj, user_name)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	// Check that the principal is allowed to push to the queue.
+	ok, err := services.CheckAccessWithToken(token, acls.MACHINE_STATE, in.Query.Name)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
 	if !ok {
-		return nil, status.Error(codes.InvalidArgument, "cant get peer info")
+		return nil, status.Error(codes.PermissionDenied,
+			"Permission denied: MACHINE_STATE "+
+				user_name+" to "+in.Query.Name)
 	}
 
-	tlsInfo, ok := peer.AuthInfo.(credentials.TLSInfo)
-	if !ok {
-		return nil, status.Error(codes.InvalidArgument, "unable to get credentials")
+	rows, err := utils.ParseJsonToDicts([]byte(in.Response))
+	if err != nil {
+		return nil, Status(self.verbose, err)
 	}
 
-	// Authenticate API clients using certificates.
-	for _, peer_cert := range tlsInfo.State.PeerCertificates {
-		chains, err := peer_cert.Verify(
-			x509.VerifyOptions{Roots: self.ca_pool})
-		if err != nil {
-			return nil, err
-		}
-
-		if len(chains) == 0 {
-			return nil, status.Error(codes.InvalidArgument, "no chains verified")
-		}
-
-		peer_name := crypto_utils.GetSubjectName(peer_cert)
-
-		token, err := acls.GetEffectivePolicy(self.config, peer_name)
-		if err != nil {
-			return nil, err
-		}
-
-		// Check that the principal is allowed to push to the queue.
-		ok, err := acls.CheckAccessWithToken(token,
-			acls.MACHINE_STATE, in.Query.Name)
-		if err != nil {
-			return nil, err
-		}
-
-		if !ok {
-			return nil, status.Error(codes.PermissionDenied,
-				"Permission denied: MACHINE_STATE "+
-					peer_name+" to "+in.Query.Name)
-		}
-
-		rows, err := utils.ParseJsonToDicts([]byte(in.Response))
-		if err != nil {
-			return nil, err
-		}
-
-		// Only return the first row
-		if true {
-			journal, err := services.GetJournal()
-			if err != nil {
-				return nil, err
-			}
-
-			err = journal.PushRowsToArtifact(self.config,
-				rows, in.Query.Name, peer_name, "")
-			return &emptypb.Empty{}, err
-		}
+	// The call can access the datastore from any org becuase it is a
+	// server->server call.
+	org_manager, err := services.GetOrgManager()
+	if err != nil {
+		return nil, Status(self.verbose, err)
 	}
 
-	return nil, status.Error(codes.InvalidArgument, "no peer certs?")
+	org_config_obj, err := org_manager.GetOrgConfig(in.OrgId)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	// Only return the first row
+	journal, err := services.GetJournal(org_config_obj)
+	if err != nil {
+		return nil, Status(self.verbose, err)
+	}
+
+	err = journal.PushRowsToArtifact(ctx, org_config_obj,
+		rows, in.Query.Name, user_name, "")
+	return &emptypb.Empty{}, err
 }
 
 func (self *ApiServer) ListAvailableEventResults(
@@ -169,142 +137,23 @@ func (self *ApiServer) ListAvailableEventResults(
 	in *api_proto.ListAvailableEventResultsRequest) (
 	*api_proto.ListAvailableEventResultsResponse, error) {
 
-	user_name := GetGRPCUserInfo(self.config, ctx, self.ca_pool).Name
-	user_record, err := users.GetUser(self.config, user_name)
+	users := services.GetUserManager()
+	user_record, org_config_obj, err := users.GetUserFromContext(ctx)
 	if err != nil {
-		return nil, err
+		return nil, Status(self.verbose, err)
 	}
 
 	permissions := acls.READ_RESULTS
-	perm, err := acls.CheckAccess(self.config, user_record.Name, permissions)
+	perm, err := services.CheckAccess(org_config_obj, user_record.Name, permissions)
 	if !perm || err != nil {
-		return nil, status.Error(codes.PermissionDenied,
+		return nil, PermissionDenied(err,
 			"User is not allowed to view results.")
 	}
 
-	if in.Artifact == "" {
-		return listAvailableEventArtifacts(self, in)
-	}
-	return listAvailableEventTimestamps(ctx, self, in)
-}
-
-func listAvailableEventTimestamps(
-	ctx context.Context,
-	self *ApiServer, in *api_proto.ListAvailableEventResultsRequest) (
-	*api_proto.ListAvailableEventResultsResponse, error) {
-
-	path_manager, err := artifacts.NewArtifactPathManager(
-		self.config, in.ClientId, "", in.Artifact)
+	client_monitoring_service, err := services.ClientEventManager(org_config_obj)
 	if err != nil {
-		return nil, err
+		return nil, Status(self.verbose, err)
 	}
 
-	result := &api_proto.ListAvailableEventResultsResponse{
-		Logs: []*api_proto.AvailableEvent{
-			{
-				Artifact: in.Artifact,
-			},
-		},
-	}
-
-	timestamps, err := listAvailableEventTimestampFiles(ctx, self, path_manager)
-	result.Logs[0].RowTimestamps = timestamps
-
-	timestamps, err = listAvailableEventTimestampFiles(
-		ctx, self, path_manager.Logs())
-	result.Logs[0].LogTimestamps = timestamps
-
-	return result, nil
-}
-
-func listAvailableEventTimestampFiles(
-	ctx context.Context, self *ApiServer, path_manager api.PathManager) ([]int32, error) {
-	result := []int32{}
-
-	file_store_factory := file_store.GetFileStore(self.config)
-	reader, err := result_sets.NewTimedResultSetReader(
-		ctx, file_store_factory, path_manager)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, prop := range reader.GetAvailableFiles(ctx) {
-		result = append(result, int32(prop.StartTime.Unix()))
-	}
-	return result, nil
-}
-
-func listAvailableEventArtifacts(
-	self *ApiServer, in *api_proto.ListAvailableEventResultsRequest) (
-	*api_proto.ListAvailableEventResultsResponse, error) {
-
-	// Figure out where all the monitoring artifacts logs are
-	// stored by looking at some examples.
-	exemplar := "Generic.Client.Stats"
-	if in.ClientId == "" || in.ClientId == "server" {
-		exemplar = "Server.Monitor.Health"
-	}
-
-	path_manager, err := artifacts.NewArtifactPathManager(
-		self.config, in.ClientId, "", exemplar)
-	if err != nil {
-		return nil, err
-	}
-
-	// getAllArtifacts analyses the path name from disk and adds
-	// to the events list.
-	seen := make(map[string]*api_proto.AvailableEvent)
-	err = getAllArtifacts(self.config, path_manager.GetRootPath(), seen)
-	if err != nil {
-		return nil, err
-	}
-
-	err = getAllArtifacts(self.config, path_manager.Logs().GetRootPath(), seen)
-	if err != nil {
-		return nil, err
-	}
-
-	result := &api_proto.ListAvailableEventResultsResponse{}
-	for _, item := range seen {
-		result.Logs = append(result.Logs, item)
-	}
-
-	sort.Slice(result.Logs, func(i, j int) bool {
-		return result.Logs[i].Artifact < result.Logs[j].Artifact
-	})
-
-	return result, nil
-}
-
-func getAllArtifacts(
-	config_obj *config_proto.Config,
-	log_path api.FSPathSpec,
-	seen map[string]*api_proto.AvailableEvent) error {
-
-	file_store_factory := file_store.GetFileStore(config_obj)
-
-	return api.Walk(file_store_factory, log_path,
-		func(full_path api.FSPathSpec, info os.FileInfo) error {
-			// Walking the events directory will give us
-			// all the day json files. Each day json file
-			// is contained in a directory structure which
-			// reflects the name of the artifact, for
-			// example:
-
-			// <log_path>/Server.Monitor.Health/Prometheus/2021-08-01.json
-			// Corresponds to the artifact Server.Monitor.Health/Prometheus
-			if !info.IsDir() && info.Size() > 0 {
-				relative_path := full_path.Dir().
-					Components()[len(log_path.Components()):]
-				artifact_name := strings.Join(relative_path, "/")
-				event, pres := seen[artifact_name]
-				if !pres {
-					event = &api_proto.AvailableEvent{
-						Artifact: artifact_name,
-					}
-					seen[artifact_name] = event
-				}
-			}
-			return nil
-		})
+	return client_monitoring_service.ListAvailableEventResults(ctx, in)
 }

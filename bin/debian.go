@@ -1,3 +1,4 @@
+//go:build !aix
 // +build !aix
 
 // This command creates a customized server deb package which may be
@@ -21,35 +22,35 @@
 // package with the client configuration.
 
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Enterprises.
+Velociraptor - Dig Deeper
+Copyright (C) 2019 Velocidex Enterprises.
 
-   This program is free software: you can redistribute it and/or modify
-   it under the terms of the GNU Affero General Public License as published
-   by the Free Software Foundation, either version 3 of the License, or
-   (at your option) any later version.
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU Affero General Public License as published
+by the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
 
-   This program is distributed in the hope that it will be useful,
-   but WITHOUT ANY WARRANTY; without even the implied warranty of
-   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-   GNU Affero General Public License for more details.
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU Affero General Public License for more details.
 
-   You should have received a copy of the GNU Affero General Public License
-   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+You should have received a copy of the GNU Affero General Public License
+along with this program.  If not, see <https://www.gnu.org/licenses/>.
 */
 package main
 
 import (
-	"encoding/binary"
+	"debug/elf"
 	"fmt"
 	"os"
 	"strings"
 
 	"github.com/Velocidex/yaml/v2"
 	"github.com/xor-gate/debpkg"
-	"www.velocidex.com/golang/velociraptor/config"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
+	logging "www.velocidex.com/golang/velociraptor/logging"
 	"www.velocidex.com/golang/velociraptor/services"
 )
 
@@ -57,9 +58,9 @@ var (
 	debian_command = app.Command(
 		"debian", "Create a debian package")
 
+	//nolint:unused
 	debian_command_arch = debian_command.Flag("arch",
-		"Specify the debian package architecture (e.g. ppcle, amd64)").
-		Default("amd64").String()
+		"Specify the debian package architecture (DEPRECATED - now auto-detects)").String()
 
 	server_debian_command = debian_command.Command(
 		"server", "Create a server package from a server config file.")
@@ -74,16 +75,14 @@ var (
 		"client", "Create a client package from a client config file.")
 
 	client_debian_command_output = client_debian_command.Flag(
-		"output", "Filename to output").Default(
-		fmt.Sprintf("velociraptor_%s_client.deb", constants.VERSION)).
-		String()
+		"output", "Filename to output").String()
 
 	client_debian_command_binary = client_debian_command.Flag(
 		"binary", "The binary to package").String()
 
 	server_service_definition = `
 [Unit]
-Description=Velociraptor linux amd64
+Description=Velociraptor server
 After=syslog.target network.target
 
 [Service]
@@ -102,18 +101,48 @@ AmbientCapabilities=CAP_SYS_RESOURCE CAP_NET_BIND_SERVICE
 WantedBy=multi-user.target
 `
 
+	server_post_install_template = `
+if ! getent group velociraptor >/dev/null; then
+   addgroup --system velociraptor
+fi
+
+if ! getent passwd velociraptor >/dev/null; then
+   adduser --system --home /etc/velociraptor/ --no-create-home \
+     --ingroup velociraptor velociraptor --shell /bin/false \
+     --gecos "Velociraptor Server"
+fi
+
+# Make the filestore path accessible to the user.
+mkdir -p '%s'/config
+
+# Only chown two levels of the filestore directory in case
+# this is an upgrade and there are many files already there.
+# otherwise chown -R takes too long.
+chown velociraptor:velociraptor '%s' '%s'/*
+chown velociraptor:velociraptor -R /etc/velociraptor/
+
+# Lock down permissions on the config file.
+chmod -R go-r /etc/velociraptor/
+chmod o+x /usr/local/bin/velociraptor /usr/local/bin/velociraptor.bin
+
+# Allow the server to bind to low ports and increase its fd limit.
+setcap CAP_SYS_RESOURCE,CAP_NET_BIND_SERVICE=+eip /usr/local/bin/velociraptor.bin
+/bin/systemctl enable velociraptor_server
+/bin/systemctl start velociraptor_server
+`
+
 	server_launcher = `#!/bin/bash
 
 export VELOCIRAPTOR_CONFIG=/etc/velociraptor/server.config.yaml
 if ! [[ -r "$VELOCIRAPTOR_CONFIG" ]] ; then
     echo "'$VELOCIRAPTOR_CONFIG' is not readable, you will need to run this as the velociraptor user ('sudo -u velociraptor bash')."
 else
-    /usr/local/bin/velociraptor.bin "$@"
+    exec /usr/local/bin/velociraptor.bin "$@"
 fi
 `
 	client_service_definition = `
 [Unit]
-Description=Velociraptor linux client
+Description=Velociraptor client
 After=syslog.target network.target
 
 [Service]
@@ -122,17 +151,29 @@ Restart=always
 RestartSec=120
 LimitNOFILE=20000
 Environment=LANG=en_US.UTF-8
-ExecStart=%s --config %s client
+ExecStart=%s --config %s client --quiet
 
 [Install]
 WantedBy=multi-user.target
 `
+
+	// debArchMap maps ELF machine strings to Debian architectures
+	// See https://github.com/torvalds/linux/blob/master/include/uapi/linux/elf-em.h
+	//     https://wiki.debian.org/SupportedArchitectures
+	debArchMap = map[string]string{
+		"EM_X86_64":  "amd64",
+		"EM_386":     "i386",
+		"EM_RISCV":   "riscv64",
+		"EM_AARCH64": "arm64",
+		"EM_ARM":     "armhf",
+		"EM_PPC64":   "ppc64",
+	}
 )
 
 func doServerDeb() error {
 	// Disable logging when creating a deb - we may not create the
 	// deb on the same system where the logs should go.
-	_ = config.ValidateClientConfig(&config_proto.Config{})
+	logging.DisableLogging()
 
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredFrontend().LoadAndValidate()
@@ -180,34 +221,31 @@ func doSingleServerDeb(
 	if input == "" {
 		input, err = os.Executable()
 		if err != nil {
-			return fmt.Errorf("Unable to open executable: %w", err)
+			return fmt.Errorf("Unable to find executable: %w", err)
 		}
 	}
 
-	fd, err := os.Open(input)
+	e, err := elf.Open(input)
 	if err != nil {
-		return fmt.Errorf("Unable to open executable: %w", err)
-	}
-	defer fd.Close()
-
-	header := make([]byte, 4)
-	_, err = fd.Read(header)
-	if err != nil {
-		return fmt.Errorf("Unable to read header: %w", err)
+		return fmt.Errorf("%s is not a valid Linux ELF binary. Use the --binary "+
+			"flag to specify the path to a Linux binary: %w", input, err)
 	}
 
-	if binary.LittleEndian.Uint32(header) != 0x464c457f {
-		return fmt.Errorf("Binary does not appear to be an " +
-			"ELF binary. Please specify the linux binary " +
-			"using the --binary flag.")
+	arch, ok := debArchMap[e.Machine.String()]
+	if !ok {
+		return fmt.Errorf("unknown binary architecture: %q", e.Machine.String())
 	}
+
+	// "-" is specifically used for Debian revisions, "_" is also not allowed
+	// https://manpages.ubuntu.com/manpages/xenial/man5/deb-version.5.html
+	version := strings.ReplaceAll(constants.VERSION, "-", ".")
 
 	deb := debpkg.New()
 	defer deb.Close()
 
 	deb.SetName("velociraptor-server")
-	deb.SetVersion(constants.VERSION)
-	deb.SetArchitecture(*debian_command_arch)
+	deb.SetVersion(version)
+	deb.SetArchitecture(arch)
 	deb.SetMaintainer("Velocidex Enterprises")
 	deb.SetMaintainerEmail("support@velocidex.com")
 	deb.SetHomepage("https://www.velocidex.com/docs")
@@ -238,35 +276,9 @@ func doSingleServerDeb(
 	}
 
 	filestore_path := config_obj.Datastore.Location
-	err = deb.AddControlExtraString("postinst", fmt.Sprintf(`
-if ! getent group velociraptor >/dev/null; then
-   addgroup --system velociraptor
-fi
-
-if ! getent passwd velociraptor >/dev/null; then
-   adduser --system --home /etc/velociraptor/ --no-create-home \
-     --ingroup velociraptor velociraptor --shell /bin/false \
-     --gecos "Velociraptor Server"
-fi
-
-# Make the filestore path accessible to the user.
-mkdir -p '%s'/config
-
-# Only chown two levels of the filestore directory in case
-# this is an upgrade and there are many files already there.
-# otherwise chown -R takes too long.
-chown velociraptor:velociraptor '%s' '%s'/*
-chown velociraptor:velociraptor -R /etc/velociraptor/
-
-# Lock down permissions on the config file.
-chmod -R go-r /etc/velociraptor/
-chmod o+x /usr/local/bin/velociraptor /usr/local/bin/velociraptor.bin
-
-# Allow the server to bind to low ports and increase its fd limit.
-setcap CAP_SYS_RESOURCE,CAP_NET_BIND_SERVICE=+eip /usr/local/bin/velociraptor.bin
-/bin/systemctl enable velociraptor_server
-/bin/systemctl start velociraptor_server
-`, filestore_path, filestore_path, filestore_path))
+	err = deb.AddControlExtraString("postinst", fmt.Sprintf(
+		server_post_install_template,
+		filestore_path, filestore_path, filestore_path))
 	if err != nil {
 		return fmt.Errorf("Adding file: %w", err)
 	}
@@ -279,16 +291,25 @@ setcap CAP_SYS_RESOURCE,CAP_NET_BIND_SERVICE=+eip /usr/local/bin/velociraptor.bi
 		return fmt.Errorf("Adding file: %w", err)
 	}
 
-	output_file := fmt.Sprintf("velociraptor_%s_server%s.deb",
-		constants.VERSION, variant)
+	kind := "server"
+	if variant != "" {
+		kind = kind + "_" + variant
+	}
 
+	output_path := fmt.Sprintf("velociraptor_%s_%s_%s.deb",
+		kind, version, arch)
+
+	// If they have specified an output filename and a variant, jam the variant into the
+	// end of the basename (ignores Debian standard naming practices)
 	if *server_debian_command_output != "" {
-		output_file = fmt.Sprintf("%s%s.deb",
+		output_path = fmt.Sprintf("%s%s.deb",
 			strings.TrimSuffix(*server_debian_command_output, ".deb"),
 			variant)
 	}
 
-	err = deb.Write(output_file)
+	fmt.Printf("Creating %s %s package at %s\n", arch, kind, output_path)
+
+	err = deb.Write(output_path)
 	if err != nil {
 		return fmt.Errorf("Deb write: %w", err)
 	}
@@ -298,7 +319,7 @@ setcap CAP_SYS_RESOURCE,CAP_NET_BIND_SERVICE=+eip /usr/local/bin/velociraptor.bi
 func doClientDeb() error {
 	// Disable logging when creating a deb - we may not create the
 	// deb on the same system where the logs should go.
-	_ = config.ValidateClientConfig(&config_proto.Config{})
+	logging.DisableLogging()
 
 	config_obj, err := makeDefaultConfigLoader().
 		WithRequiredClient().LoadAndValidate()
@@ -316,34 +337,31 @@ func doClientDeb() error {
 	if input == "" {
 		input, err = os.Executable()
 		if err != nil {
-			return fmt.Errorf("Unable to open executable: %w", err)
+			return fmt.Errorf("Unable to find executable: %w", err)
 		}
 	}
 
-	fd, err := os.Open(input)
+	e, err := elf.Open(input)
 	if err != nil {
-		return fmt.Errorf("Unable to open executable: %w", err)
-	}
-	defer fd.Close()
-
-	header := make([]byte, 4)
-	_, err = fd.Read(header)
-	if err != nil {
-		return fmt.Errorf("Unable to open executable: %w", err)
+		return fmt.Errorf("%s is not a valid Linux ELF binary. Use the --binary "+
+			"flag to specify the path to a Linux binary: %w", input, err)
 	}
 
-	if binary.LittleEndian.Uint32(header) != 0x464c457f {
-		return fmt.Errorf("Binary does not appear to be an " +
-			"ELF binary. Please specify the linux binary " +
-			"using the --binary flag.")
+	arch, ok := debArchMap[e.Machine.String()]
+	if !ok {
+		return fmt.Errorf("unknown binary architecture: %q", e.Machine.String())
 	}
 
 	deb := debpkg.New()
 	defer deb.Close()
 
+	// "-" is specifically used for Debian revisions, "_" is also not allowed
+	// https://manpages.ubuntu.com/manpages/xenial/man5/deb-version.5.html
+	version := strings.ReplaceAll(constants.VERSION, "-", ".")
+
 	deb.SetName("velociraptor-client")
-	deb.SetVersion(constants.VERSION)
-	deb.SetArchitecture(*debian_command_arch)
+	deb.SetVersion(version)
+	deb.SetArchitecture(arch)
 	deb.SetMaintainer("Velocidex Enterprises")
 	deb.SetMaintainerEmail("support@velocidex.com")
 	deb.SetHomepage("https://www.velocidex.com")
@@ -369,10 +387,14 @@ func doClientDeb() error {
 		return fmt.Errorf("Deb write: %w", err)
 	}
 
-	err = deb.AddControlExtraString("postinst", `
+	err = deb.AddControlExtraString("postinst", fmt.Sprintf(`
+# Lock down permissions on the config file.
+chmod -R go-r /etc/velociraptor/
+chmod o+x "%s"
+
 /bin/systemctl enable velociraptor_client
 /bin/systemctl start velociraptor_client
-`)
+`, velociraptor_bin))
 	if err != nil {
 		return fmt.Errorf("Deb write: %w", err)
 	}
@@ -385,7 +407,16 @@ func doClientDeb() error {
 		return fmt.Errorf("Deb write: %w", err)
 	}
 
-	err = deb.Write(*client_debian_command_output)
+	output_path := fmt.Sprintf("velociraptor_client_%s_%s.deb",
+		version, arch)
+
+	// If they have forgotten .deb in the filename, add it in.
+	if *client_debian_command_output != "" {
+		output_path = fmt.Sprintf("%s.deb", strings.TrimSuffix(*client_debian_command_output, ".deb"))
+	}
+
+	fmt.Printf("Creating %s client package at %v\n", arch, output_path)
+	err = deb.Write(output_path)
 	if err != nil {
 		return fmt.Errorf("Deb write: %w", err)
 	}

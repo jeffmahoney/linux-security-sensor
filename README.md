@@ -51,11 +51,14 @@ Velociraptor is also useful as a local triage tool. You can create a self contai
 
 ## Building from source
 
-To build from source, make sure you have a recent Golang installed
-from https://golang.org/dl/ (Currently at least Go 1.14) and the go
-binary is on your path. In addition make sure the GOBIN directory is
-also on your path (Defaults are: on linux and mac `~/go/bin`, on
-Windows `c:\\Users\\<username>\\go\\bin`) :
+To build from source, make sure you have:
+ - a recent Golang installed from https://golang.org/dl/ (Currently at least Go 1.17)
+   - the `go` binary is in your path.
+   - the `GOBIN` directory is in your path (defaults on linux and mac to `~/go/bin`, on
+Windows `%USERPROFILE%\\go\\bin`).
+ - `gcc` in your path for CGO usage (on Windows, [TDM-GCC](https://jmeubank.github.io/tdm-gcc/about/) has been verified to work)
+ - `make`
+ - Node.js LTS (the GUI is build using [Node v18.14.2](https://nodejs.org/en/blog/release/v18.14.2))
 
 ```bash
     $ git clone https://github.com/Velocidex/velociraptor.git
@@ -79,6 +82,12 @@ Windows `c:\\Users\\<username>\\go\\bin`) :
     # To build production binaries
     $ make linux
     $ make windows
+```
+
+In order to build Windows binaries on Linux you need the mingw
+tools. On Ubuntu this is simply:
+```bash
+$ sudo apt-get install mingw-w64-x86-64-dev gcc-mingw-w64-x86-64 gcc-mingw-w64
 ```
 
 ## Getting the latest version
@@ -116,11 +125,13 @@ platforms [supported by Go](https://github.com/golang/go/wiki/MinimumRequirement
 This means that Windows XP and Windows server 2003 are **not**
 supported but anything after Windows 7/Vista is.
 
-We build our releases on Centos 6 (x64) for Linux and Sierra for MacOS
-so earlier platforms may not be supported by our release pipeline. If
-you need 32 bit builds you will need to build from source. You can do
-this easily by forking the project on GitHub, enabling GitHub Actions
-in your fork and editing the `Linux Build All Arches` pipeline.
+We build our releases using the MUSL library (x64) for Linux and a
+recent MacOS system, so earlier platforms may not be supported by our
+release pipeline. We also distribute 32 bit binaries for Windows but
+not for Linux. If you need 32 bit Linux builds you will need to build
+from source. You can do this easily by forking the project on GitHub,
+enabling GitHub Actions in your fork and editing the `Linux Build All
+Arches` pipeline.
 
 ## Artifact Exchange
 
@@ -129,6 +140,13 @@ capabilities to collect many types of data from endpoints.
 Velociraptor comes with many built in `Artifacts` for the most common
 use cases. The community also maintains a large number of additional
 artifacts through the [Artifact Exchange](https://docs.velociraptor.app/exchange/).
+
+## Knowledge Base
+
+If you need help performing a task such as deployment, VQL queries
+etc. Your first port of call should be the Velociraptor Knowledge Base
+at https://docs.velociraptor.app/knowledge_base/ where you will find
+helpful tips and hints.
 
 ## Getting help
 

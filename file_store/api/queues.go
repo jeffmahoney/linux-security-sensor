@@ -5,7 +5,18 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
+
+type QueueOptions struct {
+	DisableFileBuffering bool
+
+	// How many items to lease at once from the file buffer.
+	FileBufferLeaseSize int
+
+	// Who is listening to this queue
+	OwnerName string
+}
 
 // A QueueManager writes query results into queues. The manager is
 // responsible for rotating the queue files as required.
@@ -16,8 +27,14 @@ type QueueManager interface {
 	GetWatchers() []string
 
 	PushEventRows(path_manager PathManager, rows []*ordereddict.Dict) error
-	Watch(ctx context.Context, queue_name string) (
+
+	PushEventJsonl(path_manager PathManager, jsonl []byte, row_count int) error
+
+	Watch(ctx context.Context, queue_name string, queue_options *QueueOptions) (
 		output <-chan *ordereddict.Dict, cancel func())
+
+	// Sets the clock for tests
+	SetClock(clock utils.Clock)
 }
 
 type ResultSetFileProperties struct {

@@ -11,6 +11,12 @@ description: |
   those locale files. We then resolve the extension's name and
   description from there.
 
+  ## NOTES:
+
+  This artifact is deprecated in favor of
+  Generic.Forensic.SQLiteHunter and will be removed in future
+
+
 parameters:
   - name: extensionGlobs
     default: \AppData\Local\Google\Chrome\User Data\*\Extensions\*\*\manifest.json
@@ -26,13 +32,14 @@ sources:
            in their home directory. */
         LET extension_manifests = SELECT * from foreach(
           row={
-             SELECT Uid, Name AS User, Directory
+             SELECT Uid, Name AS User,
+                    expand(path=Directory) as Directory
              FROM Artifact.Windows.Sys.Users()
              WHERE Name =~ userRegex
           },
           query={
-             SELECT FullPath, Mtime, Ctime, User, Uid from glob(
-               globs=Directory + extensionGlobs)
+             SELECT OSPath, Mtime, Ctime, User, Uid
+             FROM glob(root=Directory, globs=extensionGlobs)
           })
 
         /* If the Manifest declares a default_locale then we
@@ -74,7 +81,7 @@ sources:
              SELECT Filename as ManifestFilename,
                     Uid, User,
                     parse_json(data=Data) as Manifest
-             FROM read_file(filenames=FullPath)
+             FROM read_file(filenames=OSPath)
            },
            query=maybe_read_locale_file)
 

@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -23,10 +23,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
 
+	errors "github.com/go-errors/errors"
 	"github.com/grpc-ecosystem/grpc-gateway/v2/runtime"
-	errors "github.com/pkg/errors"
+
 	"golang.org/x/net/context"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -34,11 +34,10 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"www.velocidex.com/golang/velociraptor/api/authenticators"
 	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
+	utils "www.velocidex.com/golang/velociraptor/api/utils"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/constants"
 	crypto_utils "www.velocidex.com/golang/velociraptor/crypto/utils"
-	file_store "www.velocidex.com/golang/velociraptor/file_store"
-	"www.velocidex.com/golang/velociraptor/file_store/accessors"
 	"www.velocidex.com/golang/velociraptor/grpc_client"
 	"www.velocidex.com/golang/velociraptor/logging"
 )
@@ -91,7 +90,7 @@ func AddProxyMux(config_obj *config_proto.Config, mux *http.ServeMux) error {
 			if err != nil {
 				return err
 			}
-			handler = auther.AuthenticateUserHandler(config_obj, handler)
+			handler = auther.AuthenticateUserHandler(handler)
 		}
 
 		mux.Handle(reverse_proxy_config.Route, handler)
@@ -123,49 +122,66 @@ func PrepareGUIMux(
 		return nil, err
 	}
 
-	err = auther.AddHandlers(config_obj, mux)
+	// Add the authenticator specific handlers.
+	err = auther.AddHandlers(mux)
 	if err != nil {
 		return nil, err
 	}
 
-	base := config_obj.GUI.BasePath
+	// Add the logout handlers
+	err = auther.AddLogoff(mux)
+	if err != nil {
+		return nil, err
+	}
 
-	mux.Handle(base+"/api/", csrfProtect(config_obj,
-		auther.AuthenticateUserHandler(config_obj, h)))
+	base := utils.GetBasePath(config_obj)
+	mux.Handle(utils.Join(base, "/api/"), ipFilter(config_obj,
+		csrfProtect(config_obj,
+			auther.AuthenticateUserHandler(h))))
 
-	mux.Handle(base+"/api/v1/DownloadTable", csrfProtect(config_obj,
-		auther.AuthenticateUserHandler(
-			config_obj, downloadTable(config_obj))))
+	mux.Handle(utils.Join(base, "/api/v1/DownloadTable"),
+		ipFilter(config_obj, csrfProtect(config_obj,
+			auther.AuthenticateUserHandler(downloadTable()))))
 
-	mux.Handle(base+"/api/v1/DownloadVFSFile", csrfProtect(config_obj,
-		auther.AuthenticateUserHandler(
-			config_obj, vfsFileDownloadHandler(config_obj))))
+	mux.Handle(utils.Join(base, "/api/v1/DownloadVFSFile"),
+		ipFilter(config_obj, csrfProtect(config_obj,
+			auther.AuthenticateUserHandler(vfsFileDownloadHandler()))))
 
-	mux.Handle(base+"/api/v1/UploadTool", csrfProtect(config_obj,
-		auther.AuthenticateUserHandler(
-			config_obj, toolUploadHandler(config_obj))))
+	mux.Handle(utils.Join(base, "/api/v1/UploadTool"),
+		ipFilter(config_obj, csrfProtect(config_obj,
+			auther.AuthenticateUserHandler(toolUploadHandler()))))
 
-	mux.Handle(base+"/api/v1/UploadFormFile", csrfProtect(config_obj,
-		auther.AuthenticateUserHandler(
-			config_obj, formUploadHandler(config_obj))))
+	mux.Handle(utils.Join(base, "/api/v1/UploadFormFile"),
+		ipFilter(config_obj, csrfProtect(config_obj,
+			auther.AuthenticateUserHandler(formUploadHandler()))))
 
 	// Serve prepared zip files.
-	mux.Handle(base+"/downloads/", csrfProtect(config_obj,
-		auther.AuthenticateUserHandler(
-			config_obj, http.StripPrefix(base, forceMime(http.FileServer(
-				accessors.NewFileSystem(
-					config_obj,
-					file_store.GetFileStore(config_obj),
-					"/downloads/")))))))
+	mux.Handle(utils.Join(base, "/downloads/"),
+		ipFilter(config_obj, csrfProtect(config_obj,
+			auther.AuthenticateUserHandler(
+				http.StripPrefix(base,
+					downloadFileStore([]string{"downloads"}))))))
 
 	// Serve notebook items
-	mux.Handle(base+"/notebooks/", csrfProtect(config_obj,
-		auther.AuthenticateUserHandler(
-			config_obj, http.StripPrefix(base, forceMime(http.FileServer(
-				accessors.NewFileSystem(
-					config_obj,
-					file_store.GetFileStore(config_obj),
-					"/notebooks/")))))))
+	mux.Handle(utils.Join(base, "/notebooks/"),
+		ipFilter(config_obj, csrfProtect(config_obj,
+			auther.AuthenticateUserHandler(
+				http.StripPrefix(base,
+					downloadFileStore([]string{"notebooks"}))))))
+
+	// Serve files from hunt notebooks
+	mux.Handle(utils.Join(base, "/hunts/"),
+		ipFilter(config_obj, csrfProtect(config_obj,
+			auther.AuthenticateUserHandler(
+				http.StripPrefix(base,
+					downloadFileStore([]string{"hunts"}))))))
+
+	// Serve files from client notebooks
+	mux.Handle(utils.Join(base, "/clients/"),
+		ipFilter(config_obj, csrfProtect(config_obj,
+			auther.AuthenticateUserHandler(
+				http.StripPrefix(base,
+					downloadFileStore([]string{"clients"}))))))
 
 	// Assets etc do not need auth.
 	install_static_assets(config_obj, mux)
@@ -180,25 +196,17 @@ func PrepareGUIMux(
 	if err != nil {
 		return nil, err
 	}
-	mux.Handle(base+"/app/index.html", csrfProtect(config_obj,
-		auther.AuthenticateUserHandler(config_obj, h)))
+	mux.Handle(utils.Join(base, "/app/index.html"),
+		ipFilter(config_obj,
+			csrfProtect(config_obj, auther.AuthenticateUserHandler(h))))
 
-	mux.Handle(base+"/", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, base+"/app/index.html", 302)
-	}))
+	// Redirect everything else to the app
+	mux.Handle(utils.GetBaseDirectory(config_obj),
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, utils.Join(base, "/app/index.html"), 302)
+		}))
 
 	return mux, nil
-}
-
-type _templateArgs struct {
-	Timestamp  int64
-	Heading    string
-	Help_url   string
-	Report_url string
-	Version    string
-	CsrfToken  string
-	BasePath   string
-	UserTheme  string
 }
 
 // An api handler which connects to the gRPC service (i.e. it is a
@@ -262,7 +270,7 @@ func GetAPIHandler(
 
 	_, err = gw_cert.Verify(x509.VerifyOptions{Roots: CA_Pool})
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, errors.Wrap(err, 0)
 	}
 
 	gw_name := crypto_utils.GetSubjectName(gw_cert)
@@ -287,25 +295,15 @@ func GetAPIHandler(
 		return nil, err
 	}
 
-	base := config_obj.GUI.BasePath
-
+	base := utils.GetBasePath(config_obj)
 	reverse_proxy_mux := http.NewServeMux()
-	reverse_proxy_mux.Handle(base+"/api/v1/",
+	reverse_proxy_mux.Handle(utils.Join(base, "/api/v1/"),
 		http.StripPrefix(base, grpc_proxy_mux))
 
 	return reverse_proxy_mux, nil
 }
 
-// Force mime type to binary stream.
-func forceMime(parent http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Prevent directory listings.
-		if strings.HasSuffix(r.URL.Path, "/") {
-			http.NotFound(w, r)
-			return
-		}
-
-		w.Header().Set("Content-Type", "binary/octet-stream")
-		parent.ServeHTTP(w, r)
-	})
+func ipFilter(config_obj *config_proto.Config,
+	parent http.Handler) http.Handler {
+	return authenticators.IpFilter(config_obj, parent)
 }

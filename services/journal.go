@@ -16,45 +16,33 @@ package services
 
 import (
 	"context"
-	"errors"
-	"sync"
 
 	"github.com/Velocidex/ordereddict"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
-var (
-	journal_mu sync.Mutex
-
-	// Service is only available in the frontend.
-	GJournal JournalService
-)
-
-func GetJournal() (JournalService, error) {
-	journal_mu.Lock()
-	defer journal_mu.Unlock()
-
-	if GJournal == nil {
-		return nil, errors.New("Journal service not ready")
+func GetJournal(config_obj *config_proto.Config) (JournalService, error) {
+	org_manager, err := GetOrgManager()
+	if err != nil {
+		return nil, err
 	}
 
-	return GJournal, nil
-}
+	s := org_manager.Services(config_obj.OrgId)
 
-func RegisterJournal(journal JournalService) {
-	journal_mu.Lock()
-	defer journal_mu.Unlock()
-
-	GJournal = journal
+	return s.Journal()
 }
 
 type JournalService interface {
-	// Watch the artifact named by queue_name for new rows. This
-	// only makes sense for artifacts of type CLIENT_EVENT and
-	// SERVER_EVENT
-	Watch(ctx context.Context,
-		queue_name string) (output <-chan *ordereddict.Dict, cancel func())
+	// Watch the artifact named by queue_name for new rows. This only
+	// makes sense for artifacts of type CLIENT_EVENT and
+	// SERVER_EVENT. The watcher_name is a description of who is
+	// watching this particular queue.
+	Watch(
+		ctx context.Context,
+		queue_name string,
+		watcher_name string) (output <-chan *ordereddict.Dict, cancel func())
 
 	GetWatchers() []string
 
@@ -63,16 +51,27 @@ type JournalService interface {
 	AppendToResultSet(config_obj *config_proto.Config,
 		path api.FSPathSpec, rows []*ordereddict.Dict) error
 
-	Broadcast(config_obj *config_proto.Config,
+	Broadcast(ctx context.Context, config_obj *config_proto.Config,
 		rows []*ordereddict.Dict, name, client_id, flows_id string) error
 
 	// Push the rows to the event artifact queue
-	PushRowsToArtifact(config_obj *config_proto.Config,
+	PushRowsToArtifact(ctx context.Context, config_obj *config_proto.Config,
 		rows []*ordereddict.Dict, name, client_id, flows_id string) error
+
+	// An optimization around PushRowsToArtifact where rows are
+	// already serialized in JSONL
+	PushJsonlToArtifact(
+		ctx context.Context, config_obj *config_proto.Config,
+		jsonl []byte, row_count int,
+		name, client_id, flows_id string) error
 
 	// Push the rows to the event artifact queue with a potential
 	// unspecified delay. Internally these rows will be batched until
 	// a convenient time to send them.
-	PushRowsToArtifactAsync(config_obj *config_proto.Config,
+	PushRowsToArtifactAsync(
+		ctx context.Context, config_obj *config_proto.Config,
 		row *ordereddict.Dict, name string)
+
+	// Sets the clock for tests
+	SetClock(clock utils.Clock)
 }

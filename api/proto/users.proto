@@ -2,11 +2,18 @@ syntax = "proto3";
 
 import "proto/semantic.proto";
 import "acls/proto/acl.proto";
+import "config/proto/config.proto";
 import "flows/proto/artifact_collector.proto";
+
+import "orgs.proto";
 
 package proto;
 
 option go_package = "www.velocidex.com/golang/velociraptor/api/proto";
+
+message Strings {
+    repeated string strings = 1;
+}
 
 message VelociraptorUser {
     string name = 1 [(sem_type) = {
@@ -31,47 +38,65 @@ message VelociraptorUser {
         }];
 
     ApiClientACL Permissions = 9;
+
+    // A list of org id's the user belongs to.
+    repeated OrgRecord orgs = 11;
+
+    // Only used by the GUI/API to determine the currently selected
+    // org the user wants to see.
+    string current_org = 12;
 }
 
+message UpdateUserRequest {
+    string name = 1 [(sem_type) = {
+        description: "The username"
+    }];
 
-// Next field: 4
-message GUISettings {
-    option (semantic) = {
-        description: "User GUI settings and preferences."
-    };
+    string password = 2 [(sem_type) = {
+        description: "The cleartext password"
+    }];
 
-    enum UIMode {
-        BASIC = 0;
-        ADVANCED = 1;
-        DEBUG = 2;
-    }
+    repeated string orgs = 3;
 
-    UIMode mode = 1 [(sem_type) = {
-            description: "User interface mode.",
-        }];
+    repeated string roles = 4;
 
-    bool canary_mode = 3 [(sem_type) = {
-            description: "If true, show features that are being canaried."
-        }];
+    bool add_new_user = 5;
 }
 
-message UILink {
-    string text = 1;
-    string url = 2;
+message DeleteUserRequest {
+    string name = 1 [(sem_type) = {
+        description: "The username"
+    }];
+
+    repeated string orgs = 2 [(sem_type) = {
+        description: "The org IDs to remove this user (empty means all orgs)"
+    }];
 }
 
-// These traits are used by the AdminUI Angular app to disable certain
-// UI elements based on the user's permission set.
-message ApiGrrUserInterfaceTraits {
+message UserRequest {
+    string name = 1;
+    string org = 2;
+}
+
+// These traits are used to control the GUI App. Many of these fields
+// are constructed from the VelociraptorUser, the config file, the
+// GUIOptions etc.
+message ApiUserInterfaceTraits {
     ApiClientACL Permissions = 9;
+    GUICustomizations customizations = 10;
 
-    bool auth_using_google = 19;
+    string lang = 22;
+
+    // Set if the authenticator is password less (e.g. OAuth, SAML
+    // etc)
+    bool password_less = 25;
     string picture = 20;
 
-    repeated UILink links = 21;
+    repeated GUILink links = 21;
 
     // Get the user's preferred theme.
     string theme = 2;
+    string timezone = 23;
 
     // Downloads will be protected using this password.
     string default_password = 3;
@@ -81,16 +106,24 @@ message ApiGrrUserInterfaceTraits {
 
     // An opaque setting object stored by the GUI.
     string ui_settings = 1;
+
+    // Current selected Org.
+    string org = 24;
+
+    // Optional features of the UI to disable.
+    bool disable_server_events = 26;
+    string auth_redirect_template = 27;
+    bool disable_quarantine_button = 28;
 };
 
-message ApiGrrUser {
+// Describe the user to the GUI.
+message ApiUser {
     string username = 1 [(sem_type) = {
             description: "The name of the user."
         }];
-    GUISettings settings = 2 [(sem_type) = {
-            description: "User UI settings."
-        }];
-    ApiGrrUserInterfaceTraits interface_traits = 3 [(sem_type) = {
+
+    // Gets constructed from the users.GetUserOptions()
+    ApiUserInterfaceTraits interface_traits = 3 [(sem_type) = {
             description: "User's interface traits (what they can and can't do "
             "in the UI)."
         }];
@@ -101,62 +134,27 @@ message ApiGrrUser {
         USER_TYPE_ADMIN = 2;
     }
     UserType user_type = 4;
+
+    repeated OrgRecord orgs = 11;
+    bool org_admin = 12 [(sem_type) = {
+        description: "Whether this user is an OrgAdmin"
+    }];
 }
 
+// Contol the GUI per user.
+message GUICustomizations {
+    bool disable_server_events = 1;
+    bool disable_user_management = 2;
+    bool disable_quarantine_button = 3;
 
-message UserNotificationCount {
-    uint64 count = 1;
-}
-
-message UserNotification {
-    enum Type {
-        TYPE_UNSET = 0;
-        TYPE_CLIENT_INTERROGATED = 1;
-        TYPE_CLIENT_APPROVAL_REQUESTED = 2;
-        TYPE_HUNT_APPROVAL_REQUESTED = 3;
-        TYPE_CRON_JOB_APPROVAL_REQUESTED = 4;
-        TYPE_CLIENT_APPROVAL_GRANTED = 5;
-        TYPE_HUNT_APPROVAL_GRANTED = 6;
-        TYPE_CRON_JOB_APPROVAL_GRANTED = 7;
-        TYPE_VFS_FILE_COLLECTED = 8;
-        TYPE_VFS_FILE_COLLECTION_FAILED = 9;
-        TYPE_HUNT_STOPPED = 10;
-        TYPE_FILE_ARCHIVE_GENERATED = 11;
-        TYPE_FILE_ARCHIVE_GENERATION_FAILED = 12;
-        TYPE_FLOW_RUN_COMPLETED = 13;
-        TYPE_FLOW_RUN_FAILED = 14;
-        TYPE_VFS_LIST_DIRECTORY_COMPLETED = 15;
-        TYPE_VFS_RECURSIVE_LIST_DIRECTORY_COMPLETED = 16;
-    }
-
-    enum State {
-        STATE_UNSET = 0;
-        STATE_PENDING = 1;
-        STATE_NOT_PENDING = 2;
-    }
-
-    string username = 1;
-    Type notification_type = 2;
-    State state = 3;
-    uint64 timestamp = 4 [(sem_type) = {
-            type: "RDFDatetime"
-        }];
-
-    string message = 5;
-}
-
-message GetUserNotificationsResponse {
-    repeated UserNotification items = 1;
-}
-
-message GetUserNotificationsRequest {
-    bool clear_pending = 1 [(sem_type) = {
-            description: "If set, clears pending notifications."
-        }];
+    // Updated from config_obj.Defaults.HuntExpiryHours
+    int64 hunt_expiry_hours = 4;
 }
 
 message SetGUIOptionsRequest {
     string theme = 2;
+    string timezone = 6;
+    string lang = 5;
 
     // Downloads will be protected using this password.
     string default_password = 3;
@@ -165,10 +163,54 @@ message SetGUIOptionsRequest {
     bool default_downloads_lock = 4;
 
     string options = 1;
+
+    // Current org id
+    string org = 7;
+
+    GUICustomizations customizations = 8;
+
+    repeated GUILink links = 9;
+
+    // Optional features of the UI to disable:
+    // TODO: Move to GUICustomizations.
+    bool disable_server_events = 26;
+    string auth_redirect_template = 27;
+    bool disable_quarantine_button = 28;
 }
+
+message SetGUIOptionsResponse {
+    // If this is specifed the GUI will redirect to the specified
+    // URL. This helps when there are multiple servers that can handle
+    // the user and a better one is needed. Normally this is really
+    // set by any middleware (e.g. custom authenticators).
+    string redirect_url = 1;
+}
+
 
 message Users {
     repeated VelociraptorUser users = 1;
+}
+
+
+// Get the roles and permissions of a user within the org.
+message UserRoles {
+    string name = 1;
+    string org = 2;
+    string org_name = 8;
+
+    repeated string permissions = 3;
+    repeated string roles = 4;
+
+    // Expanded permissions as above.
+    repeated string effective_permissions = 5;
+
+    repeated string all_roles = 6;
+    repeated string all_permissions = 7;
+};
+
+message SetPasswordRequest {
+    string password = 1;
+    string username = 2;
 }
 
 // Store favorite collections (essential preset collection specs)

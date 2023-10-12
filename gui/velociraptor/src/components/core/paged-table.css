@@ -1,0 +1,37 @@
+
+.transform-button {
+    margin-left: 5px;
+}
+
+.sort-button {
+    width: 100%;
+}
+
+table.paged-table-header {
+    width: 100%;
+}
+
+table.paged-table-header td {
+    vertical-align: middle;
+}
+
+table.paged-table-header tr {
+    height: 48px;
+}
+
+table.paged-table-header .sort-element {
+    float: right;
+    display: none;
+}
+
+table.paged-table-header:hover .sort-element {
+    display: block;
+}
+
+table.paged-table-header .sort-element.visible {
+    display: block;
+}
+
+tr.paged-table-header th {
+    padding: 0;
+}

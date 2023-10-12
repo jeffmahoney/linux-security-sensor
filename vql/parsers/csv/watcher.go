@@ -6,9 +6,10 @@ import (
 	"time"
 
 	"github.com/Velocidex/ordereddict"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/csv"
-	"www.velocidex.com/golang/velociraptor/glob"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/velociraptor/services"
 	"www.velocidex.com/golang/vfilter"
 )
 
@@ -17,7 +18,8 @@ const (
 )
 
 var (
-	GlobalCSVService = NewCSVWatcherService()
+	mu               sync.Mutex
+	GlobalCSVService *CSVWatcherService
 )
 
 // This service watches one or more many event logs files and
@@ -25,17 +27,26 @@ var (
 type CSVWatcherService struct {
 	mu sync.Mutex
 
+	config_obj    *config_proto.Config
 	registrations map[string][]*Handle
 }
 
-func NewCSVWatcherService() *CSVWatcherService {
-	return &CSVWatcherService{
-		registrations: make(map[string][]*Handle),
+func NewCSVWatcherService(config_obj *config_proto.Config) *CSVWatcherService {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if GlobalCSVService == nil {
+		GlobalCSVService = &CSVWatcherService{
+			config_obj:    config_obj,
+			registrations: make(map[string][]*Handle),
+		}
 	}
+
+	return GlobalCSVService
 }
 
 func (self *CSVWatcherService) Register(
-	filename string,
+	filename *accessors.OSPath,
 	accessor string,
 	ctx context.Context,
 	scope vfilter.Scope,
@@ -49,12 +60,12 @@ func (self *CSVWatcherService) Register(
 		output_chan: output_chan,
 		scope:       scope}
 
-	key := filename + accessor
+	key := filename.String() + accessor
 	registration, pres := self.registrations[key]
 	if !pres {
 		registration = []*Handle{}
 		self.registrations[key] = registration
-		go self.StartMonitoring(filename, accessor)
+		go self.StartMonitoring(scope, filename, accessor)
 	}
 
 	registration = append(registration, handle)
@@ -66,12 +77,19 @@ func (self *CSVWatcherService) Register(
 // Monitor the filename for new events and emit them to all interested
 // listeners. If no listeners exist we terminate.
 func (self *CSVWatcherService) StartMonitoring(
-	filename string, accessor_name string) {
+	base_scope vfilter.Scope, filename *accessors.OSPath,
+	accessor_name string) {
 
-	scope := vql_subsystem.MakeScope()
+	manager, err := services.GetRepositoryManager(self.config_obj)
+	if err != nil {
+		return
+	}
+
+	builder := services.ScopeBuilderFromScope(base_scope)
+	scope := manager.BuildScope(builder)
 	defer scope.Close()
 
-	accessor, err := glob.GetAccessor(accessor_name, scope)
+	accessor, err := accessors.GetAccessor(accessor_name, scope)
 	if err != nil {
 		return
 	}
@@ -91,10 +109,10 @@ func (self *CSVWatcherService) StartMonitoring(
 }
 
 func (self *CSVWatcherService) findLastEvent(
-	filename string,
-	accessor glob.FileSystemAccessor) int {
+	filename *accessors.OSPath,
+	accessor accessors.FileSystemAccessor) int {
 
-	fd, err := accessor.Open(filename)
+	fd, err := accessor.OpenWithOSPath(filename)
 	if err != nil {
 		return 0
 	}
@@ -113,21 +131,21 @@ func (self *CSVWatcherService) findLastEvent(
 }
 
 func (self *CSVWatcherService) monitorOnce(
-	filename string,
+	filename *accessors.OSPath,
 	accessor_name string,
-	accessor glob.FileSystemAccessor,
+	accessor accessors.FileSystemAccessor,
 	last_event int) (int, bool) {
 
 	self.mu.Lock()
 	defer self.mu.Unlock()
 
-	key := filename + accessor_name
+	key := filename.String() + accessor_name
 	handles, pres := self.registrations[key]
 	if !pres {
 		return 0, false
 	}
 
-	fd, err := accessor.Open(filename)
+	fd, err := accessor.OpenWithOSPath(filename)
 	if err != nil {
 		for _, handle := range handles {
 			handle.scope.Log("Unable to open file %s: %v",

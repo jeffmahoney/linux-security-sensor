@@ -3,16 +3,29 @@ package result_sets
 import (
 	"context"
 	"errors"
+	"regexp"
+	"sync"
 
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 var (
+	l_mu             sync.Mutex
 	rs_factory       Factory
 	timed_rs_factory TimedFactory
 )
+
+type ResultSetOptions struct {
+	SortColumn   string
+	SortAsc      bool
+	FilterColumn string
+	FilterRegex  *regexp.Regexp
+	StartIdx     uint64
+	EndIdx       uint64
+}
 
 type TimedFactory interface {
 	NewTimedResultSetWriter(
@@ -38,6 +51,9 @@ func NewTimedResultSetWriter(
 	path_manager api.PathManager,
 	opts *json.EncOpts,
 	completion func()) (TimedResultSetWriter, error) {
+	l_mu.Lock()
+	defer l_mu.Unlock()
+
 	if timed_rs_factory == nil {
 		panic(errors.New("TimedFactory not initialized"))
 	}
@@ -50,6 +66,9 @@ func NewTimedResultSetWriterWithClock(
 	path_manager api.PathManager,
 	opts *json.EncOpts,
 	completion func(), clock utils.Clock) (TimedResultSetWriter, error) {
+	l_mu.Lock()
+	defer l_mu.Unlock()
+
 	if timed_rs_factory == nil {
 		panic(errors.New("TimedFactory not initialized"))
 	}
@@ -61,6 +80,9 @@ func NewTimedResultSetReader(
 	ctx context.Context,
 	file_store_factory api.FileStore,
 	path_manager api.PathManager) (TimedResultSetReader, error) {
+	l_mu.Lock()
+	defer l_mu.Unlock()
+
 	if timed_rs_factory == nil {
 		panic(errors.New("TimedFactory not initialized"))
 	}
@@ -80,6 +102,14 @@ type Factory interface {
 		file_store_factory api.FileStore,
 		log_path api.FSPathSpec,
 	) (ResultSetReader, error)
+
+	NewResultSetReaderWithOptions(
+		ctx context.Context,
+		config_obj *config_proto.Config,
+		file_store_factory api.FileStore,
+		log_path api.FSPathSpec,
+		options ResultSetOptions,
+	) (ResultSetReader, error)
 }
 
 func NewResultSetWriter(
@@ -88,10 +118,15 @@ func NewResultSetWriter(
 	opts *json.EncOpts,
 	completion func(),
 	truncate WriteMode) (ResultSetWriter, error) {
-	if rs_factory == nil {
+	l_mu.Lock()
+	factory := rs_factory
+	l_mu.Unlock()
+
+	if factory == nil {
 		panic(errors.New("ResultSetFactory not initialized"))
 	}
-	return rs_factory.NewResultSetWriter(file_store_factory,
+
+	return factory.NewResultSetWriter(file_store_factory,
 		log_path, opts, completion, truncate)
 
 }
@@ -99,17 +134,45 @@ func NewResultSetWriter(
 func NewResultSetReader(
 	file_store_factory api.FileStore,
 	log_path api.FSPathSpec) (ResultSetReader, error) {
-	if rs_factory == nil {
+	l_mu.Lock()
+	factory := rs_factory
+	l_mu.Unlock()
+
+	if factory == nil {
 		panic(errors.New("ResultSetFactory not initialized"))
 	}
-	return rs_factory.NewResultSetReader(file_store_factory, log_path)
+	return factory.NewResultSetReader(file_store_factory, log_path)
+}
+
+func NewResultSetReaderWithOptions(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	file_store_factory api.FileStore,
+	log_path api.FSPathSpec,
+	options ResultSetOptions) (ResultSetReader, error) {
+	l_mu.Lock()
+	factory := rs_factory
+	l_mu.Unlock()
+
+	if factory == nil {
+		panic(errors.New("ResultSetFactory not initialized"))
+	}
+	return factory.NewResultSetReaderWithOptions(
+		ctx, config_obj,
+		file_store_factory, log_path, options)
 }
 
 // Allows for registration of the result set factory.
 func RegisterResultSetFactory(impl Factory) {
+	l_mu.Lock()
+	defer l_mu.Unlock()
+
 	rs_factory = impl
 }
 
 func RegisterTimedResultSetFactory(impl TimedFactory) {
+	l_mu.Lock()
+	defer l_mu.Unlock()
+
 	timed_rs_factory = impl
 }

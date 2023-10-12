@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -20,18 +20,25 @@ package parsers
 import (
 	"bufio"
 	"context"
-	"encoding/json"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
 
 	"github.com/Velocidex/ordereddict"
 	"google.golang.org/protobuf/reflect/protoreflect"
-	"www.velocidex.com/golang/velociraptor/glob"
+	"www.velocidex.com/golang/velociraptor/accessors"
+	"www.velocidex.com/golang/velociraptor/acls"
+	"www.velocidex.com/golang/velociraptor/json"
 	utils "www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
+)
+
+const (
+	BUFF_SIZE = 10 * 1024 * 1024
 )
 
 type ParseJsonFunctionArg struct {
@@ -117,8 +124,8 @@ func (self ParseJsonArray) Call(
 }
 
 type ParseJsonlPluginArgs struct {
-	Filename string `vfilter:"required,field=filename,doc=JSON file to open"`
-	Accessor string `vfilter:"optional,field=accessor,doc=The accessor to use"`
+	Filename *accessors.OSPath `vfilter:"required,field=filename,doc=JSON file to open"`
+	Accessor string            `vfilter:"optional,field=accessor,doc=The accessor to use"`
 }
 
 type ParseJsonlPlugin struct{}
@@ -145,13 +152,13 @@ func (self ParseJsonlPlugin) Call(
 			return
 		}
 
-		accessor, err := glob.GetAccessor(arg.Accessor, scope)
+		accessor, err := accessors.GetAccessor(arg.Accessor, scope)
 		if err != nil {
 			scope.Log("parse_jsonl: %v", err)
 			return
 		}
 
-		fd, err := accessor.Open(arg.Filename)
+		fd, err := accessor.OpenWithOSPath(arg.Filename)
 		if err != nil {
 			scope.Log("Unable to open file %s: %v",
 				arg.Filename, err)
@@ -191,9 +198,10 @@ func (self ParseJsonlPlugin) Call(
 
 func (self ParseJsonlPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
 	return &vfilter.PluginInfo{
-		Name:    "parse_jsonl",
-		Doc:     "Parses a line oriented json file.",
-		ArgType: type_map.AddType(scope, &ParseJsonlPluginArgs{}),
+		Name:     "parse_jsonl",
+		Doc:      "Parses a line oriented json file.",
+		ArgType:  type_map.AddType(scope, &ParseJsonlPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_READ).Build(),
 	}
 }
 
@@ -278,11 +286,13 @@ func (self _MapInterfaceAssociativeProtocol) Associative(
 
 func (self _MapInterfaceAssociativeProtocol) GetMembers(
 	scope vfilter.Scope, a vfilter.Any) []string {
+
 	result := []string{}
-	a_map, ok := a.(map[string]interface{})
-	if ok {
-		for k := range a_map {
-			result = append(result, k)
+	map_value := reflect.ValueOf(a)
+	if map_value.Kind() == reflect.Map {
+		for _, map_key_value := range map_value.MapKeys() {
+			result = append(result, map_key_value.String())
+
 		}
 	}
 
@@ -474,6 +484,94 @@ func (self _IndexAssociativeProtocol) GetMembers(
 	return []string{}
 }
 
+type WriteJSONPluginArgs struct {
+	Filename *accessors.OSPath   `vfilter:"required,field=filename,doc=CSV files to open"`
+	Accessor string              `vfilter:"optional,field=accessor,doc=The accessor to use"`
+	Query    vfilter.StoredQuery `vfilter:"required,field=query,doc=query to write into the file."`
+}
+
+type WriteJSONPlugin struct{}
+
+func (self WriteJSONPlugin) Call(
+	ctx context.Context,
+	scope vfilter.Scope,
+	args *ordereddict.Dict) <-chan vfilter.Row {
+	output_chan := make(chan vfilter.Row)
+
+	go func() {
+		defer close(output_chan)
+
+		arg := &WriteJSONPluginArgs{}
+		err := arg_parser.ExtractArgsWithContext(ctx, scope, args, arg)
+		if err != nil {
+			scope.Log("write_jsonl: %s", err.Error())
+			return
+		}
+
+		var writer *bufio.Writer
+
+		switch arg.Accessor {
+		case "", "auto", "file":
+			err := vql_subsystem.CheckAccess(scope, acls.FILESYSTEM_WRITE)
+			if err != nil {
+				scope.Log("write_jsonl: %s", err)
+				return
+			}
+
+			underlying_file, err := accessors.GetUnderlyingAPIFilename(
+				arg.Accessor, scope, arg.Filename)
+			if err != nil {
+				scope.Log("write_csv: %s", err)
+				return
+			}
+
+			file, err := os.OpenFile(underlying_file,
+				os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0700)
+			if err != nil {
+				scope.Log("write_jsonl: Unable to open file %s: %s",
+					arg.Filename, err.Error())
+				return
+			}
+			defer file.Close()
+
+			writer = bufio.NewWriterSize(file, BUFF_SIZE)
+			defer writer.Flush()
+
+		default:
+			scope.Log("write_csv: Unsupported accessor for writing %v", arg.Accessor)
+			return
+		}
+
+		lf := []byte("\n")
+
+		for row := range arg.Query.Eval(ctx, scope) {
+			serialized, err := json.Marshal(row)
+			if err == nil {
+				writer.Write(serialized)
+				writer.Write(lf)
+			}
+
+			select {
+			case <-ctx.Done():
+				return
+
+			case output_chan <- row:
+			}
+		}
+	}()
+
+	return output_chan
+}
+
+func (self WriteJSONPlugin) Info(scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.PluginInfo {
+	return &vfilter.PluginInfo{
+		Name:     "write_jsonl",
+		Doc:      "Write a query into a JSONL file.",
+		ArgType:  type_map.AddType(scope, &WriteJSONPluginArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.FILESYSTEM_WRITE).Build(),
+	}
+}
+
 func init() {
 	vql_subsystem.RegisterFunction(&ParseJsonFunction{})
 	vql_subsystem.RegisterFunction(&ParseJsonArray{})
@@ -483,4 +581,5 @@ func init() {
 	vql_subsystem.RegisterProtocol(&_IndexAssociativeProtocol{})
 	vql_subsystem.RegisterPlugin(&ParseJsonArrayPlugin{})
 	vql_subsystem.RegisterPlugin(&ParseJsonlPlugin{})
+	vql_subsystem.RegisterPlugin(&WriteJSONPlugin{})
 }

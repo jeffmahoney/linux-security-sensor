@@ -1,20 +1,18 @@
 package services
 
 import (
-	"errors"
-	"sync"
+	"context"
 
+	"github.com/Velocidex/ordereddict"
 	"google.golang.org/protobuf/proto"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
+	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 )
 
-var (
-	client_info_manager    ClientInfoManager
-	client_info_manager_mu sync.Mutex
-)
-
 const (
+	NOTIFY_CLIENT = true
+
 	Unknown ClientOS = iota
 	Windows
 	Linux
@@ -26,28 +24,19 @@ type ClientOS int
 // Keep some stats about the client in the cache. These will be synced
 // to disk periodically.
 type Stats struct {
-	Ping                  uint64
-	LastHuntTimestamp     uint64
-	LastEventTableVersion uint64
-	IpAddress             string
+	Ping                  uint64 `json:"Ping,omitempty"`
+	LastHuntTimestamp     uint64 `json:"LastHuntTimestamp,omitempty"`
+	LastEventTableVersion uint64 `json:"LastEventTableVersion,omitempty"`
+	IpAddress             string `json:"IpAddress,omitempty"`
 }
 
-func GetClientInfoManager() (ClientInfoManager, error) {
-	client_info_manager_mu.Lock()
-	defer client_info_manager_mu.Unlock()
-
-	if client_info_manager == nil {
-		return nil, errors.New("Client Info Manager not initialized")
+func GetClientInfoManager(config_obj *config_proto.Config) (ClientInfoManager, error) {
+	org_manager, err := GetOrgManager()
+	if err != nil {
+		return nil, err
 	}
 
-	return client_info_manager, nil
-}
-
-func RegisterClientInfoManager(m ClientInfoManager) {
-	client_info_manager_mu.Lock()
-	defer client_info_manager_mu.Unlock()
-
-	client_info_manager = m
+	return org_manager.Services(config_obj.OrgId).ClientInfoManager()
 }
 
 type ClientInfo struct {
@@ -73,44 +62,74 @@ func (self ClientInfo) OS() ClientOS {
 }
 
 type ClientInfoManager interface {
-	Get(client_id string) (*ClientInfo, error)
+	ListClients(ctx context.Context) <-chan string
 
-	GetStats(client_id string) (*Stats, error)
-	UpdateStats(client_id string, cb func(stats *Stats)) error
+	// Used to set a new client record. To modify an existing record -
+	// or set a new one use Modify()
+	Set(ctx context.Context,
+		client_info *ClientInfo) error
+
+	// Modify a record or set a new one - if the record is not found,
+	// modifier will receive a nil client_info. The ClientInfoManager
+	// can not be accessed within the modifier function as it is
+	// locked for the duration of the change.
+	Modify(ctx context.Context, client_id string,
+		modifier func(client_info *ClientInfo) (new_record *ClientInfo, err error)) error
+
+	Get(ctx context.Context,
+		client_id string) (*ClientInfo, error)
+
+	Remove(ctx context.Context, client_id string)
+
+	GetStats(ctx context.Context, client_id string) (*Stats, error)
+	UpdateStats(ctx context.Context, client_id string, stats *Stats) error
 
 	// Get the client's tasks and remove them from the queue.
-	GetClientTasks(client_id string) ([]*crypto_proto.VeloMessage, error)
+	GetClientTasks(ctx context.Context,
+		client_id string) ([]*crypto_proto.VeloMessage, error)
 
 	// Get all the tasks without de-queuing them.
-	PeekClientTasks(client_id string) ([]*crypto_proto.VeloMessage, error)
+	PeekClientTasks(ctx context.Context,
+		client_id string) ([]*crypto_proto.VeloMessage, error)
 
 	QueueMessagesForClient(
+		ctx context.Context,
 		client_id string,
 		req []*crypto_proto.VeloMessage,
 		notify bool, /* Also notify the client about the new task */
 	) error
 
 	QueueMessageForClient(
+		ctx context.Context,
 		client_id string,
 		req *crypto_proto.VeloMessage,
 		notify bool, /* Also notify the client about the new task */
 		completion func()) error
 
 	UnQueueMessageForClient(
+		ctx context.Context,
 		client_id string,
 		req *crypto_proto.VeloMessage) error
 
-	// Remove client id from the cache - this is needed when the
-	// record chages and we need to force a read from storage.
-	Flush(client_id string)
+	// Be able to manipulate the client and server metadata.
+	GetMetadata(ctx context.Context,
+		client_id string) (*ordereddict.Dict, error)
+
+	SetMetadata(ctx context.Context,
+		client_id string, metadata *ordereddict.Dict, principal string) error
+
+	ValidateClientId(client_id string) error
 }
 
-func GetHostname(client_id string) string {
-	client_info_manager, err := GetClientInfoManager()
+func GetHostname(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	client_id string) string {
+	client_info_manager, err := GetClientInfoManager(config_obj)
 	if err != nil {
 		return ""
 	}
-	info, err := client_info_manager.Get(client_id)
+	info, err := client_info_manager.Get(ctx, client_id)
 	if err != nil {
 		return ""
 	}

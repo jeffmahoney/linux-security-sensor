@@ -1,6 +1,6 @@
 /*
-   Velociraptor - Hunting Evil
-   Copyright (C) 2019 Velocidex Innovations.
+   Velociraptor - Dig Deeper
+   Copyright (C) 2019-2022 Rapid7 Inc.
 
    This program is free software: you can redistribute it and/or modify
    it under the terms of the GNU Affero General Public License as published
@@ -21,16 +21,73 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 
-	errors "github.com/pkg/errors"
-	"www.velocidex.com/golang/velociraptor/config"
+	"github.com/go-errors/errors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
+	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
+	"www.velocidex.com/golang/vfilter"
 )
+
+// Retrieve frontend private key frome scope
+// Must be running on server
+func GetPrivateKeyFromScope(scope vfilter.Scope) (*rsa.PrivateKey, error) {
+
+	config_obj, ok := vql_subsystem.GetServerConfig(scope)
+	if !ok {
+		return nil, errors.New("Must be running on server!")
+	}
+
+	if config_obj.Frontend == nil {
+		return nil, errors.New("No frontend configuration given")
+	}
+	private_key := config_obj.Frontend.PrivateKey
+
+	key, err := ParseRsaPrivateKeyFromPemStr([]byte(private_key))
+	if err != nil {
+		return nil, err
+	}
+	return key, nil
+}
+
+// Decode base64 encoded data and decrypt RSA-OAEP
+func Base64DecryptRSAOAEP(pk *rsa.PrivateKey, data string) ([]byte, error) {
+	decoded, err := base64.StdEncoding.DecodeString(data)
+	if err != nil {
+		return nil, err
+	}
+	return DecryptRSAOAEP(pk, decoded)
+}
+
+// Decrypt RSA-OAEP
+func DecryptRSAOAEP(pk *rsa.PrivateKey, data []byte) ([]byte, error) {
+	hash := sha512.New()
+	return rsa.DecryptOAEP(hash, rand.Reader, pk, data, nil)
+}
+
+// Encrypt data using public key from X509 certificate
+func EncryptWithX509PubKey(msg []byte, cert *x509.Certificate) ([]byte, error) {
+	pub := cert.PublicKey
+	switch pub := pub.(type) {
+	case *rsa.PublicKey:
+		return EncryptRSAOAEP(msg, pub)
+	default:
+		return nil, errors.New("Unsupported Type of Public Key")
+	}
+}
+
+// Encrypt data using RSA-OAEP
+func EncryptRSAOAEP(msg []byte, pub *rsa.PublicKey) ([]byte, error) {
+	hash := sha512.New()
+	return rsa.EncryptOAEP(hash, rand.Reader, pub, msg, nil)
+}
 
 func ParseRsaPrivateKeyFromPemStr(pem_str []byte) (*rsa.PrivateKey, error) {
 	for {
@@ -42,7 +99,7 @@ func ParseRsaPrivateKeyFromPemStr(pem_str []byte) (*rsa.PrivateKey, error) {
 		if block.Type == "RSA PRIVATE KEY" {
 			priv, err := x509.ParsePKCS1PrivateKey(block.Bytes)
 			if err != nil {
-				return nil, errors.WithStack(err)
+				return nil, errors.Wrap(err, 0)
 			}
 
 			return priv, nil
@@ -61,7 +118,7 @@ func ParseX509CertFromPemStr(pem_str []byte) (*x509.Certificate, error) {
 		if block.Type == "CERTIFICATE" {
 			cert, err := x509.ParseCertificate(block.Bytes)
 			if err != nil {
-				return nil, errors.WithStack(err)
+				return nil, errors.Wrap(err, 0)
 			}
 
 			return cert, nil
@@ -80,7 +137,7 @@ func ParseX509CSRFromPemStr(pem_str []byte) (*x509.CertificateRequest, error) {
 		if block.Type == "CERTIFICATE REQUEST" {
 			csr, err := x509.ParseCertificateRequest(block.Bytes)
 			if err != nil {
-				return nil, errors.WithStack(err)
+				return nil, errors.Wrap(err, 0)
 			}
 
 			return csr, nil
@@ -112,7 +169,7 @@ func GeneratePrivateKey() ([]byte, error) {
 
 	key, err := rsa.GenerateKey(reader, bitSize)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, errors.Wrap(err, 0)
 	}
 	pemdata := pem.EncodeToMemory(
 		&pem.Block{
@@ -142,7 +199,7 @@ func PemToPublicKey(pem_str []byte) (*rsa.PublicKey, error) {
 		if block.Type == "RSA PUBLIC KEY" {
 			pub, err := x509.ParsePKCS1PublicKey(block.Bytes)
 			if err != nil {
-				return nil, errors.WithStack(err)
+				return nil, errors.Wrap(err, 0)
 			}
 
 			return pub, nil
@@ -157,25 +214,43 @@ func VerifyConfig(config_obj *config_proto.Config) error {
 		return errors.New("No server URLs configured!")
 	}
 
-	if config_obj.Writeback == nil {
-		config_obj.Writeback = &config_proto.Writeback{}
-	}
+	writeback_service := writeback.GetWritebackService()
+	return writeback_service.MutateWriteback(config_obj,
+		func(wb *config_proto.Writeback) error {
+			if wb.PrivateKey != "" {
+				// Add a client id for information here.
+				if wb.ClientId == "" {
+					private_key, err := ParseRsaPrivateKeyFromPemStr(
+						[]byte(wb.PrivateKey))
+					if err != nil {
+						return errors.Wrap(err, 0)
+					}
 
-	if config_obj.Writeback.PrivateKey == "" {
-		fmt.Println("Generating new private key....")
-		pem, err := GeneratePrivateKey()
-		if err != nil {
-			return errors.WithStack(err)
-		}
+					wb.ClientId = ClientIDFromPublicKey(
+						&private_key.PublicKey)
+					return writeback.WritebackUpdateLevel1
+				}
 
-		config_obj.Writeback.PrivateKey = string(pem)
-		err = config.UpdateWriteback(config_obj)
-		if err != nil {
-			return err
-		}
-	}
+				return writeback.WritebackNoUpdate
+			}
 
-	return nil
+			fmt.Println("Generating new private key....")
+			pem, err := GeneratePrivateKey()
+			if err != nil {
+				return errors.Wrap(err, 0)
+			}
+
+			private_key, err := ParseRsaPrivateKeyFromPemStr(pem)
+			if err != nil {
+				return errors.Wrap(err, 0)
+			}
+
+			// Add a client id for information here
+			wb.ClientId = ClientIDFromPublicKey(&private_key.PublicKey)
+			wb.PrivateKey = string(pem)
+
+			return writeback.WritebackUpdateLevel1
+		})
 }
 
 func GetSubjectName(cert *x509.Certificate) string {

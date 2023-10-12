@@ -6,39 +6,105 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"hash"
 	"io"
 	"os"
-	"path"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Velocidex/ordereddict"
 	"github.com/alexmullins/zip"
-	"github.com/pkg/errors"
+	"github.com/dustin/go-humanize"
+	"github.com/go-errors/errors"
+	"google.golang.org/protobuf/proto"
+	"www.velocidex.com/golang/velociraptor/accessors"
 	"www.velocidex.com/golang/velociraptor/actions"
 	actions_proto "www.velocidex.com/golang/velociraptor/actions/proto"
+	api_proto "www.velocidex.com/golang/velociraptor/api/proto"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
 	"www.velocidex.com/golang/velociraptor/file_store/api"
 	"www.velocidex.com/golang/velociraptor/file_store/csv"
+	"www.velocidex.com/golang/velociraptor/json"
 	"www.velocidex.com/golang/velociraptor/logging"
-	"www.velocidex.com/golang/velociraptor/paths"
 	"www.velocidex.com/golang/velociraptor/uploads"
 	"www.velocidex.com/golang/velociraptor/utils"
-	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 
+	"github.com/Velocidex/ordereddict"
 	concurrent_zip "github.com/Velocidex/zip"
 )
+
+var (
+	NO_METADATA         []vfilter.Row = nil
+	DEFAULT_COMPRESSION int64         = 5
+
+	ZipRootPath = accessors.MustNewZipFilePath("/")
+)
+
+type ContainerFormat int
+
+const (
+	ContainerFormatJson       ContainerFormat = 1
+	ContainerFormatCSV        ContainerFormat = 2
+	ContainerFormatCSVAndJson ContainerFormat = ContainerFormatJson |
+		ContainerFormatCSV
+)
+
+func GetContainerFormat(format string) (ContainerFormat, error) {
+	switch format {
+	case "json", "jsonl", "":
+		return ContainerFormatJson, nil
+
+	case "csv":
+		return ContainerFormatCSVAndJson, nil
+
+	case "csv_only":
+		return ContainerFormatCSV, nil
+
+	default:
+	}
+	return 0, fmt.Errorf(
+		"Unknown format parameter %v either 'json', 'jsonl', 'cvs' or 'csv_only'.",
+		format)
+}
+
+var (
+	Clock utils.Clock = utils.RealClock{}
+)
+
+type MemberWriter struct {
+	io.WriteCloser
+	writer_wg *sync.WaitGroup
+
+	owner *Container
+}
+
+func (self *MemberWriter) Write(buff []byte) (int, error) {
+	self.owner.increaseUncompressedBytes(len(buff))
+	return self.WriteCloser.Write(buff)
+}
+
+// Keep track of all members that are closed to allow the zip to be
+// written properly.
+func (self *MemberWriter) Close() error {
+	err := self.WriteCloser.Close()
+	self.writer_wg.Done()
+	return err
+}
 
 type Container struct {
 	config_obj *config_proto.Config
 
 	// The underlying file writer
-	fd      io.WriteCloser
-	writer  io.Writer
+	fd io.WriteCloser
+
+	// Calculate the hash of the final container.
+	writer  *utils.TeeWriter
 	sha_sum hash.Hash
+
+	// Keep track of all the files we uploaded in the container itself.
+	uploads []*uploads.UploadResponse
 
 	level int
 
@@ -53,11 +119,26 @@ type Container struct {
 	delegate_fd  io.Writer
 
 	// manage orderly shutdown of the container.
-	mu     sync.Mutex
-	closed bool
+	mu sync.Mutex
+
+	// Keep stats about the container
+	stats_mu sync.Mutex
+	stats    api_proto.ContainerStats
+
+	// Keep track of all writers so we can safely close the container.
+	writer_wg sync.WaitGroup
+	closed    bool
 }
 
 func (self *Container) Create(name string, mtime time.Time) (io.WriteCloser, error) {
+	self.stats_mu.Lock()
+	defer self.stats_mu.Unlock()
+	self.stats.TotalContainerFiles++
+
+	// Zip members must not be absolute
+	name = strings.TrimPrefix(name, "/")
+
+	self.writer_wg.Add(1)
 	header := &concurrent_zip.FileHeader{
 		Name:     name,
 		Method:   concurrent_zip.Deflate,
@@ -68,7 +149,16 @@ func (self *Container) Create(name string, mtime time.Time) (io.WriteCloser, err
 		header.Method = concurrent_zip.Store
 	}
 
-	return self.zip.CreateHeader(header)
+	writer, err := self.zip.CreateHeader(header)
+	if err != nil {
+		return nil, err
+	}
+
+	return &MemberWriter{
+		WriteCloser: writer,
+		writer_wg:   &self.writer_wg,
+		owner:       self,
+	}, nil
 }
 
 func (self *Container) StoreArtifact(
@@ -76,50 +166,74 @@ func (self *Container) StoreArtifact(
 	ctx context.Context,
 	scope vfilter.Scope,
 	query *actions_proto.VQLRequest,
-	format string) (err error) {
+	prefix api.FSPathSpec,
+	format ContainerFormat) (total_rows int, err error) {
 
-	query_log := actions.QueryLog.AddQuery(query.VQL)
-	defer query_log.Close()
+	subctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	vql, err := vfilter.Parse(query.VQL)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	artifact_name := query.Name
 
 	// Dont store un-named queries but run them anyway.
 	if artifact_name == "" {
-		for range vql.Eval(ctx, scope) {
+		query_log := actions.QueryLog.AddQuery(query.VQL)
+		defer query_log.Close()
+
+		for range vql.Eval(subctx, scope) {
+			total_rows++
 		}
-		return nil
+		return total_rows, nil
 	}
+
+	// Record query progress for stats and debugging.
+	query_log := actions.QueryLog.AddQuery(query.Name + ":" + query.VQL)
+	defer query_log.Close()
 
 	// The name to use in the zip file to store results from this artifact
-	path_manager := paths.NewContainerPathManager(artifact_name)
-	fd, err := self.Create(path_manager.Path(), time.Time{})
-	if err != nil {
-		return err
-	}
+	dest := ZipRootPath.Append(prefix.Components()...).Append(
+		artifact_name + ".json")
+	return self.WriteResultSet(subctx, config_obj, scope, format,
+		dest.String(), vql.Eval(subctx, scope))
+}
 
-	// Preserve the error for our caller.
-	defer func() {
-		err_ := fd.Close()
-		if err == nil {
-			err = err_
+func (self *Container) WriteResultSet(
+	ctx context.Context,
+	config_obj *config_proto.Config,
+	scope vfilter.Scope, format ContainerFormat,
+	dest string, in <-chan vfilter.Row) (total_rows int, err error) {
+
+	var result_set_writer *ContainerResultSetWriter
+
+	// Only create JSON files if required.
+	if format&ContainerFormatJson > 0 {
+		result_set_writer, err = NewResultSetWriter(self, dest)
+		if err != nil {
+			return total_rows, err
 		}
-	}()
+
+		defer func() {
+			result_set_writer.Close()
+		}()
+	}
 
 	// Optionally include CSV in the output
 	var csv_writer *csv.CSVWriter
-	if format == "csv" {
-		csv_fd, err := self.Create(path_manager.CSVPath(), time.Time{})
+	if format&ContainerFormatCSV > 0 {
+		csv_filename := strings.TrimSuffix(dest, ".json") + ".csv"
+		csv_fd, err := self.Create(csv_filename, time.Time{})
 		if err != nil {
-			return err
+			return total_rows, err
 		}
 
-		csv_writer = csv.GetCSVAppender(
-			scope, csv_fd, true /* write_headers */)
+		csv_writer = csv.GetCSVAppender(config_obj,
+			scope, csv_fd,
+			true, /* write_headers */
+			json.NewEncOpts())
 
 		// Preserve the error for our caller.
 		defer func() {
@@ -132,78 +246,142 @@ func (self *Container) StoreArtifact(
 	}
 
 	// Store as line delimited JSON
-	marshaler := vql_subsystem.MarshalJsonl(scope)
-	for row := range vql.Eval(ctx, scope) {
-		// Re-serialize it as compact json.
-		serialized, err := marshaler([]vfilter.Row{row})
-		if err != nil {
-			continue
-		}
+	for row := range in {
+		total_rows++
 
-		_, err = fd.Write(serialized)
-		if err != nil {
-			return errors.WithStack(err)
-		}
+		select {
+		case <-ctx.Done():
+			return
 
-		if csv_writer != nil {
-			csv_writer.Write(row)
+		default:
+			if format&ContainerFormatJson > 0 {
+				err := result_set_writer.Write(row)
+				if err != nil {
+					continue
+				}
+			}
+
+			if csv_writer != nil {
+				csv_writer.Write(row)
+			}
 		}
 	}
 
-	return nil
+	return total_rows, nil
 }
 
-func sanitize_upload_name(store_as_name string) string {
-	components := []string{}
-	// Normalize and clean up the path so the zip file is more
-	// usable by fragile zip programs like Windows explorer.
-	for _, component := range utils.SplitComponents(store_as_name) {
-		if component == "." || component == ".." {
-			continue
-		}
-		components = append(components, sanitize(component))
+func (self *Container) WriteJSON(name string, data interface{}) error {
+	fd, err := self.Create(name, Clock.Now())
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+
+	_, err = fd.Write(json.MustMarshalIndent(data))
+	return err
+}
+
+// Parse the path according to the accessor to return the components
+func (self *Container) getPathComponents(
+	scope vfilter.Scope, accessor string, path string) ([]string, error) {
+
+	file_store_factory, err := accessors.GetAccessor(accessor, scope)
+	if err != nil {
+		return nil, err
 	}
 
-	// Zip members must not have absolute paths.
-	return path.Join(components...)
+	os_path, err := file_store_factory.ParsePath(path)
+	if err != nil {
+		return nil, err
+	}
+
+	return os_path.Components, nil
 }
 
-func sanitize(component string) string {
-	component = strings.Replace(component, ":", "", -1)
-	component = strings.Replace(component, "?", "", -1)
-	return component
+func formatFilename(filename *accessors.OSPath, accessor string) string {
+	result := filename.String()
+
+	// These paths can be very large so we elide them.
+	switch accessor {
+	case "data", "sparse":
+		if len(result) > 50 {
+			result = result[:50] + "..."
+		}
+	}
+
+	return result
 }
 
+// Upload the file into the zip file.  We treat the zip file as our
+// filestore here - this means that file paths will be very
+// conservatively escaped to ensure maximum compatibility with zip
+// programs. We store the proper paths and the StoredName in the
+// uploads.json file for easy retrieval later.
 func (self *Container) Upload(
 	ctx context.Context,
 	scope vfilter.Scope,
-	filename string,
+	filename *accessors.OSPath,
 	accessor string,
-	store_as_name string,
+	store_as_name *accessors.OSPath,
 	expected_size int64,
 	mtime time.Time,
 	atime time.Time,
 	ctime time.Time,
 	btime time.Time,
-	reader io.Reader) (*api.UploadResponse, error) {
+	reader io.Reader) (*uploads.UploadResponse, error) {
 
-	if store_as_name == "" {
-		store_as_name = accessor + "/" + filename
+	result := &uploads.UploadResponse{
+		Path: formatFilename(filename, accessor),
+		Size: uint64(expected_size),
 	}
 
-	sanitized_name := sanitize_upload_name(store_as_name)
+	// Avoid sending huge strings inside the JSON
+	if accessor == "data" {
+		result.Path = "data"
+	} else if accessor == "" {
+		accessor = "auto"
+	}
+
+	// The filename to store the file inside the zip - due to escaping
+	// issues this may not be exactly the same as the file name we
+	// receive.
+	if store_as_name == nil {
+		store_as_name = filename
+	}
+
+	cached, pres, closer := uploads.DeduplicateUploads(scope, store_as_name)
+	defer closer()
+	if pres {
+		return cached, nil
+	}
+
+	store_path, err := accessors.NewZipFilePath("uploads")
+	if err != nil {
+		return nil, err
+	}
+
+	store_path = store_path.Append(accessor).
+		Append(store_as_name.Components...)
+
+	// Where to store the file inside the Zip file.
+	result.StoredName = store_path.String()
+	result.Components = store_path.Components
 
 	scope.Log("Collecting file %s into %s (%v bytes)",
-		filename, store_as_name, expected_size)
+		formatFilename(filename, accessor), result.StoredName, expected_size)
 
 	// Try to collect sparse files if possible
-	result, err := self.maybeCollectSparseFile(
-		ctx, reader, store_as_name, sanitized_name, mtime)
+	err = self.maybeCollectSparseFile(ctx, scope, reader, result, mtime)
 	if err == nil {
+		self.mu.Lock()
+		self.uploads = append(self.uploads, result)
+		self.mu.Unlock()
+
+		uploads.CacheUploadResult(scope, store_as_name, result)
 		return result, nil
 	}
 
-	writer, err := self.Create(sanitized_name, mtime)
+	writer, err := self.Create(result.StoredName, mtime)
 	if err != nil {
 		return nil, err
 	}
@@ -212,37 +390,66 @@ func (self *Container) Upload(
 	sha_sum := sha256.New()
 	md5_sum := md5.New()
 
-	n, err := utils.Copy(ctx, utils.NewTee(writer, sha_sum, md5_sum), reader)
+	// For very large files we need to emit some progress reporting.
+	tee_writer, cancel := utils.NewDurationProgressWriter(
+		ctx, func(byte_count int, duration time.Duration) {
+			scope.Log("Wrote %v/%v into %v in %v\n",
+				humanize.Bytes(uint64(byte_count)),
+				humanize.Bytes(uint64(expected_size)),
+				result.StoredName, duration)
+		}, utils.NewTee(writer, sha_sum, md5_sum),
+		time.Duration(10*time.Second))
+	defer cancel()
+
+	count, err := utils.Copy(ctx, tee_writer, reader)
 	if err != nil {
-		return &api.UploadResponse{
-			Error: err.Error(),
-		}, err
+		result.StoredSize = uint64(count)
+		result.Error = err.Error()
+		return result, err
 	}
 
-	return &api.UploadResponse{
-		Path:   sanitized_name,
-		Size:   uint64(n),
-		Sha256: hex.EncodeToString(sha_sum.Sum(nil)),
-		Md5:    hex.EncodeToString(md5_sum.Sum(nil)),
-	}, nil
+	result.StoredSize = uint64(count)
+	result.Sha256 = hex.EncodeToString(sha_sum.Sum(nil))
+	result.Md5 = hex.EncodeToString(md5_sum.Sum(nil))
+
+	self.mu.Lock()
+	self.uploads = append(self.uploads, result)
+	self.mu.Unlock()
+
+	self.stats_mu.Lock()
+	self.stats.TotalUploadedBytes += result.Size
+	self.stats_mu.Unlock()
+
+	uploads.CacheUploadResult(scope, store_as_name, result)
+	return result, nil
 }
 
 func (self *Container) maybeCollectSparseFile(
 	ctx context.Context,
-	reader io.Reader, store_as_name, sanitized_name string, mtime time.Time) (
-	*api.UploadResponse, error) {
+	scope vfilter.Scope,
+	reader io.Reader,
+	result *uploads.UploadResponse, mtime time.Time) error {
 
 	// Can the reader produce ranges?
 	range_reader, ok := reader.(uploads.RangeReader)
 	if !ok {
-		return nil, errors.New("Not supported")
+		return errors.New("Not supported")
 	}
 
-	writer, err := self.Create(sanitized_name, mtime)
+	writer, err := self.Create(result.StoredName, mtime)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer writer.Close()
+
+	// For very large files we need to emit some progress reporting.
+	tee_writer, cancel := utils.NewDurationProgressWriter(
+		ctx, func(byte_count int, duration time.Duration) {
+			scope.Log("Wrote %v into %v in %v\n",
+				humanize.Bytes(uint64(byte_count)),
+				result.StoredName, duration)
+		}, writer, time.Duration(10*time.Second))
+	defer cancel()
 
 	sha_sum := sha256.New()
 	md5_sum := md5.New()
@@ -251,7 +458,7 @@ func (self *Container) maybeCollectSparseFile(
 	count := 0
 
 	// An index array for sparse files.
-	index := []*ordereddict.Dict{}
+	index := &actions_proto.Index{}
 	is_sparse := false
 
 	for _, rng := range range_reader.Ranges() {
@@ -260,11 +467,13 @@ func (self *Container) maybeCollectSparseFile(
 			file_length = 0
 		}
 
-		index = append(index, ordereddict.NewDict().
-			Set("file_offset", count).
-			Set("original_offset", rng.Offset).
-			Set("file_length", file_length).
-			Set("length", rng.Length))
+		index.Ranges = append(index.Ranges,
+			&actions_proto.Range{
+				FileOffset:     int64(count),
+				OriginalOffset: rng.Offset,
+				FileLength:     file_length,
+				Length:         rng.Length,
+			})
 
 		if rng.IsSparse {
 			is_sparse = true
@@ -273,50 +482,74 @@ func (self *Container) maybeCollectSparseFile(
 
 		_, err = range_reader.Seek(rng.Offset, io.SeekStart)
 		if err != nil {
-			return &api.UploadResponse{
-				Error: err.Error(),
-			}, err
+			return err
 		}
 
-		n, err := utils.CopyN(ctx, utils.NewTee(writer, sha_sum, md5_sum),
-			range_reader, rng.Length)
+		run_writer := utils.NewTee(tee_writer, sha_sum, md5_sum)
+		n, err := utils.CopyN(ctx, run_writer, range_reader, rng.Length)
 		if err != nil {
-			return &api.UploadResponse{
-				Error: err.Error(),
-			}, err
+			return err
 		}
+
+		// We were unable to fully copy this run - this could indicate
+		// an issue with decompression of the ntfs for
+		// example. However we still need to maintain alignment here
+		// so we pad with zeros.
+		if int64(n) < rng.Length {
+			scope.Log("Unable to fully copy range %v in %v - padding %v bytes",
+				rng, result.StoredName, rng.Length-int64(n))
+			_, _ = utils.CopyN(
+				ctx, run_writer, utils.ZeroReader{}, rng.Length-int64(n))
+		}
+
 		count += n
 	}
 
 	// If there were any sparse runs, create an index.
 	if is_sparse {
-		writer, err := self.Create(sanitized_name+".idx", time.Time{})
+		idx_upload := &uploads.UploadResponse{
+			Components: utils.CopySlice(result.Components),
+			StoredName: result.StoredName + ".idx",
+			Path:       result.Path + ".idx",
+			Reference:  result.Reference,
+			Type:       "idx",
+		}
+		writer, err := self.Create(idx_upload.StoredName, time.Time{})
 		if err != nil {
-			return nil, err
+			return err
 		}
 		defer writer.Close()
 
-		serialized, err := utils.DictsToJson(index, nil)
+		serialized, err := json.Marshal(index)
 		if err != nil {
-			return &api.UploadResponse{
-				Error: err.Error(),
-			}, err
+			return err
 		}
 
 		_, err = writer.Write(serialized)
 		if err != nil {
-			return &api.UploadResponse{
-				Error: err.Error(),
-			}, err
+			return err
 		}
+
+		idx_upload.Size = uint64(len(serialized))
+		idx_upload.StoredSize = uint64(len(serialized))
+
+		// Add it to the uploads list.
+		self.mu.Lock()
+		self.uploads = append(self.uploads, idx_upload)
+		self.mu.Unlock()
 	}
 
-	return &api.UploadResponse{
-		Path:   sanitized_name,
-		Size:   uint64(count),
-		Sha256: hex.EncodeToString(sha_sum.Sum(nil)),
-		Md5:    hex.EncodeToString(md5_sum.Sum(nil)),
-	}, nil
+	result.StoredSize = uint64(count)
+	result.Sha256 = hex.EncodeToString(sha_sum.Sum(nil))
+	result.Md5 = hex.EncodeToString(md5_sum.Sum(nil))
+	return nil
+}
+
+func (self *Container) IsClosed() bool {
+	self.mu.Lock()
+	defer self.mu.Unlock()
+
+	return self.closed
 }
 
 // Close the underlying container zip (and write central
@@ -330,24 +563,88 @@ func (self *Container) Close() error {
 	}
 	self.closed = true
 
+	if len(self.uploads) > 0 {
+		result_set_writer, err := NewResultSetWriter(self, "uploads.json")
+		if err == nil {
+			for _, record := range self.uploads {
+				err = result_set_writer.Write(ordereddict.NewDict().
+					Set("Timestamp", Clock.Now()).
+					Set("started", Clock.Now().UTC().String()).
+					Set("vfs_path", record.Path).
+					Set("_Components", record.Components).
+					Set("file_size", record.Size).
+					Set("uploaded_size", record.StoredSize).
+					Set("Type", record.Type))
+				if err != nil {
+					break
+				}
+			}
+			result_set_writer.Close()
+		}
+	}
+
+	// Wait for all outstanding writers to finish before we close the
+	// zip file.
+	self.writer_wg.Wait()
+
 	self.zip.Close()
 
 	if self.delegate_zip != nil {
 		self.delegate_zip.Close()
 	}
-	logger := logging.GetLogger(self.config_obj, &logging.GUIComponent)
-	logger.Info("Container hash %v", hex.EncodeToString(self.sha_sum.Sum(nil)))
+
+	// Only report the hash if we actually wrote something (few bytes
+	// are always written for the zip header).
+	hash := hex.EncodeToString(self.sha_sum.Sum(nil))
+	self.stats_mu.Lock()
+	self.stats.Hash = hash
+	self.stats_mu.Unlock()
+
+	if self.writer.Count() > 50 {
+		logger := logging.GetLogger(self.config_obj, &logging.GUIComponent)
+		logger.Info("Container hash %v", hash)
+
+	}
 	return self.fd.Close()
+}
+
+func (self *Container) increaseUncompressedBytes(len int) {
+	self.stats_mu.Lock()
+	defer self.stats_mu.Unlock()
+
+	self.stats.TotalUncompressedBytes += uint64(len)
+}
+
+func (self *Container) Stats() *api_proto.ContainerStats {
+	self.stats_mu.Lock()
+	// Take a copy
+	stats := proto.Clone(&self.stats).(*api_proto.ContainerStats)
+	self.stats_mu.Unlock()
+
+	stats.TotalUploadedFiles = uint64(len(self.uploads))
+	stats.TotalCompressedBytes = uint64(self.writer.Count())
+	stats.TotalDuration = uint64(Clock.Now().Unix()) - stats.Timestamp
+
+	return stats
 }
 
 func NewContainer(
 	config_obj *config_proto.Config,
-	path string, password string, level int64) (*Container, error) {
+	path string, password string, level int64, metadata []vfilter.Row) (*Container, error) {
 	fd, err := os.OpenFile(
 		path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return nil, err
 	}
+
+	return NewContainerFromWriter(config_obj, fd, password, level, metadata)
+}
+
+func NewContainerFromWriter(
+	config_obj *config_proto.Config, fd io.WriteCloser,
+	password string, level int64, metadata []vfilter.Row) (*Container, error) {
+
+	var err error
 
 	if level < 0 || level > 9 {
 		level = 5
@@ -363,10 +660,19 @@ func NewContainer(
 		level:      int(level),
 	}
 
+	result.stats.Timestamp = uint64(Clock.Now().Unix())
+
 	// We need to build a protected container.
 	if password != "" {
-		result.delegate_zip = zip.NewWriter(result.writer)
 
+		result.delegate_zip = zip.NewWriter(result.writer)
+		if metadata != nil && len(metadata) != 0 {
+			fh, err := result.delegate_zip.Create("metadata.json")
+			if err != nil {
+				return nil, err
+			}
+			fh.Write(json.MustMarshalIndent(metadata))
+		}
 		// We are writing a zip file into here - no need to
 		// compress.
 		fh := &zip.FileHeader{
@@ -386,24 +692,16 @@ func NewContainer(
 			zip.Deflate, func(out io.Writer) (io.WriteCloser, error) {
 				return flate.NewWriter(out, int(level))
 			})
+		if metadata != nil && len(metadata) != 0 {
+			fh, err := result.zip.Create("metadata.json")
+			if err != nil {
+				return nil, err
+			}
+			fh.Write(json.MustMarshalIndent(metadata))
+			fh.Close()
+
+		}
 	}
 
 	return result, nil
-}
-
-// Turns os.Stdout into into file_store.WriteSeekCloser
-type StdoutWrapper struct {
-	io.Writer
-}
-
-func (self *StdoutWrapper) Seek(offset int64, whence int) (int64, error) {
-	return 0, nil
-}
-
-func (self *StdoutWrapper) Close() error {
-	return nil
-}
-
-func (self *StdoutWrapper) Truncate(offset int64) error {
-	return nil
 }

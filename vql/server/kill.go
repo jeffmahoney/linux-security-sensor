@@ -16,6 +16,8 @@ import (
 	"www.velocidex.com/golang/velociraptor/constants"
 	crypto_proto "www.velocidex.com/golang/velociraptor/crypto/proto"
 	"www.velocidex.com/golang/velociraptor/services"
+	"www.velocidex.com/golang/velociraptor/utils"
+	"www.velocidex.com/golang/velociraptor/vql"
 	vql_subsystem "www.velocidex.com/golang/velociraptor/vql"
 	"www.velocidex.com/golang/vfilter"
 	"www.velocidex.com/golang/vfilter/arg_parser"
@@ -44,18 +46,31 @@ func (self *KillClientFunction) Call(ctx context.Context,
 		return vfilter.Null{}
 	}
 
+	config_obj, ok := vql_subsystem.GetServerConfig(scope)
+	if !ok {
+		scope.Log("Command can only run on the server")
+		return vfilter.Null{}
+	}
+
 	// Queue a cancellation message to the client for this flow
 	// id.
-	client_manager, err := services.GetClientInfoManager()
+	client_manager, err := services.GetClientInfoManager(config_obj)
 	if err != nil {
 		scope.Log("killkillkill: %s", err.Error())
 		return vfilter.Null{}
 	}
-	err = client_manager.QueueMessageForClient(arg.ClientId,
+
+	principal := vql_subsystem.GetPrincipal(scope)
+	services.LogAudit(ctx,
+		config_obj, principal, "killkillkill",
+		ordereddict.NewDict().Set("client_id", arg.ClientId))
+
+	err = client_manager.QueueMessageForClient(ctx, arg.ClientId,
 		&crypto_proto.VeloMessage{
 			KillKillKill: &crypto_proto.Cancel{},
 			SessionId:    constants.MONITORING_WELL_KNOWN_FLOW,
-		}, true, nil)
+		},
+		services.NOTIFY_CLIENT, utils.BackgroundWriter)
 	if err != nil {
 		scope.Log("killkillkill: %s", err.Error())
 		return vfilter.Null{}
@@ -67,9 +82,10 @@ func (self *KillClientFunction) Call(ctx context.Context,
 func (self KillClientFunction) Info(
 	scope vfilter.Scope, type_map *vfilter.TypeMap) *vfilter.FunctionInfo {
 	return &vfilter.FunctionInfo{
-		Name:    "killkillkill",
-		Doc:     "Kills the client and forces a restart - this is very aggresive!",
-		ArgType: type_map.AddType(scope, &KillClientFunctionArgs{}),
+		Name:     "killkillkill",
+		Doc:      "Kills the client and forces a restart - this is very aggresive!",
+		ArgType:  type_map.AddType(scope, &KillClientFunctionArgs{}),
+		Metadata: vql.VQLMetadata().Permissions(acls.MACHINE_STATE).Build(),
 	}
 }
 

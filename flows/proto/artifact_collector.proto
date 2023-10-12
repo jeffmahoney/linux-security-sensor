@@ -18,11 +18,22 @@ message ArtifactParameters {
 message ArtifactSpec {
     string artifact = 1;
     ArtifactParameters parameters = 2;
+
+    // Batching control applies to this artifact only
+    uint64 max_batch_wait = 7;
+    uint64 max_batch_rows = 8;
+    uint64 max_batch_rows_buffer = 9;
 }
 
 message ArtifactCollectorArgs {
     string creator = 1;
+
+    // This is an arbitrary object attached to the request that
+    // provides context by the creator. For example it may be used to
+    // store a signature of the request by the creator's key.
+    string user_data = 30;
     string client_id = 3;
+    string flow_id = 31;
 
     // If set we send an urgent request to the client.
     bool urgent = 21;
@@ -38,11 +49,10 @@ message ArtifactCollectorArgs {
     // New way of specifying artifacts.
     repeated ArtifactSpec specs = 24;
 
-    float ops_per_second = 6 [(sem_type) = {
-            description: "Operations per second (Throttling).",
-            friendly_name: "Ops Per Second",
-            default: "1000000",
-        }];
+    // Artifact collection limits.
+    float cpu_limit = 25;
+    float iops_limit = 26;
+    float progress_timeout = 27;
 
     // Resource limits on this collection.
     uint64 timeout = 7 [(sem_type) = {
@@ -51,25 +61,41 @@ message ArtifactCollectorArgs {
             default: "600",
         }];
 
-    // Total number of rows we allow to collect.
+    // Total number of rows we allow to collect. Client will abort the
+    // flow if this is exceeded.
     uint64 max_rows = 22;
 
-    // Total bytes allowed to upload
+    // Total bytes allowed to upload. Client will abort the collection
+    // when exceeded. This might result is a partial file upload. It
+    // is possible to exceed the limit a bit.
     uint64 max_upload_bytes = 23;
+
+    // Request a trace of the collection on the endpoint, will upload
+    // a snapshot every trace seconds.
+    uint64 trace_freq_sec = 29;
 
     bool allow_custom_overrides = 8 [(sem_type) = {
             description: "If true we will use a custom artifact if present instead of the named artifact.",
         }];
 
+    // The maximum time in seconds the client will batch log messages
+    // before forwarding them to the server. If this is 0, no updates
+    // will be sent until he very end of the query.
+    uint64 log_batch_time = 28;
 
     // A place to cache the compiled request. If this is provided we
-    // do not compile the artifacts at all, we just use it as is.
-
-    // Note: Event artifacts may produce several VQLCollectorArgs, one
-    // for each artifact/source because Event Artifacts are
-    // asyncronous and blocking and need to run each query in
-    // parallel.
+    // do not compile the artifacts at all, we just use it as is. This
+    // is used by hunts which repeat the same collection multiple
+    // times, so we can avoid the compiler overheads at scale.
     repeated VQLCollectorArgs compiled_collector_args = 20;
+
+
+    // DEPRECATED:
+    float ops_per_second = 6 [(sem_type) = {
+            description: "Operations per second (Throttling).",
+            friendly_name: "Ops Per Second",
+            default: "1000000",
+        }];
 }
 
 message ArtifactCollectorResponse {
@@ -83,18 +109,23 @@ message ArtifactUploadedFileInfo {
     uint64 size = 3;
     uint64 stored_size = 4;
     repeated string components = 5;
+
+    // idx for index files.
+    string type = 6;
 }
 
 // Maintain this also outside the collector context. It will be
 // updated each time anyting about the collection is changed, without
 // having to race updating the main record. The read active_time is
 // the latest between this record and the one in
-// ArtifactCollectorContext
+// ArtifactCollectorContext. This is mainly used by the GUI to notice
+// when a collection is updated.
 message PingContext {
     uint64 active_time = 1;
 }
 
-// This context is serialized into the data store.
+// This context is serialized into the data store. We keep track of
+// all aspects of a collection.
 message ArtifactCollectorContext {
     string client_id = 27;
     string session_id = 13;
@@ -110,20 +141,23 @@ message ArtifactCollectorContext {
     // Last time this collection was active (receiving data).
     uint64 active_time = 17;
 
-    // A total count of files uploaded by this query.
+    // A total count of files uploaded by this query.  This is now
+    // tracked on the client and synced to the server so the server
+    // does not need to keep track of it.
     uint64 total_uploaded_files = 23;
     uint64 total_expected_uploaded_bytes = 25;
     uint64 total_uploaded_bytes = 26;
     uint64 total_collected_rows = 28;
     uint64 total_logs = 32;
 
+    int64 total_requests = 35;
     int64 outstanding_requests = 31;
 
     // We expect the next response from the client to have this id.
     uint64 next_response_id = 30;
 
     // Total time the query took to run on the client (reported by the
-    // client).
+    // client's status message at the end of the query).
     int64 execution_duration = 29;
 
     enum State {
@@ -134,8 +168,6 @@ message ArtifactCollectorContext {
 
         FINISHED = 2; // Flow completed normally.
         ERROR = 3;   // Flows which raise are marked as having an error.
-        ARCHIVED = 4;  // Archived flows do not show up in the UI
-        CANCELLED = 5; // Cancelled collection were actively cancelled.
     };
 
     State state = 14;
@@ -144,13 +176,14 @@ message ArtifactCollectorContext {
             description: "Contents of an error status sent by the client."
         }];
 
-    bool user_notified = 16;
-
     // Some of the collected artifacts may not have results.
     repeated string artifacts_with_results = 22 [(sem_type) = {
             description: "The full path to the artifacts with their results. "
             "This takes the form artifact name/source name."
         }];
+
+    // Keep detailed track of each query status.
+    repeated VeloStatus query_stats = 34;
 
     // The below are not serialized but are used during execution.
 
@@ -158,13 +191,20 @@ message ArtifactCollectorContext {
     // never serialized - it is just a place holder during processing.
     repeated ArtifactUploadedFileInfo uploaded_files = 24;
 
+
+    // The below fields are deprecated and only used in compatible
+    // code for older clients (<0.6.8)
+
+    // DEPRECATED: Not considered any more as clients report the end
+    // of the flow in FlowStats.flow_complete field.
+    bool user_notified = 16;
+
     // Logs are stored in their own CSV file. This is just a
     // placeholder during processing.
     repeated LogMessage logs = 20;
 
     bool dirty = 2;
 
-    // Total number of times the flow was loaded from the data store.
     uint64 total_loads = 33;
 }
 

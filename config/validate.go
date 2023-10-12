@@ -5,8 +5,10 @@ import (
 	"regexp"
 	"strings"
 
-	errors "github.com/pkg/errors"
+	"github.com/go-errors/errors"
 	config_proto "www.velocidex.com/golang/velociraptor/config/proto"
+	"www.velocidex.com/golang/velociraptor/services/writeback"
+	"www.velocidex.com/golang/velociraptor/utils"
 )
 
 // Ensures client config is valid, fills in defaults for missing values etc.
@@ -28,11 +30,6 @@ func ValidateClientConfig(config_obj *config_proto.Config) error {
 
 	if config_obj.Client.ServerUrls == nil {
 		return errors.New("No Client.server_urls configured")
-	}
-
-	_, err := WritebackLocation(config_obj)
-	if err != nil {
-		return err
 	}
 
 	// Add defaults
@@ -59,8 +56,26 @@ func ValidateClientConfig(config_obj *config_proto.Config) error {
 		config_obj.Client.MaxUploadSize = 5242880
 	}
 
+	if config_obj.Client.Crypto != nil {
+		allowed_verification_modes := []string{
+			"", "PKI", "PKI_OR_THUMBPRINT", "THUMBPRINT_ONLY",
+		}
+		if !utils.InString(allowed_verification_modes,
+			strings.ToUpper(config_obj.Client.Crypto.CertificateVerificationMode)) {
+			return fmt.Errorf("Client.Crypto.certificate_verification_mode not valid! Should be one of %v",
+				allowed_verification_modes)
+		}
+	}
+
 	config_obj.Version = GetVersion()
 	config_obj.Client.Version = config_obj.Version
+
+	// Ensure the writeback service is configured.
+	writeback_service := writeback.GetWritebackService()
+	writeback, err := writeback_service.GetWriteback(config_obj)
+	if err == nil && writeback.InstallTime != 0 {
+		config_obj.Client.Version.InstallTime = writeback.InstallTime
+	}
 
 	for _, url := range config_obj.Client.ServerUrls {
 		if !strings.HasSuffix(url, "/") {
